@@ -157,6 +157,20 @@ try {
 }
 ```
 
+## Supported Agents
+
+`zeph install` detects and configures these agents automatically:
+
+| Agent | What gets installed |
+|-------|-------------------|
+| Claude Code | Plugin (hooks + MCP server) |
+| Cursor | MCP server + stop hook + rules |
+| Windsurf | MCP server + response hook |
+| Gemini CLI | MCP server + AfterAgent hook |
+| Codex CLI | Stop hook |
+| Copilot CLI | Session end hook |
+| Cline | Rules file |
+
 ## Requirements
 
 - Node.js >= 18 (uses native `fetch`)
