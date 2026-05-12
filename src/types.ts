@@ -15,6 +15,21 @@ export interface NotifyPayload {
 
 export interface NotifyResult {
   pushId: string;
+  fileKey?: string;
+  autoFile?: boolean;
+}
+
+export interface FileAttachment {
+  fileKey: string;
+  fileName: string;
+  fileSize: number;
+  fileType: string;
+}
+
+export interface UploadRequestResult {
+  fileId: string;
+  fileKey: string;
+  uploadUrl: string;
 }
 
 export interface ListParams {
