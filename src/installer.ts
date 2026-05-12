@@ -98,12 +98,12 @@ const injectMcpJson = (filePath: string): void => {
 
 const installClaude = (): void => {
   try {
-    execSync('claude plugin marketplace add zeph-to/agent-plugin', { stdio: 'pipe' });
+    execSync('claude plugin marketplace add zeph-to/plugin', { stdio: 'pipe' });
     execSync('claude plugin install zeph@zeph', { stdio: 'pipe' });
     ok('Plugin installed');
   } catch {
     fail('Plugin install failed. Manual:');
-    console.log('      claude plugin marketplace add zeph-to/agent-plugin');
+    console.log('      claude plugin marketplace add zeph-to/plugin');
     console.log('      claude plugin install zeph@zeph');
   }
 };
