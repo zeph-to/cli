@@ -5,6 +5,14 @@ import { createInterface } from 'readline';
 import { ZephHook } from './zeph-hook.js';
 import { loadConfig, saveConfig, CONFIG_FILE, VERSION } from './config.js';
 import type { ZephConfig } from './config.js';
+import {
+  CURSOR_HOOKS, CURSOR_RULE,
+  WINDSURF_HOOKS,
+  GEMINI_HOOKS,
+  CODEX_HOOKS,
+  COPILOT_HOOKS,
+  CLINE_RULE,
+} from './templates.js';
 
 const HOME = process.env.HOME ?? '~';
 
@@ -46,6 +54,20 @@ const hasCommand = (cmd: string): boolean => {
   }
 };
 
+const writeFile = (filePath: string, content: string): void => {
+  mkdirSync(dirname(filePath), { recursive: true });
+  writeFileSync(filePath, content + '\n');
+};
+
+const mergeJsonFile = (filePath: string, patch: Record<string, unknown>): void => {
+  let data: Record<string, unknown> = {};
+  try {
+    data = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+  } catch { /* new file */ }
+  const merged = { ...data, ...patch };
+  writeFile(filePath, JSON.stringify(merged, null, 2));
+};
+
 // ── Agent Detection ──────────────────────────────────────────────
 
 const detectAgents = (): Agent[] => [
@@ -53,6 +75,9 @@ const detectAgents = (): Agent[] => [
   { name: 'Cursor', id: 'cursor', detected: existsSync(join(HOME, '.cursor')) },
   { name: 'Windsurf', id: 'windsurf', detected: existsSync(join(HOME, '.codeium')) },
   { name: 'Gemini CLI', id: 'gemini', detected: hasCommand('gemini') },
+  { name: 'Codex CLI', id: 'codex', detected: hasCommand('codex') },
+  { name: 'Copilot CLI', id: 'copilot', detected: existsSync(join(HOME, '.copilot')) },
+  { name: 'Cline', id: 'cline', detected: existsSync(join(HOME, '.cline')) },
 ];
 
 // ── Per-Agent Installers ─────────────────────────────────────────
@@ -86,18 +111,36 @@ const installClaude = (): void => {
 const installCursor = (): void => {
   try {
     injectMcpJson(join(HOME, '.cursor', 'mcp.json'));
-    ok('MCP server added to ~/.cursor/mcp.json');
+    ok('MCP server added');
   } catch {
     fail('MCP injection failed. Manual: add zeph to ~/.cursor/mcp.json');
+  }
+  try {
+    writeFile(join(HOME, '.cursor', 'hooks.json'), CURSOR_HOOKS);
+    ok('Stop hook added');
+  } catch {
+    fail('Hook install failed');
+  }
+  try {
+    writeFile(join(HOME, '.cursor', 'rules', 'zeph.mdc'), CURSOR_RULE);
+    ok('Rule file added');
+  } catch {
+    fail('Rule install failed');
   }
 };
 
 const installWindsurf = (): void => {
   try {
     injectMcpJson(join(HOME, '.codeium', 'windsurf', 'mcp_config.json'));
-    ok('MCP server added to ~/.codeium/windsurf/mcp_config.json');
+    ok('MCP server added');
   } catch {
     fail('MCP injection failed. Manual: add zeph to windsurf mcp_config.json');
+  }
+  try {
+    writeFile(join(HOME, '.codeium', 'windsurf', 'hooks.json'), WINDSURF_HOOKS);
+    ok('Response hook added');
+  } catch {
+    fail('Hook install failed');
   }
 };
 
@@ -108,6 +151,39 @@ const installGemini = (): void => {
   } catch {
     fail('MCP add failed. Manual: gemini mcp add zeph -- npx -y @zeph-to/mcp-server');
   }
+  try {
+    mergeJsonFile(join(HOME, '.gemini', 'settings.json'), GEMINI_HOOKS);
+    ok('AfterAgent hook added');
+  } catch {
+    fail('Hook install failed');
+  }
+};
+
+const installCodex = (): void => {
+  try {
+    writeFile(join(HOME, '.codex', 'hooks.json'), CODEX_HOOKS);
+    ok('Stop hook added');
+  } catch {
+    fail('Hook install failed. Manual: add zeph to ~/.codex/hooks.json');
+  }
+};
+
+const installCopilot = (): void => {
+  try {
+    writeFile(join(HOME, '.copilot', 'hooks', 'zeph.json'), COPILOT_HOOKS);
+    ok('Session end hook added');
+  } catch {
+    fail('Hook install failed. Manual: add zeph to ~/.copilot/hooks/');
+  }
+};
+
+const installCline = (): void => {
+  try {
+    writeFile(join(HOME, '.cline', 'rules', 'zeph.md'), CLINE_RULE);
+    ok('Rule file added');
+  } catch {
+    fail('Rule install failed. Manual: add zeph to ~/.cline/rules/');
+  }
 };
 
 const AGENT_INSTALLERS: Record<string, () => void> = {
@@ -115,6 +191,9 @@ const AGENT_INSTALLERS: Record<string, () => void> = {
   cursor: installCursor,
   windsurf: installWindsurf,
   gemini: installGemini,
+  codex: installCodex,
+  copilot: installCopilot,
+  cline: installCline,
 };
 
 // ── Test Connection ──────────────────────────────────────────────
@@ -209,9 +288,12 @@ export const handleInstall = async (args: Record<string, string | boolean>): Pro
     for (const agent of detected) {
       const labels: Record<string, string> = {
         claude: 'Install Claude Code plugin',
-        cursor: 'Add MCP server to ~/.cursor/mcp.json',
-        windsurf: 'Add MCP server to windsurf mcp_config.json',
-        gemini: 'Add MCP server to Gemini CLI',
+        cursor: 'Setup Cursor (MCP + hooks + rules)',
+        windsurf: 'Setup Windsurf (MCP + hooks)',
+        gemini: 'Setup Gemini CLI (MCP + hooks)',
+        codex: 'Setup Codex CLI (hooks)',
+        copilot: 'Setup Copilot CLI (hooks)',
+        cline: 'Setup Cline (rules)',
       };
       console.log(`    ${step}. ${labels[agent.id] ?? `Install for ${agent.name}`}`);
       step++;
