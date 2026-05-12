@@ -3,7 +3,7 @@ import { ZephError, AuthenticationError, QuotaExceededError } from './errors.js'
 
 const DEFAULT_BASE_URL = 'https://api.zeph.to/v1';
 const DEFAULT_TIMEOUT_MS = 30_000;
-const BODY_FILE_THRESHOLD = 1024;
+const BODY_FILE_THRESHOLD = 0;
 const PREVIEW_LENGTH = 200;
 
 const inferMimeType = (fileName: string): string => {
