@@ -1,0 +1,62 @@
+{
+  "name": "@zeph-to/hook-sdk",
+  "version": "0.0.0-semantic-release",
+  "description": "Zeph push notification SDK + CLI — zero dependencies",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "bin": {
+    "zeph": "./dist/cli.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.tsbuildinfo"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0",
+    "@types/node": "^22.0.0",
+    "semantic-release": "^24.0.0"
+  },
+  "release": {
+    "branches": ["main"],
+    "plugins": [
+      "@semantic-release/commit-analyzer",
+      "@semantic-release/release-notes-generator",
+      "@semantic-release/npm",
+      "@semantic-release/github"
+    ]
+  },
+  "author": "Zeph <dev@zeph.to>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zeph-to/hook-sdk"
+  },
+  "homepage": "https://github.com/zeph-to/hook-sdk",
+  "bugs": {
+    "url": "https://github.com/zeph-to/hook-sdk/issues"
+  },
+  "keywords": [
+    "zeph",
+    "push",
+    "notification",
+    "cli",
+    "webhook",
+    "ai-agent",
+    "mcp",
+    "claude",
+    "devtools"
+  ],
+  "license": "Apache-2.0"
+}
