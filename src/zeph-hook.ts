@@ -54,7 +54,7 @@ export class ZephHook {
     const json = await this.request<{ data: { pushId: string } }>('POST', '/pushes/send', {
       ...payload,
       body: preview,
-      type: 'file',
+      type: payload.type ?? 'file',
       files: [{ fileKey: upload.fileKey, fileName, fileSize, fileType }],
     });
 
