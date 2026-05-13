@@ -83,6 +83,21 @@ zeph notify --title "Hello" --json
 | `--json` | Output JSON format |
 | `--version` | Print version |
 
+### Mute
+
+Notifications are silently skipped when a mute file exists for the current project:
+
+```bash
+# Mute (created by /zeph-mute in Claude Code plugin)
+HASH=$(echo -n "$PROJECT_DIR" | cksum | cut -d' ' -f1)
+touch /tmp/zeph-muted-$HASH
+
+# Unmute
+rm /tmp/zeph-muted-$HASH
+```
+
+The CLI checks `CLAUDE_PROJECT_DIR`, `CURSOR_PROJECT_DIR`, `WINDSURF_PROJECT_DIR`, and falls back to `cwd`.
+
 ### Exit Codes
 
 | Code | Meaning |

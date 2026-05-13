@@ -1,9 +1,24 @@
 #!/usr/bin/env node
 
+import { existsSync } from 'fs';
+import { execFileSync } from 'child_process';
 import { ZephHook } from './zeph-hook.js';
 import { AuthenticationError, QuotaExceededError, ZephError } from './errors.js';
 import { handleInstall } from './installer.js';
-import { loadConfig, VERSION } from './config.js';
+import { loadConfig, resolvedEnv, VERSION } from './config.js';
+
+const PROJECT_DIR_VARS = ['CLAUDE_PROJECT_DIR', 'CURSOR_PROJECT_DIR', 'WINDSURF_PROJECT_DIR'] as const;
+
+const isMuted = (): boolean => {
+  try {
+    const dir = PROJECT_DIR_VARS.reduce<string | undefined>((found, key) => found || process.env[key], undefined) ?? process.cwd();
+    const raw = execFileSync('cksum', { input: dir, encoding: 'utf-8' });
+    const hash = raw.split(' ')[0];
+    return existsSync(`/tmp/zeph-muted-${hash}`);
+  } catch {
+    return false;
+  }
+};
 
 // ── Arg Parser ──────────────────────────────────────────────────
 
@@ -95,7 +110,7 @@ const printJson = (data: unknown) => {
 
 const createHook = (args: Record<string, string | boolean>): ZephHook | null => {
   const config = loadConfig();
-  const apiKey = (args.key as string) || process.env.ZEPH_API_KEY || config.apiKey;
+  const apiKey = (args.key as string) || resolvedEnv('ZEPH_API_KEY') || config.apiKey;
   const isJson = args.json === true;
 
   if (!apiKey) {
@@ -103,7 +118,7 @@ const createHook = (args: Record<string, string | boolean>): ZephHook | null => 
     return null;
   }
 
-  const baseUrl = (args['base-url'] as string) || process.env.ZEPH_BASE_URL || config.baseUrl;
+  const baseUrl = (args['base-url'] as string) || resolvedEnv('ZEPH_BASE_URL') || config.baseUrl;
 
   return new ZephHook({
     apiKey,
@@ -113,6 +128,7 @@ const createHook = (args: Record<string, string | boolean>): ZephHook | null => 
 
 const handleNotify = async (args: Record<string, string | boolean>): Promise<number> => {
   const isJson = args.json === true;
+  if (isMuted()) return 0;
   const hook = createHook(args);
   if (!hook) return 3;
 
