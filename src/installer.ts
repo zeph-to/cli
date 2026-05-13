@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { createInterface } from 'readline';
 import { ZephHook } from './zeph-hook.js';
-import { loadConfig, saveConfig, CONFIG_FILE, VERSION } from './config.js';
+import { loadConfig, resolvedEnv, saveConfig, CONFIG_FILE, VERSION } from './config.js';
 import type { ZephConfig } from './config.js';
 import {
   CURSOR_HOOKS, CURSOR_RULE,
@@ -249,12 +249,12 @@ export const handleInstall = async (args: Record<string, string | boolean>): Pro
   let baseUrl: string | undefined;
 
   if (nonInteractive) {
-    apiKey = installArgs.key || process.env.ZEPH_API_KEY || existing.apiKey;
-    hookId = installArgs.hook === 'none' ? undefined : (installArgs.hook || process.env.ZEPH_HOOK_ID || existing.hookId);
-    baseUrl = installArgs['base-url'] || process.env.ZEPH_BASE_URL || existing.baseUrl;
+    apiKey = installArgs.key || resolvedEnv('ZEPH_API_KEY') || existing.apiKey;
+    hookId = installArgs.hook === 'none' ? undefined : (installArgs.hook || resolvedEnv('ZEPH_HOOK_ID') || existing.hookId);
+    baseUrl = installArgs['base-url'] || resolvedEnv('ZEPH_BASE_URL') || existing.baseUrl;
   } else {
     console.log('');
-    const currentKey = process.env.ZEPH_API_KEY || existing.apiKey;
+    const currentKey = resolvedEnv('ZEPH_API_KEY') || existing.apiKey;
     if (currentKey) {
       console.log(`  Current API Key: ${currentKey.slice(0, 12)}...`);
     }
@@ -263,7 +263,7 @@ export const handleInstall = async (args: Record<string, string | boolean>): Pro
     );
     apiKey = keyInput || currentKey;
 
-    const currentHook = process.env.ZEPH_HOOK_ID || existing.hookId;
+    const currentHook = resolvedEnv('ZEPH_HOOK_ID') || existing.hookId;
     if (currentHook) {
       console.log(`  Current Hook ID: ${currentHook}`);
     }

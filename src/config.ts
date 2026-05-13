@@ -11,6 +11,11 @@ export interface ZephConfig {
   deviceId?: string;
 }
 
+export const resolvedEnv = (key: string): string | undefined => {
+  const val = process.env[key];
+  return val && !val.startsWith('${') ? val : undefined;
+};
+
 export const loadConfig = (): ZephConfig => {
   try {
     return JSON.parse(readFileSync(CONFIG_FILE, 'utf-8')) as ZephConfig;
