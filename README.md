@@ -54,7 +54,7 @@ zeph notify --title "Hello" --json
 | `notify` | Send a push notification |
 | `list` | List recent push notifications |
 | `dismiss <id>` | Dismiss a push (or `--all`) |
-| `test` | Send a test notification to verify setup |
+| `test` | Verify connection and API key |
 
 ### Notify Options
 
@@ -84,6 +84,8 @@ zeph notify --title "Hello" --json
 | `--version` | Print version |
 
 ### Mute
+
+Mute is project-scoped (uses project directory hash). Created by Claude Code `/zeph-mute` command.
 
 Notifications are silently skipped when a mute file exists for the current project:
 
