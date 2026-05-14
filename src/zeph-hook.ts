@@ -4,7 +4,7 @@ import { initCrypto, getKeyPair, encryptPushBodyForSelf, encryptFileForSelf } fr
 
 const DEFAULT_BASE_URL = 'https://api.zeph.to/v1';
 const DEFAULT_TIMEOUT_MS = 30_000;
-const BODY_FILE_THRESHOLD = 0;
+const BODY_FILE_THRESHOLD = 512;
 const PREVIEW_LENGTH = 200;
 
 const inferMimeType = (fileName: string): string => {
@@ -32,7 +32,7 @@ export class ZephHook {
   private async ensureCrypto(): Promise<boolean> {
     if (this.cryptoInitialized) return !!getKeyPair();
     try {
-      await initCrypto();
+      await initCrypto(this.apiKey, this.baseUrl);
       this.cryptoInitialized = true;
       return !!getKeyPair();
     } catch {

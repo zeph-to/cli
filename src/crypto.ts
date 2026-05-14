@@ -157,14 +157,53 @@ let cachedOwnPublicKey: CryptoKey | null = null;
 let initPromise: Promise<string> | null = null;
 
 /**
- * Initialize crypto: load or generate ECDH key pair.
+ * Initialize crypto: sync keys with server, then fallback to local/generate.
+ * Server is source of truth for per-user key pair.
  * Safe to call concurrently — deduplicates to single init.
  * Returns the exported public key (Base64 SPKI).
  */
-export const initCrypto = (): Promise<string> => {
+export const initCrypto = (apiKey?: string, baseUrl?: string): Promise<string> => {
   if (initPromise) return initPromise;
   initPromise = (async () => {
+    // Try local cache first
     const stored = loadStoredKeys();
+
+    // Try server sync if API key available
+    if (apiKey) {
+      const serverKeys = await fetchServerKeys(apiKey, baseUrl);
+      if (serverKeys) {
+        // Server has keys — adopt them (server is source of truth)
+        if (!stored || stored.publicKey !== serverKeys.publicKey) {
+          storeKeys(serverKeys);
+        }
+        cachedKeyPair = await importKeyPair(serverKeys);
+        cachedExportedPublicKey = serverKeys.publicKey;
+        cachedOwnPublicKey = cachedKeyPair.publicKey;
+        return serverKeys.publicKey;
+      }
+
+      // Server has no keys
+      if (stored) {
+        // Upload local keys to server
+        await uploadServerKeys(stored, apiKey, baseUrl);
+        cachedKeyPair = await importKeyPair(stored);
+        cachedExportedPublicKey = stored.publicKey;
+        cachedOwnPublicKey = cachedKeyPair.publicKey;
+        return stored.publicKey;
+      }
+
+      // No keys anywhere — generate + upload
+      const keyPair = await generateKeyPair();
+      const exported = await exportKeyPair(keyPair);
+      storeKeys(exported);
+      await uploadServerKeys(exported, apiKey, baseUrl);
+      cachedKeyPair = keyPair;
+      cachedExportedPublicKey = exported.publicKey;
+      cachedOwnPublicKey = keyPair.publicKey;
+      return exported.publicKey;
+    }
+
+    // No API key — local-only mode
     if (stored) {
       cachedKeyPair = await importKeyPair(stored);
       cachedExportedPublicKey = stored.publicKey;
@@ -179,8 +218,37 @@ export const initCrypto = (): Promise<string> => {
     cachedExportedPublicKey = exported.publicKey;
     cachedOwnPublicKey = keyPair.publicKey;
     return exported.publicKey;
-  })();
+  })().catch((err) => {
+    initPromise = null;
+    throw err;
+  });
   return initPromise;
+};
+
+// ─── Server key sync helpers ───
+
+const fetchServerKeys = async (apiKey: string, baseUrl?: string): Promise<ExportedKeyPair | null> => {
+  try {
+    const url = `${(baseUrl ?? 'https://api.zeph.to/v1').replace(/\/$/, '')}/users/me/keys`;
+    const res = await fetch(url, { headers: { 'X-API-Key': apiKey } });
+    if (!res.ok) return null;
+    const json = await res.json() as { data?: { encryptionKeys?: ExportedKeyPair | null } };
+    const keys = json.data?.encryptionKeys;
+    return keys?.publicKey && keys?.privateKey ? keys : null;
+  } catch {
+    return null;
+  }
+};
+
+const uploadServerKeys = async (keys: ExportedKeyPair, apiKey: string, baseUrl?: string): Promise<void> => {
+  try {
+    const url = `${(baseUrl ?? 'https://api.zeph.to/v1').replace(/\/$/, '')}/users/me/keys`;
+    await fetch(url, {
+      method: 'PUT',
+      headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify(keys),
+    });
+  } catch { /* non-critical */ }
 };
 
 export const getKeyPair = (): CryptoKeyPair | null => cachedKeyPair;
