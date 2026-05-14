@@ -34,11 +34,6 @@ export const WINDSURF_HOOKS = JSON.stringify({
   },
 }, null, 2);
 
-export const WINDSURF_RULE = `When you complete a coding task, call the zeph_notify MCP tool with a brief summary.
-Use zeph_prompt for user decisions (2-4 options). Use zeph_input for free-form text.
-Do not notify for trivial operations (file reads, simple searches).
-`;
-
 // ── Gemini ───────────────────────────────────────────────────────
 
 export const GEMINI_HOOKS = {

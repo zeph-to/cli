@@ -19,13 +19,6 @@ export interface NotifyResult {
   autoFile?: boolean;
 }
 
-export interface FileAttachment {
-  fileKey: string;
-  fileName: string;
-  fileSize: number;
-  fileType: string;
-}
-
 export interface UploadRequestResult {
   fileId: string;
   fileKey: string;

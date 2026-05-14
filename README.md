@@ -63,7 +63,7 @@ zeph notify --title "Hello" --json
 | `--title <text>` | Push title |
 | `--body <text>` | Push body |
 | `--url <url>` | URL to include |
-| `--type <type>` | Push type: `note`, `link`, `file` |
+| `--type <type>` | Push type: `note`, `link`, `file`, `hook` |
 | `--priority <p>` | Priority: `low`, `normal`, `high`, `urgent` |
 | `--device <id>` | Target device ID |
 
@@ -154,7 +154,7 @@ await hook.dismissAll();
 | `title` | `string?` | Push title |
 | `body` | `string?` | Push body |
 | `url` | `string?` | URL to include |
-| `type` | `'note' \| 'link' \| 'file'?` | Push type (default: `note`) |
+| `type` | `'note' \| 'link' \| 'file' \| 'hook'?` | Push type (default: `hook`) |
 | `priority` | `'low' \| 'normal' \| 'high' \| 'urgent'?` | Priority (default: `normal`) |
 | `targetDeviceId` | `string?` | Send to specific device |
 
