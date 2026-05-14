@@ -1,5 +1,6 @@
 import type { ZephOptions, NotifyPayload, NotifyResult, ListParams, ListResult, PushItem, DismissOneResult, DismissAllResult, ApiErrorResponse, UploadRequestResult } from './types.js';
 import { ZephError, AuthenticationError, QuotaExceededError } from './errors.js';
+import { initCrypto, getKeyPair, encryptPushBodyForSelf, encryptFileForSelf } from './crypto.js';
 
 const DEFAULT_BASE_URL = 'https://api.zeph.to/v1';
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -17,6 +18,8 @@ export class ZephHook {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
 
+  private cryptoInitialized = false;
+
   constructor(options: ZephOptions) {
     if (!options.apiKey) {
       throw new ZephError('apiKey is required', 'INVALID_OPTIONS', 400);
@@ -26,16 +29,40 @@ export class ZephHook {
     this.timeoutMs = options.timeout ?? DEFAULT_TIMEOUT_MS;
   }
 
+  private async ensureCrypto(): Promise<boolean> {
+    if (this.cryptoInitialized) return !!getKeyPair();
+    try {
+      await initCrypto();
+      this.cryptoInitialized = true;
+      return !!getKeyPair();
+    } catch {
+      this.cryptoInitialized = true;
+      return false;
+    }
+  }
+
   async notify(payload: NotifyPayload): Promise<NotifyResult> {
+    const canEncrypt = await this.ensureCrypto();
     const body = payload.body;
     const bodyBytes = body ? new TextEncoder().encode(body).byteLength : 0;
     const isLongBody = bodyBytes > BODY_FILE_THRESHOLD;
 
     if (isLongBody && body) {
-      return this.notifyWithFile(payload, body, bodyBytes);
+      return this.notifyWithFile(payload, body, bodyBytes, canEncrypt);
     }
 
-    const json = await this.request<{ data: { pushId: string } }>('POST', '/pushes/send', payload);
+    // Encrypt push body if possible
+    let sendPayload: Record<string, unknown> = { ...payload };
+    if (canEncrypt) {
+      try {
+        const enc = await encryptPushBodyForSelf({ title: payload.title, body: payload.body, url: payload.url });
+        sendPayload = { ...sendPayload, title: undefined, body: enc.body, isEncrypted: true, encryptedKey: enc.encryptedKey, senderPublicKey: enc.senderPublicKey };
+      } catch (err) {
+        console.error('[Crypto] Push encryption failed, sending plaintext:', err);
+      }
+    }
+
+    const json = await this.request<{ data: { pushId: string } }>('POST', '/pushes/send', sendPayload);
     const pushId = json.data?.pushId;
     if (!pushId) {
       throw new ZephError('Server returned no pushId', 'INVALID_RESPONSE', 500);
@@ -43,20 +70,52 @@ export class ZephHook {
     return { pushId };
   }
 
-  private async notifyWithFile(payload: NotifyPayload, body: string, fileSize: number): Promise<NotifyResult> {
+  private async notifyWithFile(payload: NotifyPayload, body: string, fileSize: number, canEncrypt: boolean): Promise<NotifyResult> {
     const fileName = 'response.md';
-    const fileType = inferMimeType(fileName);
+    let fileType = inferMimeType(fileName);
 
-    const upload = await this.requestUpload({ fileName, fileType, fileSize });
-    await this.uploadToS3(upload.uploadUrl, body, fileType);
+    // Encrypt file content if possible
+    let uploadContent: string | Buffer = body;
+    let uploadSize = fileSize;
+    let fileIv: string | undefined;
+    let fileEncryptedKey: string | undefined;
+
+    if (canEncrypt) {
+      try {
+        const encrypted = await encryptFileForSelf(body);
+        uploadContent = encrypted.ciphertext;
+        uploadSize = encrypted.ciphertext.length;
+        fileType = 'application/octet-stream';
+        fileIv = encrypted.iv;
+        fileEncryptedKey = encrypted.encryptedKey;
+      } catch (err) {
+        console.error('[Crypto] File encryption failed, sending plaintext:', err);
+      }
+    }
+
+    const upload = await this.requestUpload({ fileName, fileType, fileSize: uploadSize });
+    await this.uploadToS3(upload.uploadUrl, uploadContent, fileType);
 
     const preview = body.length > PREVIEW_LENGTH ? body.slice(0, PREVIEW_LENGTH) + '...' : body;
-    const json = await this.request<{ data: { pushId: string } }>('POST', '/pushes/send', {
+
+    // Encrypt push body
+    let sendPayload: Record<string, unknown> = {
       ...payload,
       body: preview,
       type: payload.type ?? 'file',
-      files: [{ fileKey: upload.fileKey, fileName, fileSize, fileType }],
-    });
+      files: [{ fileKey: upload.fileKey, fileName, fileSize, fileType: inferMimeType(fileName), iv: fileIv, encryptedKey: fileEncryptedKey }],
+    };
+
+    if (canEncrypt) {
+      try {
+        const enc = await encryptPushBodyForSelf({ title: payload.title, body: preview, url: payload.url });
+        sendPayload = { ...sendPayload, title: undefined, body: enc.body, isEncrypted: true, encryptedKey: enc.encryptedKey, senderPublicKey: enc.senderPublicKey };
+      } catch (err) {
+        console.error('[Crypto] Push encryption failed, sending plaintext:', err);
+      }
+    }
+
+    const json = await this.request<{ data: { pushId: string } }>('POST', '/pushes/send', sendPayload);
 
     const pushId = json.data?.pushId;
     if (!pushId) {
@@ -70,11 +129,13 @@ export class ZephHook {
     return json.data;
   }
 
-  async uploadToS3(url: string, content: string, contentType: string): Promise<void> {
+  async uploadToS3(url: string, content: string | Buffer, contentType: string): Promise<void> {
+    const isText = typeof content === 'string';
+    const body = isText ? content : new Uint8Array(content);
     const response = await fetch(url, {
       method: 'PUT',
-      headers: { 'Content-Type': `${contentType}; charset=utf-8` },
-      body: content,
+      headers: { 'Content-Type': isText ? `${contentType}; charset=utf-8` : contentType },
+      body,
       signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (!response.ok) {
