@@ -145,7 +145,7 @@ const loadStoredKeys = (): ExportedKeyPair | null => {
 };
 
 const storeKeys = (exported: ExportedKeyPair): void => {
-  mkdirSync(KEYS_DIR, { recursive: true });
+  mkdirSync(KEYS_DIR, { recursive: true, mode: 0o700 });
   writeFileSync(KEYS_PATH, JSON.stringify(exported, null, 2), { mode: 0o600 });
 };
 
