@@ -170,16 +170,25 @@ export const initCrypto = (apiKey?: string, baseUrl?: string): Promise<string> =
 
     // Try server sync if API key available
     if (apiKey) {
-      const serverKeys = await fetchServerKeys(apiKey, baseUrl);
-      if (serverKeys) {
+      const serverResult = await fetchServerKeys(apiKey, baseUrl);
+
+      // Server says encryption disabled — skip crypto init
+      if (serverResult && !serverResult.encryptionEnabled) {
+        cachedKeyPair = null;
+        cachedExportedPublicKey = null;
+        cachedOwnPublicKey = null;
+        return '';
+      }
+
+      if (serverResult?.keys) {
         // Server has keys — adopt them (server is source of truth)
-        if (!stored || stored.publicKey !== serverKeys.publicKey) {
-          storeKeys(serverKeys);
+        if (!stored || stored.publicKey !== serverResult.keys.publicKey) {
+          storeKeys(serverResult.keys);
         }
-        cachedKeyPair = await importKeyPair(serverKeys);
-        cachedExportedPublicKey = serverKeys.publicKey;
+        cachedKeyPair = await importKeyPair(serverResult.keys);
+        cachedExportedPublicKey = serverResult.keys.publicKey;
         cachedOwnPublicKey = cachedKeyPair.publicKey;
-        return serverKeys.publicKey;
+        return serverResult.keys.publicKey;
       }
 
       // Server has no keys
@@ -227,14 +236,23 @@ export const initCrypto = (apiKey?: string, baseUrl?: string): Promise<string> =
 
 // ─── Server key sync helpers ───
 
-const fetchServerKeys = async (apiKey: string, baseUrl?: string): Promise<ExportedKeyPair | null> => {
+interface ServerKeysResult {
+  keys: ExportedKeyPair | null;
+  encryptionEnabled: boolean;
+}
+
+const fetchServerKeys = async (apiKey: string, baseUrl?: string): Promise<ServerKeysResult | null> => {
   try {
     const url = `${(baseUrl ?? 'https://api.zeph.to/v1').replace(/\/$/, '')}/users/me/keys`;
     const res = await fetch(url, { headers: { 'X-API-Key': apiKey } });
     if (!res.ok) return null;
-    const json = await res.json() as { data?: { encryptionKeys?: ExportedKeyPair | null } };
+    const json = await res.json() as { data?: { encryptionKeys?: ExportedKeyPair | null; encryptionEnabled?: boolean } };
     const keys = json.data?.encryptionKeys;
-    return keys?.publicKey && keys?.privateKey ? keys : null;
+    const encryptionEnabled = json.data?.encryptionEnabled ?? (keys ? true : false);
+    return {
+      keys: keys?.publicKey && keys?.privateKey ? keys : null,
+      encryptionEnabled,
+    };
   } catch {
     return null;
   }
