@@ -188,6 +188,10 @@ try {
 | Copilot CLI | Session end hook |
 | Cline | Rules file |
 
+## E2E Encryption
+
+Notifications are encrypted end-to-end by default (AES-256-GCM + ECDH P-256). Keys are synced with the server automatically. When encryption is disabled in the Zeph app, the CLI sends plaintext. No configuration needed.
+
 ## Requirements
 
 - Node.js >= 18 (uses native `fetch`)
