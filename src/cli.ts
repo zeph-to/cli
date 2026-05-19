@@ -70,6 +70,7 @@ Notify options:
   --type <type>      Push type (note|link|file|hook) [default: hook]
   --priority <p>     Priority (low|normal|high|urgent) [default: normal]
   --device <id>      Target device ID
+  --session <id>     AI session ID (or set ZEPH_SESSION_ID env)
 
 List options:
   --limit <n>        Number of pushes (1-20, default 5)
@@ -91,7 +92,8 @@ Global options:
 
 Environment:
   ZEPH_API_KEY       API key (fallback when --key not provided)
-  ZEPH_BASE_URL      API base URL (fallback when --base-url not provided)`);
+  ZEPH_BASE_URL      API base URL (fallback when --base-url not provided)
+  ZEPH_SESSION_ID    AI session ID (fallback when --session not provided)`);
 };
 
 const printError = (message: string, isJson: boolean) => {
@@ -133,6 +135,7 @@ const handleNotify = async (args: Record<string, string | boolean>): Promise<num
   if (!hook) return 3;
 
   try {
+    const sessionId = (args.session as string | undefined) || resolvedEnv('ZEPH_SESSION_ID') || undefined;
     const result = await hook.notify({
       title: args.title as string | undefined,
       body: args.body as string | undefined,
@@ -140,6 +143,7 @@ const handleNotify = async (args: Record<string, string | boolean>): Promise<num
       type: (args.type as 'note' | 'link' | 'file' | 'hook') || 'hook',
       priority: (args.priority as 'low' | 'normal' | 'high' | 'urgent') || undefined,
       targetDeviceId: args.device as string | undefined,
+      sessionId,
     });
 
     if (isJson) {

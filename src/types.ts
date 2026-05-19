@@ -11,6 +11,7 @@ export interface NotifyPayload {
   type?: 'note' | 'link' | 'file' | 'hook';
   priority?: 'low' | 'normal' | 'high' | 'urgent';
   targetDeviceId?: string;
+  sessionId?: string;
 }
 
 export interface NotifyResult {
