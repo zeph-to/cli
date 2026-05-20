@@ -1,12 +1,36 @@
 /**
- * E2E encryption for Hook SDK — self-contained ECDH P-256 + AES-256-GCM
- * Mirrors @zeph/crypto API but bundled inline (no external dependency).
- * Uses Web Crypto API (globalThis.crypto.subtle) — Node.js 18+.
+ * Device-shared encryption for Hook SDK — self-contained ECDH P-256 +
+ * AES-256-GCM. Mirrors @zeph/crypto API but bundled inline (no external
+ * dependency). Uses Web Crypto API (globalThis.crypto.subtle) — Node.js 18+.
+ *
+ * Threat model honesty (do not call this "E2E" without a footnote):
+ *
+ *   The Zeph backend persists the per-user private key in plaintext so it
+ *   can be synced down to a fresh device (fetchServerKeys / uploadServerKeys
+ *   below). That means the backend can decrypt any push body — this is NOT
+ *   end-to-end in the standard sense. What it gives you is:
+ *     • Protection against passive network observers
+ *     • Protection against a leaked DB snapshot taken without the key store
+ *     • Cross-device readability (all your devices share one keypair)
+ *   What it does NOT give you:
+ *     • Protection against the Zeph backend itself
+ *     • Forward secrecy — encryptPushBodyForSelf / encryptFileForSelf do
+ *       ECDH(self, self), which collapses to a static derived key. A single
+ *       device compromise (since all your devices share the same keypair)
+ *       lets the attacker decrypt every past push for which they have the
+ *       ciphertext. The per-message AES key is random, but its wrap key is
+ *       static, so wrapped keys are decryptable forever.
+ *
+ *   True E2E would require a per-device keypair (server stores only public
+ *   keys; senders wrap the message key once per recipient device public
+ *   key). That refactor is on the roadmap; until then, treat push bodies as
+ *   sensitive-but-not-secret.
  */
 
 /// <reference lib="dom" />
 
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { homedir } from 'os';
 import { join } from 'path';
 
 // ─── Base64 helpers ───
@@ -133,7 +157,7 @@ const encryptFileContent = async (
 
 // ─── Key persistence (~/.config/zeph/keys.json) ───
 
-const KEYS_DIR = join(process.env.HOME ?? '~', '.config', 'zeph');
+const KEYS_DIR = join(homedir(), '.config', 'zeph');
 const KEYS_PATH = join(KEYS_DIR, 'keys.json');
 
 const loadStoredKeys = (): ExportedKeyPair | null => {

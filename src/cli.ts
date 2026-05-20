@@ -9,15 +9,32 @@ import { loadConfig, resolvedEnv, VERSION } from './config.js';
 
 const PROJECT_DIR_VARS = ['CLAUDE_PROJECT_DIR', 'CURSOR_PROJECT_DIR', 'WINDSURF_PROJECT_DIR'] as const;
 
+const detectProjectDir = (): string =>
+  PROJECT_DIR_VARS.reduce<string | undefined>((found, key) => found || process.env[key], undefined) ?? process.cwd();
+
 const isMuted = (): boolean => {
   try {
-    const dir = PROJECT_DIR_VARS.reduce<string | undefined>((found, key) => found || process.env[key], undefined) ?? process.cwd();
+    const dir = detectProjectDir();
     const raw = execFileSync('cksum', { input: dir, encoding: 'utf-8' });
     const hash = raw.split(' ')[0];
     return existsSync(`/tmp/zeph-muted-${hash}`);
   } catch {
     return false;
   }
+};
+
+const detectBranchAndProject = (): { branch?: string; project: string } => {
+  const dir = detectProjectDir();
+  const project = dir.split('/').filter(Boolean).pop() ?? 'project';
+  let branch: string | undefined;
+  try {
+    branch = execFileSync('git', ['-C', dir, 'rev-parse', '--abbrev-ref', 'HEAD'], {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    if (!branch || branch === 'HEAD') branch = undefined;
+  } catch { /* not a git repo */ }
+  return { branch, project };
 };
 
 // ── Arg Parser ──────────────────────────────────────────────────
@@ -136,9 +153,21 @@ const handleNotify = async (args: Record<string, string | boolean>): Promise<num
 
   try {
     const sessionId = (args.session as string | undefined) || resolvedEnv('ZEPH_SESSION_ID') || undefined;
+
+    // When body isn't supplied (common case for hook-driven invocations like
+    // `zeph notify --title "Task done"`), auto-fill with branch + project so
+    // the user can tell which session finished without opening the app.
+    let title = args.title as string | undefined;
+    let body = args.body as string | undefined;
+    if (!body) {
+      const { branch, project } = detectBranchAndProject();
+      body = branch ? `${project} · ${branch}` : project;
+    }
+    if (!title) title = 'Task done';
+
     const result = await hook.notify({
-      title: args.title as string | undefined,
-      body: args.body as string | undefined,
+      title,
+      body,
       url: args.url as string | undefined,
       type: (args.type as 'note' | 'link' | 'file' | 'hook') || 'hook',
       priority: (args.priority as 'low' | 'normal' | 'high' | 'urgent') || undefined,
