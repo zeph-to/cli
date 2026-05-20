@@ -1,5 +1,6 @@
 import { execSync } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { homedir } from 'os';
 import { join, dirname } from 'path';
 import { createInterface } from 'readline';
 import { ZephHook } from './zeph-hook.js';
@@ -14,7 +15,7 @@ import {
   CLINE_RULE,
 } from './templates.js';
 
-const HOME = process.env.HOME ?? '~';
+const HOME = homedir();
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -88,9 +89,14 @@ const injectMcpJson = (filePath: string): void => {
     data = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
   } catch { /* new file */ }
   if (!data.mcpServers) data.mcpServers = {};
+  // Pass through env explicitly so the MCP server doesn't have to rely on
+  // process-env inheritance (which behaves differently per IDE — Cursor and
+  // Windsurf spawn the MCP from a graphical context that may not inherit
+  // shell env). Mirrors plugin/.mcp.json.
   (data.mcpServers as Record<string, unknown>).zeph = {
     command: 'npx',
     args: ['-y', '@zeph-to/mcp-server'],
+    env: { ZEPH_API_KEY: '${ZEPH_API_KEY}' },
   };
   mkdirSync(dirname(filePath), { recursive: true });
   writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n');

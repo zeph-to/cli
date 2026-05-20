@@ -1,7 +1,8 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { homedir } from 'os';
 import { join } from 'path';
 
-export const CONFIG_DIR = join(process.env.HOME ?? '~', '.zeph');
+export const CONFIG_DIR = join(homedir(), '.zeph');
 export const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
 
 export interface ZephConfig {
