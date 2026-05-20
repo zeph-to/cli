@@ -8,11 +8,13 @@ import { loadConfig, resolvedEnv, saveConfig, CONFIG_FILE, VERSION } from './con
 import type { ZephConfig } from './config.js';
 import {
   CURSOR_HOOKS, CURSOR_RULE,
-  WINDSURF_HOOKS,
-  GEMINI_HOOKS,
-  CODEX_HOOKS,
-  COPILOT_HOOKS,
+  WINDSURF_HOOKS, WINDSURF_RULE,
+  GEMINI_HOOKS, GEMINI_RULE,
+  CODEX_HOOKS, CODEX_RULE,
+  COPILOT_HOOKS, COPILOT_RULE,
   CLINE_RULE,
+  AIDER_RULE,
+  upsertManagedBlock,
 } from './templates.js';
 
 const HOME = homedir();
@@ -69,6 +71,40 @@ const mergeJsonFile = (filePath: string, patch: Record<string, unknown>): void =
   writeFile(filePath, JSON.stringify(merged, null, 2));
 };
 
+/**
+ * Write a Zeph rule into a SHARED agent rule file (Windsurf global_rules.md,
+ * Gemini GEMINI.md, Codex AGENTS.md) without clobbering the user's own
+ * content. The rule lands inside <!-- ZEPH:START/END --> markers; a re-run
+ * replaces just that block.
+ */
+const writeManagedRule = (filePath: string, rule: string): void => {
+  let existing = '';
+  try {
+    existing = readFileSync(filePath, 'utf-8');
+  } catch { /* new file */ }
+  mkdirSync(dirname(filePath), { recursive: true });
+  writeFileSync(filePath, upsertManagedBlock(existing, rule));
+};
+
+/**
+ * Add a `read:` entry to ~/.aider.conf.yml so Aider always loads the Zeph
+ * conventions file. Idempotent — skips if the path is already referenced.
+ * Aider's config is YAML; we do a minimal text-level append to avoid
+ * pulling in a YAML dependency (the SDK is zero-dep by design).
+ */
+const addAiderReadDirective = (confPath: string, conventionsPath: string): void => {
+  let conf = '';
+  try {
+    conf = readFileSync(confPath, 'utf-8');
+  } catch { /* new file */ }
+  if (conf.includes(conventionsPath)) return; // already wired up
+  const marker = '# Added by Zeph';
+  const line = `${marker}\nread: ${conventionsPath}\n`;
+  const base = conf.replace(/\n*$/, '');
+  mkdirSync(dirname(confPath), { recursive: true });
+  writeFileSync(confPath, (base ? `${base}\n\n` : '') + line);
+};
+
 // ── Agent Detection ──────────────────────────────────────────────
 
 const detectAgents = (): Agent[] => [
@@ -79,6 +115,7 @@ const detectAgents = (): Agent[] => [
   { name: 'Codex CLI', id: 'codex', detected: hasCommand('codex') },
   { name: 'Copilot CLI', id: 'copilot', detected: existsSync(join(HOME, '.copilot')) },
   { name: 'Cline', id: 'cline', detected: existsSync(join(HOME, '.cline')) },
+  { name: 'Aider', id: 'aider', detected: hasCommand('aider') },
 ];
 
 // ── Per-Agent Installers ─────────────────────────────────────────
@@ -148,6 +185,14 @@ const installWindsurf = (): void => {
   } catch {
     fail('Hook install failed');
   }
+  try {
+    // Windsurf reads ~/.codeium/windsurf/memories/global_rules.md as always-on
+    // global rules. Managed-block append preserves the user's own rules.
+    writeManagedRule(join(HOME, '.codeium', 'windsurf', 'memories', 'global_rules.md'), WINDSURF_RULE);
+    ok('Rules added to global_rules.md');
+  } catch {
+    fail('Rule install failed. Manual: add zeph rules to ~/.codeium/windsurf/memories/global_rules.md');
+  }
 };
 
 const installGemini = (): void => {
@@ -163,6 +208,13 @@ const installGemini = (): void => {
   } catch {
     fail('Hook install failed');
   }
+  try {
+    // Gemini CLI loads ~/.gemini/GEMINI.md as global context every prompt.
+    writeManagedRule(join(HOME, '.gemini', 'GEMINI.md'), GEMINI_RULE);
+    ok('Rules added to GEMINI.md');
+  } catch {
+    fail('Rule install failed. Manual: add zeph rules to ~/.gemini/GEMINI.md');
+  }
 };
 
 const installCodex = (): void => {
@@ -172,6 +224,13 @@ const installCodex = (): void => {
   } catch {
     fail('Hook install failed. Manual: add zeph to ~/.codex/hooks.json');
   }
+  try {
+    // Codex CLI loads ~/.codex/AGENTS.md as global instructions.
+    writeManagedRule(join(HOME, '.codex', 'AGENTS.md'), CODEX_RULE);
+    ok('Rules added to AGENTS.md');
+  } catch {
+    fail('Rule install failed. Manual: add zeph rules to ~/.codex/AGENTS.md');
+  }
 };
 
 const installCopilot = (): void => {
@@ -180,6 +239,14 @@ const installCopilot = (): void => {
     ok('Session end hook added');
   } catch {
     fail('Hook install failed. Manual: add zeph to ~/.copilot/hooks/');
+  }
+  try {
+    // Copilot CLI loads ~/.copilot/instructions/*.instructions.md globally.
+    // A dedicated file means no merge needed — overwrite is safe.
+    writeFile(join(HOME, '.copilot', 'instructions', 'zeph.instructions.md'), COPILOT_RULE);
+    ok('Rule file added');
+  } catch {
+    fail('Rule install failed. Manual: add zeph rules to ~/.copilot/instructions/');
   }
 };
 
@@ -192,6 +259,26 @@ const installCline = (): void => {
   }
 };
 
+const installAider = (): void => {
+  // Aider has no hooks; rules reach it via a conventions file loaded by the
+  // `read:` directive in ~/.aider.conf.yml. We keep the conventions file in
+  // ~/.zeph/ (our own dir — no conflict) and just wire the read directive.
+  const conventionsPath = join(HOME, '.zeph', 'aider-conventions.md');
+  try {
+    writeFile(conventionsPath, AIDER_RULE);
+    ok('Conventions file added');
+  } catch {
+    fail('Conventions install failed. Manual: save zeph rules somewhere readable');
+    return;
+  }
+  try {
+    addAiderReadDirective(join(HOME, '.aider.conf.yml'), conventionsPath);
+    ok('read: directive added to ~/.aider.conf.yml');
+  } catch {
+    fail(`Config wiring failed. Manual: add "read: ${conventionsPath}" to ~/.aider.conf.yml`);
+  }
+};
+
 const AGENT_INSTALLERS: Record<string, () => void> = {
   claude: installClaude,
   cursor: installCursor,
@@ -200,6 +287,7 @@ const AGENT_INSTALLERS: Record<string, () => void> = {
   codex: installCodex,
   copilot: installCopilot,
   cline: installCline,
+  aider: installAider,
 };
 
 // ── Test Connection ──────────────────────────────────────────────
@@ -295,11 +383,12 @@ export const handleInstall = async (args: Record<string, string | boolean>): Pro
       const labels: Record<string, string> = {
         claude: 'Install Claude Code plugin',
         cursor: 'Setup Cursor (MCP + hooks + rules)',
-        windsurf: 'Setup Windsurf (MCP + hooks)',
-        gemini: 'Setup Gemini CLI (MCP + hooks)',
-        codex: 'Setup Codex CLI (hooks)',
-        copilot: 'Setup Copilot CLI (hooks)',
+        windsurf: 'Setup Windsurf (MCP + hooks + rules)',
+        gemini: 'Setup Gemini CLI (MCP + hooks + rules)',
+        codex: 'Setup Codex CLI (hooks + rules)',
+        copilot: 'Setup Copilot CLI (hooks + rules)',
         cline: 'Setup Cline (rules)',
+        aider: 'Setup Aider (conventions)',
       };
       console.log(`    ${step}. ${labels[agent.id] ?? `Install for ${agent.name}`}`);
       step++;
