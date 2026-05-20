@@ -60,12 +60,14 @@ zeph notify --title "Hello" --json
 
 | Flag | Description |
 |------|-------------|
-| `--title <text>` | Push title |
-| `--body <text>` | Push body |
+| `--title <text>` | Push title (default: `"Task done"`) |
+| `--body <text>` | Push body (default: `"<project> · <branch>"` if cwd is a git repo, else `"<project>"`) |
 | `--url <url>` | URL to include |
 | `--type <type>` | Push type: `note`, `link`, `file`, `hook` |
 | `--priority <p>` | Priority: `low`, `normal`, `high`, `urgent` |
 | `--device <id>` | Target device ID |
+
+The defaults are tuned for hook-driven invocations (e.g. Stop hooks calling `zeph notify --title "Task done"` without a body) — you'll see which project + branch finished without writing per-IDE wrappers. Pass `--body ""` explicitly to suppress.
 
 ### List Options
 
@@ -188,9 +190,11 @@ try {
 | Copilot CLI | Session end hook |
 | Cline | Rules file |
 
-## E2E Encryption
+## Encryption
 
-Notifications are encrypted end-to-end by default (AES-256-GCM + ECDH P-256). Keys are synced with the server automatically. When encryption is disabled in the Zeph app, the CLI sends plaintext. No configuration needed.
+Push bodies are encrypted with AES-256-GCM. The wrapping key is derived via ECDH P-256 and synced across your own devices on first run so every device can read the same push. Toggle encryption in the Zeph app (Settings → Encryption); when disabled, the CLI sends plaintext. No configuration needed.
+
+**Threat model honesty:** keys are persisted on the Zeph backend to enable cross-device sync, so this is *device-shared* encryption — not true end-to-end. It protects push contents from passive network observers and from a leaked database snapshot taken without the key store, but it does **not** protect against the Zeph backend itself (it has the keys it serves to your devices). A true E2E mode (per-device keypairs, server stores only public keys, no key escrow) is on the roadmap.
 
 ## Requirements
 
