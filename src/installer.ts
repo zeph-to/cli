@@ -1,11 +1,12 @@
 import { execSync } from 'child_process';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { join, dirname } from 'path';
 import { createInterface } from 'readline';
 import { ZephHook } from './zeph-hook.js';
 import { loadConfig, resolvedEnv, saveConfig, CONFIG_FILE, VERSION } from './config.js';
 import type { ZephConfig } from './config.js';
+import { detectAgents } from './agents.js';
 import {
   CURSOR_HOOKS, CURSOR_RULE,
   WINDSURF_HOOKS, WINDSURF_RULE,
@@ -20,12 +21,6 @@ import {
 const HOME = homedir();
 
 // ── Types ────────────────────────────────────────────────────────
-
-interface Agent {
-  name: string;
-  id: string;
-  detected: boolean;
-}
 
 interface InstallArgs {
   key?: string;
@@ -46,15 +41,6 @@ const promptInput = (question: string): Promise<string> => {
       resolve(answer.trim());
     });
   });
-};
-
-const hasCommand = (cmd: string): boolean => {
-  try {
-    execSync(`which ${cmd}`, { stdio: 'pipe' });
-    return true;
-  } catch {
-    return false;
-  }
 };
 
 const writeFile = (filePath: string, content: string): void => {
@@ -104,19 +90,6 @@ const addAiderReadDirective = (confPath: string, conventionsPath: string): void 
   mkdirSync(dirname(confPath), { recursive: true });
   writeFileSync(confPath, (base ? `${base}\n\n` : '') + line);
 };
-
-// ── Agent Detection ──────────────────────────────────────────────
-
-const detectAgents = (): Agent[] => [
-  { name: 'Claude Code', id: 'claude', detected: hasCommand('claude') },
-  { name: 'Cursor', id: 'cursor', detected: existsSync(join(HOME, '.cursor')) },
-  { name: 'Windsurf', id: 'windsurf', detected: existsSync(join(HOME, '.codeium')) },
-  { name: 'Gemini CLI', id: 'gemini', detected: hasCommand('gemini') },
-  { name: 'Codex CLI', id: 'codex', detected: hasCommand('codex') },
-  { name: 'Copilot CLI', id: 'copilot', detected: existsSync(join(HOME, '.copilot')) },
-  { name: 'Cline', id: 'cline', detected: existsSync(join(HOME, '.cline')) },
-  { name: 'Aider', id: 'aider', detected: hasCommand('aider') },
-];
 
 // ── Per-Agent Installers ─────────────────────────────────────────
 

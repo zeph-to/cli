@@ -50,7 +50,10 @@ zeph notify --title "Hello" --json
 
 | Command | Description |
 |---------|-------------|
-| `install` | One-command setup: detect agents, save config, install plugins |
+| `install` | One-command setup: detect agents, save config, install rules + hooks + MCP |
+| `uninstall` | Remove Zeph from all detected agents (`--dry-run`, `--purge`) |
+| `verify` | Check installation health across detected agents (`--ping` for a live API call) |
+| `check-update` | Check whether a newer Zeph version is on npm |
 | `notify` | Send a push notification |
 | `list` | List recent push notifications |
 | `dismiss <id>` | Dismiss a push (or `--all`) |
