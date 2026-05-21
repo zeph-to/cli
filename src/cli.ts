@@ -106,6 +106,9 @@ Install options:
   --key <api-key>    API key (non-interactive)
   --hook <hook-id>   Hook ID (non-interactive)
   --base-url <url>   Base URL (non-interactive)
+  --only <agents>    Comma-separated agent ids to install for
+                     (claude,cursor,windsurf,gemini,codex,copilot,cline,aider).
+                     Skips the interactive picker.
 
 Uninstall options:
   --dry-run          Preview what would be removed, change nothing

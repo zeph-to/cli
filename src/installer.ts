@@ -7,6 +7,7 @@ import { ZephHook } from './zeph-hook.js';
 import { loadConfig, resolvedEnv, saveConfig, CONFIG_FILE, VERSION } from './config.js';
 import type { ZephConfig } from './config.js';
 import { detectAgents } from './agents.js';
+import type { Agent } from './agents.js';
 import {
   CURSOR_HOOKS, CURSOR_RULE,
   WINDSURF_HOOKS, WINDSURF_RULE,
@@ -263,6 +264,57 @@ const AGENT_INSTALLERS: Record<string, () => void> = {
   aider: installAider,
 };
 
+// One-line summary of what each agent's installer does — shown in the
+// interactive plan before anything is written.
+const AGENT_PLAN_LABELS: Record<string, string> = {
+  claude: 'Claude Code — install plugin',
+  cursor: 'Cursor — MCP + hooks + rules',
+  windsurf: 'Windsurf — MCP + hooks + rules',
+  gemini: 'Gemini CLI — MCP + hooks + rules',
+  codex: 'Codex CLI — hooks + rules',
+  copilot: 'Copilot CLI — hooks + rules',
+  cline: 'Cline — rules',
+  aider: 'Aider — conventions',
+};
+
+// ── Agent selection ──────────────────────────────────────────────
+
+/**
+ * Interactive agent picker — an @inquirer/prompts checkbox (arrow keys
+ * to move, space to toggle, enter to confirm). Every agent starts
+ * checked, so a bare Enter installs for all. Returns the chosen Agent[].
+ *
+ * Dynamic import keeps @inquirer/prompts (ESM) loadable from this
+ * CommonJS build, and means the dependency is only touched on the
+ * interactive path — `notify` / `list` / scripted `install --only`
+ * never load it.
+ */
+const pickAgentsInteractive = async (detected: Agent[]): Promise<Agent[]> => {
+  const { checkbox } = await import('@inquirer/prompts');
+  const picked = await checkbox<string>({
+    message: 'Install Zeph for which agents? (space to toggle, enter to confirm)',
+    choices: detected.map((agent) => ({
+      name: AGENT_PLAN_LABELS[agent.id] ?? agent.name,
+      value: agent.id,
+      checked: true,
+    })),
+    loop: false,
+  });
+  return detected.filter((a) => picked.includes(a.id));
+};
+
+/**
+ * Resolve agents from a non-interactive `--only cursor,gemini` flag.
+ * Matches on agent id; unknown ids are silently dropped. Exported for
+ * unit testing.
+ */
+export const filterAgentsByIds = (detected: Agent[], only: string): Agent[] => {
+  const ids = new Set(
+    only.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
+  );
+  return detected.filter((a) => ids.has(a.id));
+};
+
 // ── Test Connection ──────────────────────────────────────────────
 
 const testConnection = async (apiKey: string, baseUrl?: string): Promise<boolean> => {
@@ -309,7 +361,30 @@ export const handleInstall = async (args: Record<string, string | boolean>): Pro
     console.log('\n  No supported agents found. Config will still be saved.\n');
   }
 
-  // 2. Collect credentials
+  // 2. Choose which agents to install for — asked up front so the user
+  //    sees the choice before being walked through credential prompts.
+  let selected: Agent[] = detected;
+  const onlyArg = (args.only as string | undefined)?.trim();
+  if (detected.length > 0) {
+    if (onlyArg) {
+      // Non-interactive or scripted: --only cursor,gemini
+      selected = filterAgentsByIds(detected, onlyArg);
+      console.log(`\n  --only ${onlyArg} → ${selected.map((a) => a.name).join(', ') || '(no match)'}`);
+    } else if (nonInteractive) {
+      // Scripted run with no --only: keep the all-detected default
+      selected = detected;
+    } else {
+      try {
+        selected = await pickAgentsInteractive(detected);
+      } catch {
+        // Ctrl-C in the picker (or no TTY) — treat as a clean cancel.
+        console.log('\n  Cancelled.\n');
+        return 0;
+      }
+    }
+  }
+
+  // 3. Collect credentials
   const existing = loadConfig();
   let apiKey: string | undefined;
   let hookId: string | undefined;
@@ -347,35 +422,20 @@ export const handleInstall = async (args: Record<string, string | boolean>): Pro
     return 1;
   }
 
-  // 3. Confirmation (interactive only)
+  // 4. Show the resolved plan before touching anything (interactive only).
   if (!nonInteractive) {
     console.log('\n  Will do:');
-    console.log('    1. Save config to ~/.zeph/config.json');
-    let step = 2;
-    for (const agent of detected) {
-      const labels: Record<string, string> = {
-        claude: 'Install Claude Code plugin',
-        cursor: 'Setup Cursor (MCP + hooks + rules)',
-        windsurf: 'Setup Windsurf (MCP + hooks + rules)',
-        gemini: 'Setup Gemini CLI (MCP + hooks + rules)',
-        codex: 'Setup Codex CLI (hooks + rules)',
-        copilot: 'Setup Copilot CLI (hooks + rules)',
-        cline: 'Setup Cline (rules)',
-        aider: 'Setup Aider (conventions)',
-      };
-      console.log(`    ${step}. ${labels[agent.id] ?? `Install for ${agent.name}`}`);
-      step++;
+    console.log(`    - Save config to ${CONFIG_FILE}`);
+    for (const agent of selected) {
+      console.log(`    - ${AGENT_PLAN_LABELS[agent.id] ?? `Install for ${agent.name}`}`);
     }
-    console.log(`    ${step}. Test connection`);
-
-    const confirm = await promptInput('  Continue? [Y/n] ');
-    if (confirm.toLowerCase() === 'n') {
-      console.log('\n  Cancelled.\n');
-      return 0;
+    if (selected.length === 0) {
+      console.log('    (no agents selected — only the config file will be saved)');
     }
+    console.log('    - Test connection');
   }
 
-  // 4. Save config
+  // 5. Save config
   console.log('');
   const config: ZephConfig = {
     apiKey,
@@ -385,14 +445,14 @@ export const handleInstall = async (args: Record<string, string | boolean>): Pro
   saveConfig(config);
   ok(`Config saved to ${CONFIG_FILE}`);
 
-  // 5. Install per-agent
-  for (const agent of detected) {
+  // 6. Install for the selected agents only
+  for (const agent of selected) {
     console.log(`\n  Installing for ${agent.name}...`);
     const installer = AGENT_INSTALLERS[agent.id];
     if (installer) installer();
   }
 
-  // 6. Test connection
+  // 7. Test connection
   console.log('\n  Testing connection...');
   await testConnection(apiKey, baseUrl);
 
