@@ -52,14 +52,19 @@ describe('templates.ts: NOTIFY_CMD shape', () => {
     it('CLINE_RULE keeps zeph_notify guidance (no Stop hook for Cline)', async () => {
         const { CLINE_RULE } = await import('./templates.js');
         expect(CLINE_RULE).toContain('zeph_notify');
-        expect(CLINE_RULE).toContain('Cline does not have a Stop hook');
+        // Wording-robust: matches both the pre-refactor phrasing
+        // ("Cline does not have a Stop hook") and the shared-core
+        // refactor ("This agent has no Stop hook"). The semantic
+        // assertion is "the rule tells Cline it has no Stop hook".
+        expect(CLINE_RULE).toMatch(/no Stop hook|does not have a Stop hook/i);
     });
 
     it('CURSOR_RULE forbids manual zeph_notify (Stop hook installed)', async () => {
         const { CURSOR_RULE } = await import('./templates.js');
-        // Whitespace-flexible — the rule body wraps lines and a newline
-        // between 'call' and 'zeph_notify' is fine.
-        expect(CURSOR_RULE).toMatch(/do not need to call\s+zeph_notify/);
+        // Wording-robust: matches the pre-refactor "do not need to call
+        // zeph_notify" and the shared-core "Do NOT call zeph_notify just
+        // to announce completion". \\s+ tolerates the line wrap.
+        expect(CURSOR_RULE).toMatch(/(do not need to call|do NOT call)\s+zeph_notify/i);
     });
 
     it('CURSOR_RULE documents the irreversible-op carve-out', async () => {
