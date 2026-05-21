@@ -1,6 +1,6 @@
 # @zeph-to/hook-sdk
 
-Push notification SDK + CLI for [Zeph](https://zeph.to). Zero dependencies — uses native `fetch`.
+Push notification SDK + CLI for [Zeph](https://zeph.to). The `ZephHook` SDK uses native `fetch` with no runtime dependencies; the `zeph` CLI adds `@inquirer/prompts` for its interactive installer.
 
 ## Installation
 
@@ -202,7 +202,8 @@ Push bodies are encrypted with AES-256-GCM. The wrapping key is derived via ECDH
 ## Requirements
 
 - Node.js >= 18 (uses native `fetch`)
-- Zero runtime dependencies
+- The `ZephHook` SDK has no runtime dependencies. The CLI depends on
+  `@inquirer/prompts` for the interactive `zeph install` picker.
 
 ## License
 

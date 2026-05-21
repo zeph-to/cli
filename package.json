@@ -1,7 +1,7 @@
 {
   "name": "@zeph-to/hook-sdk",
   "version": "0.0.0-semantic-release",
-  "description": "Zeph push notification SDK + CLI — zero dependencies",
+  "description": "Zeph push notification SDK + CLI for AI agents",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -62,5 +62,8 @@
     "claude",
     "devtools"
   ],
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@inquirer/prompts": "^8.4.3"
+  }
 }
