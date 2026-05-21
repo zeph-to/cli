@@ -5,6 +5,9 @@ import { execFileSync } from 'child_process';
 import { ZephHook } from './zeph-hook.js';
 import { AuthenticationError, QuotaExceededError, ZephError } from './errors.js';
 import { handleInstall } from './installer.js';
+import { handleUninstall } from './uninstall.js';
+import { handleVerify } from './verify.js';
+import { handleCheckUpdate } from './check-update.js';
 import { loadConfig, resolvedEnv, VERSION } from './config.js';
 
 const PROJECT_DIR_VARS = ['CLAUDE_PROJECT_DIR', 'CURSOR_PROJECT_DIR', 'WINDSURF_PROJECT_DIR'] as const;
@@ -74,7 +77,10 @@ const printUsage = () => {
   console.log(`Usage: zeph <command> [options]
 
 Commands:
-  install         One-command setup: detect agents, save config, install plugins
+  install         One-command setup: detect agents, save config, install rules
+  uninstall       Remove Zeph from all detected agents
+  verify          Check installation health across detected agents
+  check-update    Check whether a newer Zeph version is available
   notify          Send a push notification
   list            List recent push notifications
   dismiss <id>    Dismiss a push notification (or --all)
@@ -100,6 +106,13 @@ Install options:
   --key <api-key>    API key (non-interactive)
   --hook <hook-id>   Hook ID (non-interactive)
   --base-url <url>   Base URL (non-interactive)
+
+Uninstall options:
+  --dry-run          Preview what would be removed, change nothing
+  --purge            Also delete ~/.zeph/config.json (kept by default)
+
+Verify options:
+  --ping             Also make a live API call to confirm the key works
 
 Global options:
   --key <api-key>    API key (or set ZEPH_API_KEY env)
@@ -311,6 +324,12 @@ const main = async (): Promise<number> => {
     case 'install':
     case 'setup':
       return handleInstall(args);
+    case 'uninstall':
+      return handleUninstall(args);
+    case 'verify':
+      return handleVerify(args);
+    case 'check-update':
+      return handleCheckUpdate(args);
     case 'notify':
       return handleNotify(args);
     case 'list':
