@@ -192,6 +192,7 @@ try {
 | Codex CLI | Stop hook |
 | Copilot CLI | Session end hook |
 | Cline | Rules file |
+| Aider | Conventions file + `read:` directive in `~/.aider.conf.yml` |
 
 ## Encryption
 
