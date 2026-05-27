@@ -28,6 +28,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
     "typescript": "^5.8.0",
     "vitest": "^2.1.9"
   },
@@ -64,6 +65,7 @@
   ],
   "license": "Apache-2.0",
   "dependencies": {
-    "@inquirer/prompts": "^8.4.3"
+    "@inquirer/prompts": "^8.4.3",
+    "ws": "^8.21.0"
   }
 }

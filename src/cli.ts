@@ -8,6 +8,8 @@ import { handleInstall } from './installer.js';
 import { handleUninstall } from './uninstall.js';
 import { handleVerify } from './verify.js';
 import { handleCheckUpdate } from './check-update.js';
+import { handleAgentSession } from './wrapper.js';
+import { handleListener } from './listener.js';
 import { loadConfig, resolvedEnv, VERSION } from './config.js';
 
 const PROJECT_DIR_VARS = ['CLAUDE_PROJECT_DIR', 'CURSOR_PROJECT_DIR', 'WINDSURF_PROJECT_DIR'] as const;
@@ -85,6 +87,11 @@ Commands:
   list            List recent push notifications
   dismiss <id>    Dismiss a push notification (or --all)
   test            Send a test notification to verify setup
+  cc              Run 'claude' in a named tmux session ('zeph-<project>')
+  codex           Run 'codex' in a named tmux session
+  gemini          Run 'gemini' in a named tmux session
+  listener        Resident daemon — injects phone messages into tmux sessions.
+                  Send a push with body '@<tmux-session> <text>' to drive it.
 
 Notify options:
   --title <text>     Push title
@@ -341,6 +348,14 @@ const main = async (): Promise<number> => {
       return handleDismiss(args);
     case 'test':
       return handleTest(args);
+    case 'cc':
+      return handleAgentSession('claude');
+    case 'codex':
+      return handleAgentSession('codex');
+    case 'gemini':
+      return handleAgentSession('gemini');
+    case 'listener':
+      return handleListener(args);
     default:
       printError(`Unknown command: ${command}`, args.json === true);
       printUsage();
