@@ -148,13 +148,24 @@ const log = (msg: string): void => console.log(`[${stamp()}] ${msg}`);
  */
 let cachedSocketPath: string | null | undefined;
 
-const probeTmuxSocket = (socketPath: string | null): boolean => {
+interface ProbeResult {
+    ok: boolean;
+    stderr?: string;
+}
+
+const probeTmuxSocketDetail = (socketPath: string | null): ProbeResult => {
     const args = socketPath ? ['-S', socketPath, 'list-sessions'] : ['list-sessions'];
     const r = spawnSync('tmux', args, {
-        stdio: ['ignore', 'ignore', 'ignore'],
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
     });
-    return r.status === 0;
+    if (r.status === 0) return { ok: true };
+    const err = ((r.stderr ?? '') as string).trim();
+    return { ok: false, stderr: err || undefined };
 };
+
+const probeTmuxSocket = (socketPath: string | null): boolean =>
+    probeTmuxSocketDetail(socketPath).ok;
 
 /** Walk `/var/folders` for user-owned `tmux-<uid>/default` sockets. Each
  * subdir is wrapped in its own try/catch — entries that belong to other
@@ -225,12 +236,24 @@ const findTmuxSocket = (): string | null => {
 
     // No live tmux yet. Log the full probe report once, then stay quiet
     // until something works — otherwise the user gets a 4-line dump
-    // every 30 seconds while they're still bringing tmux up.
+    // every 30 seconds while they're still bringing tmux up. Include the
+    // tmux binary identification + stderr for failed probes so the user
+    // can spot version mismatches (homebrew on /usr/local vs /opt/homebrew)
+    // or stale socket files.
     if (!warnedNoServer) {
-        log(`tmux: no live server yet — probed ${unique.length} candidate(s):`);
+        const which = spawnSync('which', ['tmux'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+        const tmuxPath = (which.stdout ?? '').trim() || '(not on PATH)';
+        const ver = spawnSync('tmux', ['-V'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+        const tmuxVer = (ver.stdout ?? '').trim() || '?';
+        log(`tmux: no live server yet — using ${tmuxPath} (${tmuxVer})`);
+        log(`tmux: probed ${unique.length} candidate(s):`);
         for (const path of unique) {
-            const exists = existsSync(path);
-            log(`  ${exists ? '✗' : '-'} ${path}${exists ? '  (probe failed)' : '  (no socket file)'}`);
+            if (!existsSync(path)) {
+                log(`  - ${path}  (no socket file)`);
+                continue;
+            }
+            const detail = probeTmuxSocketDetail(path);
+            log(`  ✗ ${path}  (${detail.stderr ?? 'probe failed without stderr'})`);
         }
         log(`tmux: will retry each cycle. Start a session with 'zeph cc' to pick it up.`);
         warnedNoServer = true;
