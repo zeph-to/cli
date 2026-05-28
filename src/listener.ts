@@ -152,51 +152,64 @@ const probeTmuxSocket = (socketPath: string | null): boolean => {
     return r.status === 0;
 };
 
+/** Walk `/var/folders` for user-owned `tmux-<uid>/default` sockets. Each
+ * subdir is wrapped in its own try/catch — entries that belong to other
+ * users (or that we otherwise can't read) must skip cleanly, not abort
+ * the whole walk. That was the bug in the previous pass. */
+const walkVarFolders = (uid: number): string[] => {
+    const found: string[] = [];
+    const root = '/var/folders';
+    if (!existsSync(root)) return found;
+    let topEntries: string[];
+    try { topEntries = readdirSync(root); } catch { return found; }
+    for (const a of topEntries) {
+        const aPath = `${root}/${a}`;
+        let subEntries: string[];
+        try { subEntries = readdirSync(aPath); } catch { continue; }
+        for (const b of subEntries) {
+            const sock = `${aPath}/${b}/T/tmux-${uid}/default`;
+            if (existsSync(sock)) found.push(sock);
+        }
+    }
+    return found;
+};
+
 const findTmuxSocket = (): string | null => {
     if (cachedSocketPath !== undefined) return cachedSocketPath;
 
     const uid = userInfo().uid;
     const candidates: string[] = [];
 
-    // Try whatever the user / spawner already configured first.
     const envDir = process.env.TMUX_TMPDIR || process.env.TMPDIR;
     if (envDir) candidates.push(`${envDir.replace(/\/+$/, '')}/tmux-${uid}/default`);
-
-    // Then walk macOS's per-user temp directory tree. The two random
-    // dirname components are user-specific, so we glob both. Cheap —
-    // typically a handful of subdirs.
-    try {
-        const root = '/var/folders';
-        if (existsSync(root)) {
-            for (const a of readdirSync(root)) {
-                let aStat;
-                try { aStat = statSync(`${root}/${a}`); } catch { continue; }
-                if (!aStat.isDirectory()) continue;
-                for (const b of readdirSync(`${root}/${a}`)) {
-                    const sock = `${root}/${a}/${b}/T/tmux-${uid}/default`;
-                    if (existsSync(sock)) candidates.push(sock);
-                }
-            }
-        }
-    } catch { /* ignore */ }
-
-    // Linux / fallback.
+    candidates.push(...walkVarFolders(uid));
     candidates.push(`/tmp/tmux-${uid}/default`);
 
-    // Try the default (no -S) first — succeeds when the shell that
-    // launched us shares tmux's view.
+    // De-dupe (TMPDIR may already point inside /var/folders).
+    const seen = new Set<string>();
+    const unique = candidates.filter((p) => (seen.has(p) ? false : (seen.add(p), true)));
+
+    // Default first — succeeds when the shell that launched us shares
+    // tmux's view.
     if (probeTmuxSocket(null)) {
         cachedSocketPath = null;
         return null;
     }
-    for (const path of candidates) {
-        if (!existsSync(path)) continue;
-        if (probeTmuxSocket(path)) {
+    log(`tmux: default socket empty, probing ${unique.length} candidate(s)`);
+    for (const path of unique) {
+        const exists = existsSync(path);
+        if (!exists) {
+            log(`  - ${path}  (no socket file)`);
+            continue;
+        }
+        const ok = probeTmuxSocket(path);
+        log(`  ${ok ? '→' : '✗'} ${path}${ok ? '' : '  (probe failed)'}`);
+        if (ok) {
             cachedSocketPath = path;
-            log(`tmux socket → ${path}`);
             return path;
         }
     }
+    log(`tmux: no live server found. Run 'tmux ls' from the same shell as 'zeph listener' to compare paths.`);
     cachedSocketPath = null;
     return null;
 };
