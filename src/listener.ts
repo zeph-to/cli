@@ -22,8 +22,9 @@
  */
 
 import { spawnSync } from 'child_process';
+import { createHash } from 'crypto';
 import { readdirSync, statSync } from 'fs';
-import { homedir } from 'os';
+import { homedir, hostname } from 'os';
 import { join, basename } from 'path';
 import WebSocket from 'ws';
 import { loadConfig, resolvedEnv } from './config.js';
@@ -342,12 +343,35 @@ interface SessionResult {
 }
 
 /**
+ * Stable per-host device id for the listener. We hash the OS hostname so
+ * the same machine reuses the same DeviceRecord across listener restarts
+ * (otherwise the phone's session inventory grows a new ghost device every
+ * time `zeph listener` rebinds). `dev_listener_<sha8(hostname)>` keeps it
+ * human-recognisable in dev logs without leaking the raw hostname.
+ */
+export const computeListenerDeviceId = (host: string = hostname()): string => {
+    const h = createHash('sha256').update(host).digest('hex').slice(0, 8);
+    return `dev_listener_${h}`;
+};
+
+/**
  * Open one WebSocket and stream messages until it closes. Resolves when
  * the connection is gone; the outer loop decides whether to reconnect.
  */
 const streamSession = (wsUrl: string, apiKey: string): Promise<SessionResult> =>
     new Promise<SessionResult>((resolve) => {
-        const url = `${wsUrl}?apiKey=${encodeURIComponent(apiKey)}`;
+        // deviceId + listenerNickname let the backend attach the connection
+        // to a DeviceRecord (auto-created on first connect for apiKey auth).
+        // Without these the `listener.sessions` reports are silently dropped
+        // server-side and the phone's picker stays empty.
+        const deviceId = computeListenerDeviceId();
+        const nickname = hostname() || 'listener';
+        const params = new URLSearchParams({
+            apiKey,
+            deviceId,
+            listenerNickname: nickname,
+        });
+        const url = `${wsUrl}?${params.toString()}`;
         const ws = new WebSocket(url);
 
         let pingTimer: NodeJS.Timeout | null = null;
@@ -434,7 +458,8 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     }
 
     log(`zeph listener starting — ${wsUrl}`);
-    log('Waiting for `@<tmux-session> <text>` pushes. Ctrl-C to stop.');
+    log(`device=${computeListenerDeviceId()} host=${hostname()}`);
+    log("Waiting for 'agent.command' pushes from the phone picker. Ctrl-C to stop.");
 
     let shuttingDown = false;
     const stop = (sig: string): void => {
