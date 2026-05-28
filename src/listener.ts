@@ -414,9 +414,14 @@ interface PaneInfo {
     currentPath: string | null;
 }
 
-// ASCII Unit Separator (US, 0x1f) — won't appear in command lines or
-// filesystem paths, so we can split the tmux output unambiguously.
-const FIELD_SEP = '\x1f';
+// U+241F "Symbol for Unit Separator" — a *printable* Unicode glyph
+// (3-byte UTF-8) that visually represents the C0 Unit Separator but is
+// itself a normal character. Critical detail: tmux 3.5a's `-F` format
+// escapes raw control bytes (0x00-0x1F) like `\037` for terminal safety,
+// which broke an earlier `'\x1f'` separator — the byte we passed never
+// arrived at the consumer end. A printable Unicode char passes through
+// verbatim and won't appear in any real session name or filesystem path.
+const FIELD_SEP = '␟';
 
 const readPaneInfo = (session: string): PaneInfo => {
     const r = spawnSync('tmux', tmuxArgs(['display-message', '-p', '-t', session,
