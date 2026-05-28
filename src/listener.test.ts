@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach } from 'vitest';
-import { parseInjection, checkRateLimit, handlePush } from './listener.js';
+import { parseInjection, parseSessionName, checkRateLimit, handlePush } from './listener.js';
 
 describe('parseInjection', () => {
     it('parses `@session text`', () => {
@@ -183,5 +183,81 @@ describe('handlePush', () => {
             );
             expect(ok, `expected ${shell} to be refused`).toBe(false);
         }
+    });
+
+    it("prefers structured agent.command type over body's @-prefix", () => {
+        let calledWith: { session: string; text: string } | null = null;
+        const ok = handlePush(
+            // body intentionally has @another-session to prove the
+            // structured path wins; agentSessionName is the authority.
+            {
+                pushId: '1',
+                type: 'agent.command',
+                agentSessionName: 'zeph-myapp',
+                body: '@another-session this body should not route here',
+            },
+            baseDeps({
+                paneCommand: () => 'claude',
+                inject: (session, text) => { calledWith = { session, text }; return true; },
+            }),
+        );
+        expect(ok).toBe(true);
+        expect(calledWith).toEqual({
+            session: 'zeph-myapp',
+            text: '@another-session this body should not route here',
+        });
+    });
+
+    it('agent.command path still applies the shell-pane guard', () => {
+        let injected = false;
+        const ok = handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-x', body: 'rm -rf' },
+            baseDeps({
+                paneCommand: () => 'bash',
+                inject: () => { injected = true; return true; },
+            }),
+        );
+        expect(ok).toBe(false);
+        expect(injected).toBe(false);
+    });
+
+    it('agent.command path still applies the rate limit', () => {
+        let injected = false;
+        const ok = handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-x', body: 'hi' },
+            baseDeps({
+                rateLimit: () => false,
+                inject: () => { injected = true; return true; },
+            }),
+        );
+        expect(ok).toBe(false);
+        expect(injected).toBe(false);
+    });
+
+    it('agent.command with empty body is dropped (no spurious Enter)', () => {
+        let injected = false;
+        const ok = handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-x', body: '' },
+            baseDeps({ inject: () => { injected = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(injected).toBe(false);
+    });
+});
+
+describe('parseSessionName', () => {
+    it('strips the zeph- prefix into the project field', () => {
+        expect(parseSessionName('zeph-encl')).toEqual({ project: 'encl', label: null });
+    });
+
+    it('keeps dashes inside the project name (Phase 1: no label parsing yet)', () => {
+        expect(parseSessionName('zeph-my-cool-app')).toEqual({ project: 'my-cool-app', label: null });
+    });
+
+    it('returns null for non-zeph-prefixed names', () => {
+        expect(parseSessionName('main')).toBeNull();
+        expect(parseSessionName('zeph')).toBeNull();   // no dash, no project
+        expect(parseSessionName('zeph-')).toBeNull();  // empty project
+        expect(parseSessionName('')).toBeNull();
     });
 });
