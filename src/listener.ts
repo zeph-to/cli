@@ -167,10 +167,22 @@ const probeTmuxSocketDetail = (socketPath: string | null): ProbeResult => {
 const probeTmuxSocket = (socketPath: string | null): boolean =>
     probeTmuxSocketDetail(socketPath).ok;
 
-/** Walk `/var/folders` for user-owned `tmux-<uid>/default` sockets. Each
+/**
+ * List every socket file inside a `tmux-<uid>/` directory. tmux's
+ * default socket name is `default`, but users can change it with
+ * `tmux -L <name>` or via .tmux.conf — so we probe every file we find,
+ * not just `default`. Returns absolute socket paths.
+ */
+const listSocketsIn = (dir: string): string[] => {
+    if (!existsSync(dir)) return [];
+    try { return readdirSync(dir).map((name) => `${dir}/${name}`); }
+    catch { return []; }
+};
+
+/** Walk `/var/folders` for user-owned `tmux-<uid>/*` socket files. Each
  * subdir is wrapped in its own try/catch — entries that belong to other
  * users (or that we otherwise can't read) must skip cleanly, not abort
- * the whole walk. That was the bug in the previous pass. */
+ * the whole walk. */
 const walkVarFolders = (uid: number): string[] => {
     const found: string[] = [];
     const root = '/var/folders';
@@ -182,8 +194,7 @@ const walkVarFolders = (uid: number): string[] => {
         let subEntries: string[];
         try { subEntries = readdirSync(aPath); } catch { continue; }
         for (const b of subEntries) {
-            const sock = `${aPath}/${b}/T/tmux-${uid}/default`;
-            if (existsSync(sock)) found.push(sock);
+            found.push(...listSocketsIn(`${aPath}/${b}/T/tmux-${uid}`));
         }
     }
     return found;
@@ -203,13 +214,35 @@ const findTmuxSocket = (): string | null => {
     // up a tmux server that the user launches *after* `zeph listener`.
     if (cachedSocketPath) return cachedSocketPath;
 
+    // Explicit override — for users with `tmux -L <name>` setups or
+    // unusual socket locations. Skip discovery entirely if set and
+    // probeable.
+    const override = process.env.ZEPH_TMUX_SOCKET;
+    if (override) {
+        if (probeTmuxSocket(override)) {
+            cachedSocketPath = override;
+            log(`tmux socket → ${override} (from ZEPH_TMUX_SOCKET)`);
+            warnedNoServer = false;
+            return override;
+        }
+        // Fall through to standard discovery if override fails — better
+        // than failing silently. We re-log this every cycle (no
+        // `warnedNoServer`) because it's a user-supplied setting we want
+        // to keep nagging about.
+        log(`tmux: ZEPH_TMUX_SOCKET=${override} probe failed, falling back to auto-discovery`);
+    }
+
     const uid = userInfo().uid;
     const candidates: string[] = [];
 
+    // Include every socket file we find in any `tmux-<uid>/` dir — the
+    // user might have `-L <name>` configured rather than the default
+    // socket name.
     const envDir = process.env.TMUX_TMPDIR || process.env.TMPDIR;
-    if (envDir) candidates.push(`${envDir.replace(/\/+$/, '')}/tmux-${uid}/default`);
+    if (envDir) candidates.push(...listSocketsIn(`${envDir.replace(/\/+$/, '')}/tmux-${uid}`));
     candidates.push(...walkVarFolders(uid));
-    candidates.push(`/tmp/tmux-${uid}/default`);
+    candidates.push(...listSocketsIn(`/tmp/tmux-${uid}`));
+    candidates.push(...listSocketsIn(`/private/tmp/tmux-${uid}`));
 
     const seen = new Set<string>();
     const unique = candidates.filter((p) => (seen.has(p) ? false : (seen.add(p), true)));
@@ -255,7 +288,9 @@ const findTmuxSocket = (): string | null => {
             const detail = probeTmuxSocketDetail(path);
             log(`  ✗ ${path}  (${detail.stderr ?? 'probe failed without stderr'})`);
         }
-        log(`tmux: will retry each cycle. Start a session with 'zeph cc' to pick it up.`);
+        log(`tmux: will retry each cycle. If your tmux uses a custom socket,`);
+        log(`     run \`tmux info | head -1\` in the same shell as 'zeph cc'`);
+        log(`     and pass it via:  ZEPH_TMUX_SOCKET=<path> zeph listener`);
         warnedNoServer = true;
     }
     return null;
