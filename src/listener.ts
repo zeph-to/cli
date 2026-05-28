@@ -139,8 +139,12 @@ const log = (msg: string): void => console.log(`[${stamp()}] ${msg}`);
  * common locations and use `-S <path>` for every subsequent tmux call
  * once a live server is found.
  *
- * Cached for the process lifetime; if tmux dies and respawns under a
- * different path the user has to restart `zeph listener` (rare).
+ * Caching is one-way: a successful discovery sticks for the process
+ * lifetime, but failure does NOT — we re-probe every cycle so the
+ * listener picks up a tmux server that gets started AFTER the listener
+ * itself (very common: the user opens `zeph cc` after starting the
+ * daemon). If tmux dies and respawns under a different path the user
+ * has to restart the listener (rare).
  */
 let cachedSocketPath: string | null | undefined;
 
@@ -174,8 +178,19 @@ const walkVarFolders = (uid: number): string[] => {
     return found;
 };
 
+/**
+ * Track whether the "no server anywhere" diagnostic was already logged
+ * this run. We want the user to see the path list *once* on first
+ * failure, then go quiet until we either find a server or notice a new
+ * candidate file appearing — otherwise every 30-s cycle would spam the
+ * full probe report.
+ */
+let warnedNoServer = false;
+
 const findTmuxSocket = (): string | null => {
-    if (cachedSocketPath !== undefined) return cachedSocketPath;
+    // Successful discovery sticks. Failure does NOT — we want to pick
+    // up a tmux server that the user launches *after* `zeph listener`.
+    if (cachedSocketPath) return cachedSocketPath;
 
     const uid = userInfo().uid;
     const candidates: string[] = [];
@@ -185,32 +200,41 @@ const findTmuxSocket = (): string | null => {
     candidates.push(...walkVarFolders(uid));
     candidates.push(`/tmp/tmux-${uid}/default`);
 
-    // De-dupe (TMPDIR may already point inside /var/folders).
     const seen = new Set<string>();
     const unique = candidates.filter((p) => (seen.has(p) ? false : (seen.add(p), true)));
 
     // Default first — succeeds when the shell that launched us shares
-    // tmux's view.
+    // tmux's view. We deliberately don't cache this success; on the
+    // first call though it's enough.
     if (probeTmuxSocket(null)) {
-        cachedSocketPath = null;
+        cachedSocketPath = null; // null means "use default"
+        if (!warnedNoServer) log('tmux: default socket OK');
+        warnedNoServer = false;
         return null;
     }
-    log(`tmux: default socket empty, probing ${unique.length} candidate(s)`);
+
     for (const path of unique) {
-        const exists = existsSync(path);
-        if (!exists) {
-            log(`  - ${path}  (no socket file)`);
-            continue;
-        }
-        const ok = probeTmuxSocket(path);
-        log(`  ${ok ? '→' : '✗'} ${path}${ok ? '' : '  (probe failed)'}`);
-        if (ok) {
+        if (!existsSync(path)) continue;
+        if (probeTmuxSocket(path)) {
             cachedSocketPath = path;
+            log(`tmux socket → ${path}`);
+            warnedNoServer = false;
             return path;
         }
     }
-    log(`tmux: no live server found. Run 'tmux ls' from the same shell as 'zeph listener' to compare paths.`);
-    cachedSocketPath = null;
+
+    // No live tmux yet. Log the full probe report once, then stay quiet
+    // until something works — otherwise the user gets a 4-line dump
+    // every 30 seconds while they're still bringing tmux up.
+    if (!warnedNoServer) {
+        log(`tmux: no live server yet — probed ${unique.length} candidate(s):`);
+        for (const path of unique) {
+            const exists = existsSync(path);
+            log(`  ${exists ? '✗' : '-'} ${path}${exists ? '  (probe failed)' : '  (no socket file)'}`);
+        }
+        log(`tmux: will retry each cycle. Start a session with 'zeph cc' to pick it up.`);
+        warnedNoServer = true;
+    }
     return null;
 };
 
