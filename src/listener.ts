@@ -23,8 +23,8 @@
 
 import { spawnSync } from 'child_process';
 import { createHash } from 'crypto';
-import { readdirSync, statSync } from 'fs';
-import { homedir, hostname } from 'os';
+import { existsSync, readdirSync, statSync } from 'fs';
+import { homedir, hostname, userInfo } from 'os';
 import { join, basename } from 'path';
 import WebSocket from 'ws';
 import { loadConfig, resolvedEnv } from './config.js';
@@ -99,7 +99,7 @@ export const checkRateLimit = (session: string, now: number = Date.now()): boole
 
 /** Read the foreground command in the named tmux session's active pane. */
 export const paneCurrentCommand = (session: string): string | null => {
-    const result = spawnSync('tmux', ['display-message', '-p', '-t', session, '#{pane_current_command}'], {
+    const result = spawnSync('tmux', tmuxArgs(['display-message', '-p', '-t', session, '#{pane_current_command}']), {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'ignore'],
     });
@@ -118,14 +118,94 @@ const isShellPane = (command: string | null): boolean => {
  * sequences inside the message can't drive other tmux commands.
  */
 const injectKeys = (session: string, text: string): boolean => {
-    const a = spawnSync('tmux', ['send-keys', '-l', '-t', session, text], { stdio: ['ignore', 'ignore', 'pipe'] });
+    const a = spawnSync('tmux', tmuxArgs(['send-keys', '-l', '-t', session, text]), { stdio: ['ignore', 'ignore', 'pipe'] });
     if (a.status !== 0) return false;
-    const b = spawnSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: ['ignore', 'ignore', 'pipe'] });
+    const b = spawnSync('tmux', tmuxArgs(['send-keys', '-t', session, 'Enter']), { stdio: ['ignore', 'ignore', 'pipe'] });
     return b.status === 0;
 };
 
 const stamp = (): string => new Date().toISOString().slice(11, 19);
 const log = (msg: string): void => console.log(`[${stamp()}] ${msg}`);
+
+// ─── tmux socket discovery ──────────────────────────────────────────
+
+/**
+ * macOS sets a per-user `TMPDIR` like `/var/folders/xz/.../T/`, and tmux
+ * (started from a regular shell there) lays its socket at
+ * `<TMPDIR>/tmux-<uid>/default`. When the listener is spawned from a
+ * shell with a different TMPDIR — or no TMPDIR at all (cron, launchd,
+ * IDE-managed terminals) — tmux defaults to `/tmp/tmux-<uid>/default`
+ * and the user's real server is invisible. We probe a small list of
+ * common locations and use `-S <path>` for every subsequent tmux call
+ * once a live server is found.
+ *
+ * Cached for the process lifetime; if tmux dies and respawns under a
+ * different path the user has to restart `zeph listener` (rare).
+ */
+let cachedSocketPath: string | null | undefined;
+
+const probeTmuxSocket = (socketPath: string | null): boolean => {
+    const args = socketPath ? ['-S', socketPath, 'list-sessions'] : ['list-sessions'];
+    const r = spawnSync('tmux', args, {
+        stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    return r.status === 0;
+};
+
+const findTmuxSocket = (): string | null => {
+    if (cachedSocketPath !== undefined) return cachedSocketPath;
+
+    const uid = userInfo().uid;
+    const candidates: string[] = [];
+
+    // Try whatever the user / spawner already configured first.
+    const envDir = process.env.TMUX_TMPDIR || process.env.TMPDIR;
+    if (envDir) candidates.push(`${envDir.replace(/\/+$/, '')}/tmux-${uid}/default`);
+
+    // Then walk macOS's per-user temp directory tree. The two random
+    // dirname components are user-specific, so we glob both. Cheap —
+    // typically a handful of subdirs.
+    try {
+        const root = '/var/folders';
+        if (existsSync(root)) {
+            for (const a of readdirSync(root)) {
+                let aStat;
+                try { aStat = statSync(`${root}/${a}`); } catch { continue; }
+                if (!aStat.isDirectory()) continue;
+                for (const b of readdirSync(`${root}/${a}`)) {
+                    const sock = `${root}/${a}/${b}/T/tmux-${uid}/default`;
+                    if (existsSync(sock)) candidates.push(sock);
+                }
+            }
+        }
+    } catch { /* ignore */ }
+
+    // Linux / fallback.
+    candidates.push(`/tmp/tmux-${uid}/default`);
+
+    // Try the default (no -S) first — succeeds when the shell that
+    // launched us shares tmux's view.
+    if (probeTmuxSocket(null)) {
+        cachedSocketPath = null;
+        return null;
+    }
+    for (const path of candidates) {
+        if (!existsSync(path)) continue;
+        if (probeTmuxSocket(path)) {
+            cachedSocketPath = path;
+            log(`tmux socket → ${path}`);
+            return path;
+        }
+    }
+    cachedSocketPath = null;
+    return null;
+};
+
+/** Prepend `-S <socket>` when we've discovered a non-default tmux server. */
+const tmuxArgs = (args: string[]): string[] => {
+    const sock = findTmuxSocket();
+    return sock ? ['-S', sock, ...args] : args;
+};
 
 // ─── Session inventory ──────────────────────────────────────────────
 
@@ -183,8 +263,8 @@ interface PaneInfo {
 const FIELD_SEP = '\x1f';
 
 const readPaneInfo = (session: string): PaneInfo => {
-    const r = spawnSync('tmux', ['display-message', '-p', '-t', session,
-        `#{pane_current_command}${FIELD_SEP}#{pane_start_command}${FIELD_SEP}#{pane_current_path}`], {
+    const r = spawnSync('tmux', tmuxArgs(['display-message', '-p', '-t', session,
+        `#{pane_current_command}${FIELD_SEP}#{pane_start_command}${FIELD_SEP}#{pane_current_path}`]), {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'ignore'],
     });
@@ -246,8 +326,8 @@ export interface CollectResult {
  * re-attach, and the current command is `node` rather than `claude`).
  */
 export const collectSessionsVerbose = (): CollectResult => {
-    const list = spawnSync('tmux', ['list-sessions', '-F',
-        `#{session_name}${FIELD_SEP}#{session_attached}${FIELD_SEP}#{session_created}${FIELD_SEP}#{session_activity}`], {
+    const list = spawnSync('tmux', tmuxArgs(['list-sessions', '-F',
+        `#{session_name}${FIELD_SEP}#{session_attached}${FIELD_SEP}#{session_created}${FIELD_SEP}#{session_activity}`]), {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -483,7 +563,7 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             // *this process's* perspective so the user can compare with
             // their interactive shell.
             if (sessions.length === 0 && rejected.length === 0) {
-                const raw = spawnSync('tmux', ['list-sessions', '-F', '#{session_name}'], {
+                const raw = spawnSync('tmux', tmuxArgs(['list-sessions', '-F', '#{session_name}']), {
                     encoding: 'utf-8',
                     stdio: ['ignore', 'pipe', 'pipe'],
                 });
