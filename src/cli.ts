@@ -90,8 +90,11 @@ Commands:
   cc              Run 'claude' in a named tmux session ('zeph-<project>')
   codex           Run 'codex' in a named tmux session
   gemini          Run 'gemini' in a named tmux session
-  listener        Resident daemon — injects phone messages into tmux sessions.
-                  Send a push with body '@<tmux-session> <text>' to drive it.
+                  (auto-suffixed -2/-3/… when another zeph cc is already
+                   attached to the default name)
+  listener        Resident daemon — receives 'agent.command' pushes from
+                  the phone picker and injects them into the matching
+                  tmux session.
 
 Notify options:
   --title <text>     Push title

@@ -9,7 +9,7 @@
  * ($TMUX set) it skips the outer tmux to avoid nesting and execs the
  * agent directly — letting power users keep their own multiplexer setup.
  */
-import { spawn, execFileSync } from 'child_process';
+import { spawn, execFileSync, spawnSync } from 'child_process';
 import { basename } from 'path';
 
 /** First non-empty value among the supported per-agent project dir env vars. */
@@ -31,8 +31,40 @@ export const detectProjectName = (): string => {
     return basename(process.cwd()) || 'project';
 };
 
-/** `zeph-<project>` — the canonical tmux session name for the listener to target. */
+/** `zeph-<project>` — the canonical tmux session base name. */
 export const tmuxSessionName = (project: string): string => `zeph-${project}`;
+
+const MAX_SUFFIX_ATTEMPTS = 20;
+
+/**
+ * Pick a tmux session name that won't steal focus from another live
+ * `zeph cc`. Strategy:
+ *   - If `<base>` doesn't exist → use it (create new).
+ *   - If `<base>` exists but is detached → use it (reattach).
+ *   - If `<base>` exists *and* has a client attached → try `<base>-2`,
+ *     `<base>-3`, … so the new `zeph cc` gets an independent session
+ *     instead of joining the existing one.
+ * Falls back to `<base>` after 20 attempts (shouldn't realistically hit).
+ *
+ * Detection uses `tmux has-session` and `tmux list-clients`; both are
+ * dependency-free against the user's running tmux server.
+ */
+export const findAvailableSession = (base: string): string => {
+    for (let i = 0; i < MAX_SUFFIX_ATTEMPTS; i++) {
+        const name = i === 0 ? base : `${base}-${i + 1}`;
+        const has = spawnSync('tmux', ['has-session', '-t', name], {
+            stdio: ['ignore', 'ignore', 'ignore'],
+        });
+        if (has.status !== 0) return name; // doesn't exist — fresh session
+        const clients = spawnSync('tmux', ['list-clients', '-t', name, '-F', '#{client_tty}'], {
+            encoding: 'utf-8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        const attached = (clients.stdout ?? '').trim().length > 0;
+        if (!attached) return name; // exists but detached — reattach
+    }
+    return base;
+};
 
 interface SpawnTarget {
     cmd: string;
@@ -46,9 +78,13 @@ const targetForAgent = (agent: string): SpawnTarget => {
     if (process.env.TMUX) {
         return { cmd: agent, args: [] };
     }
-    const session = tmuxSessionName(detectProjectName());
+    const base = tmuxSessionName(detectProjectName());
+    // Auto-suffix when the default name is taken by another attached
+    // session — lets the user keep `zeph cc` workflow simple and still
+    // get independent sessions when opening multiple terminals in the
+    // same project.
+    const session = findAvailableSession(base);
     // `tmux new -A`: attach if the named session exists, else create it.
-    // The agent command runs as the session's first window.
     return { cmd: 'tmux', args: ['new', '-A', '-s', session, agent] };
 };
 

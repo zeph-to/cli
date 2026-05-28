@@ -94,12 +94,23 @@ tmux session via `tmux send-keys`.
    zeph gemini    # gemini  → tmux session "zeph-<project>"
    ```
 
-   The project name is resolved from `CLAUDE_PROJECT_DIR` /
+   Project name resolves from `CLAUDE_PROJECT_DIR` /
    `CURSOR_PROJECT_DIR` / `WINDSURF_PROJECT_DIR` if set, else the git
-   repo root, else the cwd basename. If you're already inside a tmux
-   session (`$TMUX` is set) the wrapper skips the nested tmux and runs
-   the agent in the current pane — the listener can't target that
-   session by name, but you keep your existing multiplexer setup.
+   repo root, else the cwd basename.
+
+   **Multiple sessions in one project.** Open another terminal in the
+   same folder, run `zeph cc` again, and the wrapper auto-suffixes:
+   first session is `zeph-encl`, the next attached one becomes
+   `zeph-encl-2`, then `zeph-encl-3`, etc. The phone picker shows them
+   as `encl · Claude`, `encl · Claude #2`, `encl · Claude #3`. If
+   `zeph-encl` already exists but is **detached** (no one attached),
+   the wrapper reattaches to it instead of spawning a new one — close
+   the terminal, come back later, pick up where you left off.
+
+   If you're already inside a tmux session (`$TMUX` set) the wrapper
+   skips the outer tmux and runs the agent in the current pane — the
+   listener can't target an unnamed session that way, but you keep your
+   existing multiplexer setup.
 
 4. **Run the listener** (once per machine; backgrounded or under
    launchd/systemd):
@@ -110,26 +121,36 @@ tmux session via `tmux send-keys`.
 
 ### Wire format
 
-Any push whose body matches `@<session> <text>` is treated as an
-injection. The session name must be `[A-Za-z0-9._-]+` (shell-safe);
-text is everything after the first whitespace, trimmed. Other pushes
-(Stop-hook auto-pushes, `zeph_ask` responses, channel broadcasts) are
-ignored — the listener only acts on the `@` prefix.
+The phone-side picker is the supported way to drive this — the listener
+only acts on pushes with `type='agent.command'` carrying the tmux
+session name in `agentSessionName` and the message in `body`. Other
+pushes (Stop-hook auto-pushes, `zeph_ask` responses, channel
+broadcasts, plain notes) are ignored.
 
-From the phone, send a push with body:
-
-```
-@zeph-myapp 테스트 다 통과시키고 PR 올려줘
-```
-
-The listener picks it up over WS, runs:
+End-to-end the listener runs:
 
 ```
-tmux send-keys -l -t zeph-myapp "테스트 다 통과시키고 PR 올려줘"
-tmux send-keys    -t zeph-myapp Enter
+tmux send-keys -l -t <agentSessionName> "<body>"
+tmux send-keys    -t <agentSessionName> Enter
 ```
 
 …and the message lands in your CC/Codex/Gemini prompt.
+
+If you ever need to send one from the command line (debugging the
+backend, scripting), build the same structured push directly — there
+is no longer an `@<session>` body-prefix fallback:
+
+```bash
+curl -X POST "$ZEPH_BASE_URL/pushes/send" \
+  -H "X-API-Key: $ZEPH_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "type": "agent.command",
+    "targetDeviceId": "dev_...",
+    "agentSessionName": "zeph-myapp",
+    "body": "테스트 통과시키고 PR 올려줘"
+  }'
+```
 
 ### Defense
 
@@ -202,8 +223,8 @@ zeph notify --title "Hello" --json
 | `list` | List recent push notifications |
 | `dismiss <id>` | Dismiss a push (or `--all`) |
 | `test` | Verify connection and API key |
-| `cc` · `codex` · `gemini` | Run the agent in a `zeph-<project>` tmux session so the listener can address it |
-| `listener` | Resident daemon: subscribes via WebSocket and injects `@<session> <text>` pushes into matching tmux sessions |
+| `cc` · `codex` · `gemini` | Run the agent in a `zeph-<project>` tmux session (auto-suffixed `-2`, `-3`, … on attached collisions) so the listener can address it |
+| `listener` | Resident daemon: subscribes via WebSocket and injects `agent.command` pushes into the matching tmux session |
 
 ### Notify Options
 

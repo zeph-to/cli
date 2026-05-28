@@ -8,11 +8,12 @@
  * from the phone. The listener stays subscribed indefinitely and can
  * deliver to any named tmux session at any time.
  *
- * Wire format: any push whose body starts with `@<tmux-session>` followed
- * by whitespace and text is treated as an injection. Other pushes (hook
- * notifications, zeph_ask responses, etc.) are ignored. From the phone:
- *
- *   @zeph-myapp 리팩토링 마무리해줘
+ * Wire format: pushes with `type='agent.command'` carry the tmux
+ * session name in `agentSessionName` and the message in `body`. The
+ * "AI Agent에게 명령" sheet on the phone builds these structured
+ * pushes from the listener-reported session inventory. Other push
+ * types (Stop-hook auto-pushes, zeph_ask responses, channel
+ * broadcasts) are ignored.
  *
  * Transport: WebSocket against the Zeph $connect endpoint with
  * `?apiKey=<key>`. The server fan-out pushes `{ type: 'push.new', data }`
@@ -63,28 +64,6 @@ const SHELL_COMMANDS = new Set(['bash', 'zsh', 'fish', 'sh', 'dash', 'ksh', 'tcs
 // Auth-failure close codes: retrying with the same bad credentials hammers
 // the server forever, so the listener exits instead.
 const AUTH_FAILURE_CODES = new Set([4001, 4002, 4003]);
-
-/** Decomposed injection directive. */
-export interface ParsedInjection {
-    session: string;
-    text: string;
-}
-
-/**
- * Parse a push body. Null when the body is not an injection directive.
- * Shape: `@<session> <text>`. Session must be non-empty and shell-safe
- * (alphanumerics, dashes, underscores, dots). Text is everything after
- * the first whitespace run, trimmed.
- */
-export const parseInjection = (body: string | undefined): ParsedInjection | null => {
-    if (!body) return null;
-    const m = body.match(/^@([A-Za-z0-9._-]+)\s+([\s\S]+)$/);
-    if (!m) return null;
-    const session = m[1];
-    const text = m[2].trim();
-    if (!session || !text) return null;
-    return { session, text };
-};
 
 const buckets = new Map<string, { tokens: number; lastRefillAt: number }>();
 
@@ -319,13 +298,10 @@ const tryInject = (session: string, text: string, deps: HandlePushDeps): boolean
  * Process one push. Returns true when an injection actually fired.
  * Exported for unit testing with mocked deps.
  *
- * Routing:
- *   - `type='agent.command'` with `agentSessionName` — preferred path,
- *     structured fields from the phone's "AI Agent에게 명령" sheet.
- *   - `@<session> <text>` body prefix — legacy/manual path; still
- *     supported for curl-style ad-hoc sends and debugging.
- *   - Everything else (Stop-hook auto-pushes, zeph_ask responses,
- *     encrypted pushes) is ignored.
+ * Only acts on `type='agent.command'` pushes carrying both an
+ * `agentSessionName` (tmux session to inject into) and a non-empty
+ * `body`. Everything else (Stop-hook auto-pushes, zeph_ask responses,
+ * encrypted pushes, normal text/link/file notifications) is ignored.
  */
 export const handlePush = (
     push: PushItem,
@@ -333,20 +309,11 @@ export const handlePush = (
 ): boolean => {
     if (push.isEncrypted) {
         // Per-device keys aren't wired yet; encrypted pushes are opaque
-        // to the listener. Stop-hook and zeph_ask pushes are not part of
-        // the injection paths so this is fine for now.
+        // to the listener.
         return false;
     }
-
-    // Structured path — preferred.
-    if (push.type === 'agent.command' && push.agentSessionName) {
-        return tryInject(push.agentSessionName, push.body ?? '', deps);
-    }
-
-    // Legacy `@<session> <text>` prefix in body.
-    const parsed = parseInjection(push.body);
-    if (!parsed) return false;
-    return tryInject(parsed.session, parsed.text, deps);
+    if (push.type !== 'agent.command' || !push.agentSessionName) return false;
+    return tryInject(push.agentSessionName, push.body ?? '', deps);
 };
 
 // ─── WS connect loop ─────────────────────────────────────────────────

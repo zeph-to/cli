@@ -1,49 +1,5 @@
 import { describe, expect, it, beforeEach } from 'vitest';
-import { parseInjection, parseSessionName, checkRateLimit, handlePush } from './listener.js';
-
-describe('parseInjection', () => {
-    it('parses `@session text`', () => {
-        expect(parseInjection('@zeph-myapp 리팩토링 부탁')).toEqual({
-            session: 'zeph-myapp',
-            text: '리팩토링 부탁',
-        });
-    });
-
-    it('preserves internal whitespace and trims edges', () => {
-        expect(parseInjection('@s1   hello   world  ')).toEqual({
-            session: 's1',
-            text: 'hello   world',
-        });
-    });
-
-    it('accepts multi-line text', () => {
-        expect(parseInjection('@s1\nline one\nline two')).toEqual({
-            session: 's1',
-            text: 'line one\nline two',
-        });
-    });
-
-    it('returns null when prefix is not at start', () => {
-        expect(parseInjection('hi @session world')).toBeNull();
-    });
-
-    it('returns null when there is no text body', () => {
-        expect(parseInjection('@session')).toBeNull();
-        expect(parseInjection('@session   ')).toBeNull();
-    });
-
-    it('returns null on empty or undefined', () => {
-        expect(parseInjection('')).toBeNull();
-        expect(parseInjection(undefined)).toBeNull();
-    });
-
-    it('rejects session names with shell-unsafe chars', () => {
-        // ; and $ are not in the allowed [A-Za-z0-9._-] charset, so the
-        // session regex fails and the whole thing returns null.
-        expect(parseInjection('@a;b hi')).toBeNull();
-        expect(parseInjection('@a$b hi')).toBeNull();
-    });
-});
+import { parseSessionName, checkRateLimit, handlePush } from './listener.js';
 
 describe('checkRateLimit', () => {
     beforeEach(() => {
@@ -93,10 +49,28 @@ describe('handlePush', () => {
         ...override,
     });
 
-    it('ignores pushes without the @session prefix', () => {
+    const agentCmd = (overrides: Partial<Parameters<typeof handlePush>[0]> = {}) => ({
+        pushId: '1',
+        type: 'agent.command' as const,
+        agentSessionName: 'zeph-myapp',
+        body: 'do the thing',
+        ...overrides,
+    });
+
+    it('ignores pushes that are not agent.command', () => {
         let injected = false;
         const ok = handlePush(
-            { pushId: '1', body: 'Just a regular notification' },
+            { pushId: '1', type: 'note', body: 'Just a regular notification' },
+            baseDeps({ inject: () => { injected = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(injected).toBe(false);
+    });
+
+    it('ignores agent.command without agentSessionName', () => {
+        let injected = false;
+        const ok = handlePush(
+            { pushId: '1', type: 'agent.command', body: 'hello' },
             baseDeps({ inject: () => { injected = true; return true; } }),
         );
         expect(ok).toBe(false);
@@ -106,7 +80,7 @@ describe('handlePush', () => {
     it('ignores encrypted pushes (no key to decrypt body)', () => {
         let injected = false;
         const ok = handlePush(
-            { pushId: '1', body: '@s1 should be ignored', isEncrypted: true },
+            agentCmd({ isEncrypted: true }),
             baseDeps({ inject: () => { injected = true; return true; } }),
         );
         expect(ok).toBe(false);
@@ -116,20 +90,20 @@ describe('handlePush', () => {
     it('injects when session exists and pane runs an agent', () => {
         let calledWith: { session: string; text: string } | null = null;
         const ok = handlePush(
-            { pushId: '1', body: '@zeph-myapp do thing' },
+            agentCmd(),
             baseDeps({
                 paneCommand: () => 'claude',
                 inject: (session, text) => { calledWith = { session, text }; return true; },
             }),
         );
         expect(ok).toBe(true);
-        expect(calledWith).toEqual({ session: 'zeph-myapp', text: 'do thing' });
+        expect(calledWith).toEqual({ session: 'zeph-myapp', text: 'do the thing' });
     });
 
     it('refuses to inject when pane is at a shell (RCE guard)', () => {
         let injected = false;
         const ok = handlePush(
-            { pushId: '1', body: '@s1 rm -rf' },
+            agentCmd({ body: 'rm -rf' }),
             baseDeps({
                 paneCommand: () => 'bash',
                 inject: () => { injected = true; return true; },
@@ -142,7 +116,7 @@ describe('handlePush', () => {
     it('refuses when the tmux session does not exist', () => {
         let injected = false;
         const ok = handlePush(
-            { pushId: '1', body: '@ghost-session hi' },
+            agentCmd({ agentSessionName: 'ghost' }),
             baseDeps({
                 paneCommand: () => null,
                 inject: () => { injected = true; return true; },
@@ -155,7 +129,7 @@ describe('handlePush', () => {
     it('drops on rate-limit', () => {
         let injected = false;
         const ok = handlePush(
-            { pushId: '1', body: '@s1 hi' },
+            agentCmd(),
             baseDeps({
                 rateLimit: () => false,
                 inject: () => { injected = true; return true; },
@@ -168,7 +142,7 @@ describe('handlePush', () => {
     it('accepts python/node/codex/gemini as non-shell commands', () => {
         for (const cmd of ['claude', 'codex', 'gemini', 'node', 'python3']) {
             const ok = handlePush(
-                { pushId: '1', body: '@s1 hi' },
+                agentCmd(),
                 baseDeps({ paneCommand: () => cmd }),
             );
             expect(ok, `expected ${cmd} to be allowed`).toBe(true);
@@ -178,66 +152,17 @@ describe('handlePush', () => {
     it('refuses on every common shell name', () => {
         for (const shell of ['bash', 'zsh', 'fish', 'sh', 'dash', 'ksh', 'tcsh', 'csh', 'pwsh']) {
             const ok = handlePush(
-                { pushId: '1', body: '@s1 hi' },
+                agentCmd(),
                 baseDeps({ paneCommand: () => shell }),
             );
             expect(ok, `expected ${shell} to be refused`).toBe(false);
         }
     });
 
-    it("prefers structured agent.command type over body's @-prefix", () => {
-        let calledWith: { session: string; text: string } | null = null;
-        const ok = handlePush(
-            // body intentionally has @another-session to prove the
-            // structured path wins; agentSessionName is the authority.
-            {
-                pushId: '1',
-                type: 'agent.command',
-                agentSessionName: 'zeph-myapp',
-                body: '@another-session this body should not route here',
-            },
-            baseDeps({
-                paneCommand: () => 'claude',
-                inject: (session, text) => { calledWith = { session, text }; return true; },
-            }),
-        );
-        expect(ok).toBe(true);
-        expect(calledWith).toEqual({
-            session: 'zeph-myapp',
-            text: '@another-session this body should not route here',
-        });
-    });
-
-    it('agent.command path still applies the shell-pane guard', () => {
+    it('drops empty body (no spurious Enter)', () => {
         let injected = false;
         const ok = handlePush(
-            { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-x', body: 'rm -rf' },
-            baseDeps({
-                paneCommand: () => 'bash',
-                inject: () => { injected = true; return true; },
-            }),
-        );
-        expect(ok).toBe(false);
-        expect(injected).toBe(false);
-    });
-
-    it('agent.command path still applies the rate limit', () => {
-        let injected = false;
-        const ok = handlePush(
-            { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-x', body: 'hi' },
-            baseDeps({
-                rateLimit: () => false,
-                inject: () => { injected = true; return true; },
-            }),
-        );
-        expect(ok).toBe(false);
-        expect(injected).toBe(false);
-    });
-
-    it('agent.command with empty body is dropped (no spurious Enter)', () => {
-        let injected = false;
-        const ok = handlePush(
-            { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-x', body: '' },
+            agentCmd({ body: '' }),
             baseDeps({ inject: () => { injected = true; return true; } }),
         );
         expect(ok).toBe(false);
