@@ -249,14 +249,28 @@ export const collectSessionsVerbose = (): CollectResult => {
     const list = spawnSync('tmux', ['list-sessions', '-F',
         `#{session_name}${FIELD_SEP}#{session_attached}${FIELD_SEP}#{session_created}${FIELD_SEP}#{session_activity}`], {
         encoding: 'utf-8',
-        stdio: ['ignore', 'pipe', 'ignore'],
+        stdio: ['ignore', 'pipe', 'pipe'],
     });
-    if (list.status !== 0) return { sessions: [], rejected: [] };
+    if (list.status !== 0) {
+        const stderr = (list.stderr ?? '').toString().trim();
+        log(`  tmux list-sessions failed: status=${list.status}${stderr ? ', stderr=' + stderr : ''}`);
+        return { sessions: [], rejected: [] };
+    }
+
+    const rawLines = (list.stdout ?? '').split('\n').filter(Boolean);
+    // Sanity-check that the format separator actually survived. tmux is
+    // supposed to pass non-format bytes through unchanged, but if any
+    // shim (login shell, security tool, terminal wrapper) mangles the
+    // 0x1f byte we'd parse the line as a single un-split field and drop
+    // it as "not zeph-*". Detect that explicitly so the user isn't left
+    // guessing.
+    if (rawLines.length > 0 && !rawLines[0].includes(FIELD_SEP)) {
+        log(`  tmux output missing FIELD_SEP — likely encoding issue. Raw line: ${JSON.stringify(rawLines[0])}`);
+    }
 
     const sessions: AgentSession[] = [];
     const rejected: Array<{ name: string; reason: string }> = [];
-    for (const line of (list.stdout ?? '').split('\n')) {
-        if (!line) continue;
+    for (const line of rawLines) {
         const [name, attached, created, activity] = line.split(FIELD_SEP);
         const parsed = parseSessionName(name);
         if (!parsed) {
@@ -463,6 +477,27 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             // confusion (pane lost its claude start_command after a
             // re-attach) shows up directly in the log.
             for (const r of rejected) log(`  skip ${r.name}: ${r.reason}`);
+            // When the parsed result is empty AND nothing was rejected,
+            // we likely have a tmux-visibility issue (different socket,
+            // tmux server not running, etc.). Dump what tmux sees from
+            // *this process's* perspective so the user can compare with
+            // their interactive shell.
+            if (sessions.length === 0 && rejected.length === 0) {
+                const raw = spawnSync('tmux', ['list-sessions', '-F', '#{session_name}'], {
+                    encoding: 'utf-8',
+                    stdio: ['ignore', 'pipe', 'pipe'],
+                });
+                if (raw.status !== 0) {
+                    const err = (raw.stderr ?? '').toString().trim() || 'no stderr';
+                    log(`  diag: tmux list-sessions exit=${raw.status}, ${err}`);
+                } else {
+                    const all = (raw.stdout ?? '').trim().split('\n').filter(Boolean);
+                    log(`  diag: tmux sees ${all.length} session(s) total: ${all.join(', ') || '∅'}`);
+                    if (all.length > 0) {
+                        log(`  diag: none start with "zeph-" — check wrapper output or run 'zeph cc' to verify naming`);
+                    }
+                }
+            }
         };
 
         sock.on('open', () => {
