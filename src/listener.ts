@@ -179,6 +179,62 @@ const listSocketsIn = (dir: string): string[] => {
     catch { return []; }
 };
 
+/**
+ * Final-fallback socket discovery: find tmux server processes via `ps`
+ * and ask `lsof` what unix socket each is bound to. Handles the cases
+ * filesystem walking can't:
+ *   - macOS auto-cleanup deleted the socket file while the server kept
+ *     running (the most likely cause of "no server running" errors when
+ *     a tmux session is clearly alive in another iTerm/Warp pane)
+ *   - The user runs tmux with `-L <name>` or `-S <unusual-path>` that we
+ *     never thought to enumerate
+ *
+ * `lsof` on macOS may report sockets as `(deleted)`. Even then, if the
+ * server still has the inode open we can still tmux-attach by recreating
+ * the path — but for now we only return paths that still exist on disk
+ * so tmux's connect logic isn't confused. If the path is gone, the user
+ * has to `tmux kill-server` + restart anyway.
+ */
+const findTmuxViaProcess = (): string[] => {
+    const username = userInfo().username;
+    const ps = spawnSync('ps', ['-A', '-o', 'pid=,user=,command='], {
+        encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (ps.status !== 0) return [];
+
+    const tmuxPids: string[] = [];
+    for (const line of (ps.stdout ?? '').split('\n')) {
+        const m = line.match(/^\s*(\d+)\s+(\S+)\s+(.+)$/);
+        if (!m) continue;
+        const [, pid, user, cmd] = m;
+        if (user !== username) continue;
+        // Server processes show up as `tmux: server` (with the colon) on
+        // some versions; client/wrapper invocations show up as `tmux new`
+        // / `tmux attach` etc. lsof works on either.
+        if (!/(^|[^\w-])tmux($|[:\s])/.test(cmd)) continue;
+        tmuxPids.push(pid);
+    }
+    if (tmuxPids.length === 0) return [];
+
+    const found = new Set<string>();
+    for (const pid of tmuxPids) {
+        const lsof = spawnSync('lsof', ['-p', pid, '-Fn'], {
+            encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        if (lsof.status !== 0) continue;
+        // `-Fn` prints names prefixed with `n`; one per line. Filter for
+        // tmux-shaped socket paths.
+        for (const lline of (lsof.stdout ?? '').split('\n')) {
+            if (!lline.startsWith('n')) continue;
+            const path = lline.slice(1);
+            if (!/\/tmux-\d+\//.test(path)) continue;
+            if (path.endsWith(' (deleted)') || path.includes('(deleted)')) continue;
+            if (existsSync(path)) found.add(path);
+        }
+    }
+    return [...found];
+};
+
 /** Walk `/var/folders` for user-owned `tmux-<uid>/*` socket files. Each
  * subdir is wrapped in its own try/catch — entries that belong to other
  * users (or that we otherwise can't read) must skip cleanly, not abort
@@ -234,6 +290,11 @@ const findTmuxSocket = (): string | null => {
 
     const uid = userInfo().uid;
     const candidates: string[] = [];
+
+    // Process-based discovery first — it's the only path that handles
+    // stale-socket-file cases (macOS /tmp cleanup) and unusual socket
+    // locations the heuristic walks would miss.
+    candidates.push(...findTmuxViaProcess());
 
     // Include every socket file we find in any `tmux-<uid>/` dir — the
     // user might have `-L <name>` configured rather than the default
