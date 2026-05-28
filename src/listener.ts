@@ -68,9 +68,23 @@ const AUTH_FAILURE_CODES = new Set([4001, 4002, 4003]);
 
 const buckets = new Map<string, { tokens: number; lastRefillAt: number }>();
 
+// Evict idle buckets older than this so the Map can't grow without bound
+// under attack. Two refill windows past full refill = bucket is at cap
+// anyway and recreating it on next hit is free.
+const BUCKET_IDLE_TTL_MS = RATE_LIMIT_WINDOW_MS * 2;
+
+const pruneStaleBuckets = (now: number): void => {
+    for (const [key, b] of buckets) {
+        if (now - b.lastRefillAt > BUCKET_IDLE_TTL_MS) buckets.delete(key);
+    }
+};
+
 export const checkRateLimit = (session: string, now: number = Date.now()): boolean => {
+    pruneStaleBuckets(now);
     const b = buckets.get(session) ?? { tokens: RATE_LIMIT_TOKENS, lastRefillAt: now };
     const elapsed = Math.max(0, now - b.lastRefillAt);
+    // Fractional refill is intentional: smooths the boundary so a session
+    // hitting the cap doesn't have to wait a full window for the next slot.
     const refilled = Math.min(
         RATE_LIMIT_TOKENS,
         b.tokens + (elapsed / RATE_LIMIT_WINDOW_MS) * RATE_LIMIT_TOKENS,
@@ -164,14 +178,20 @@ interface PaneInfo {
     currentPath: string | null;
 }
 
+// ASCII Unit Separator (US, 0x1f) — won't appear in command lines or
+// filesystem paths, so we can split the tmux output unambiguously.
+const FIELD_SEP = '\x1f';
+
 const readPaneInfo = (session: string): PaneInfo => {
     const r = spawnSync('tmux', ['display-message', '-p', '-t', session,
-        '#{pane_current_command}|#{pane_start_command}|#{pane_current_path}'], {
+        `#{pane_current_command}${FIELD_SEP}#{pane_start_command}${FIELD_SEP}#{pane_current_path}`], {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'ignore'],
     });
     if (r.status !== 0) return { currentCommand: null, startCommand: null, currentPath: null };
-    const [current, start, path] = (r.stdout ?? '').trim().split('|');
+    const parts = (r.stdout ?? '').trim().split(FIELD_SEP);
+    if (parts.length !== 3) return { currentCommand: null, startCommand: null, currentPath: null };
+    const [current, start, path] = parts;
     return {
         currentCommand: current || null,
         startCommand: start || null,
@@ -179,19 +199,29 @@ const readPaneInfo = (session: string): PaneInfo => {
     };
 };
 
+const firstTokenBasename = (cmd: string | null): string => {
+    if (!cmd) return '';
+    return basename(cmd.split(/\s+/)[0] || '');
+};
+
 /**
- * Identify the agent type from the tmux pane's start command. We rely
- * on start_command rather than current_command because the foreground
- * process under `claude` is often `node` (the interpreter), which
- * doesn't tell us what was actually launched.
+ * Identify the agent type from the tmux pane. Prefer `pane_start_command`
+ * because the foreground process is usually `node`/`python3` (the
+ * interpreter), which doesn't tell us *what* was launched. Fall back to
+ * `pane_current_command` when start_command is empty — tmux clears
+ * start_command in some re-attach cases, especially when a pre-existing
+ * session was joined via `tmux new -A` instead of being created fresh.
+ * That fallback is safe because we only accept literal `claude` /
+ * `codex` / `gemini` as a match.
  */
 const detectAgentKind = (info: PaneInfo): AgentKind | null => {
-    const start = info.startCommand;
-    if (!start) return null;
-    // First token, basename — `/usr/local/bin/claude --foo` → `claude`.
-    const startBase = basename(start.split(/\s+/)[0] || '');
+    const startBase = firstTokenBasename(info.startCommand);
     for (const k of AGENT_KINDS) {
         if (startBase === k) return k;
+    }
+    const currentBase = firstTokenBasename(info.currentCommand);
+    for (const k of AGENT_KINDS) {
+        if (currentBase === k) return k;
     }
     return null;
 };
@@ -203,35 +233,51 @@ const epochToIso = (epoch: string | undefined): string | undefined => {
     return new Date(n * 1000).toISOString();
 };
 
+export interface CollectResult {
+    sessions: AgentSession[];
+    /** Diagnostic notes per rejected session — surfaced under `--verbose`. */
+    rejected: Array<{ name: string; reason: string }>;
+}
+
 /**
- * Snapshot the live `zeph-*` tmux sessions on this machine, enriched
- * with the running agent kind, CC session UUID (claude only), project,
- * and tmux activity timestamps. Returns [] when tmux is unreachable
- * or no agent sessions exist. Sessions whose pane is at a shell or
- * running something other than claude/codex/gemini are filtered out
- * — the phone can't usefully address them.
+ * Inventory pass that also records *why* each `zeph-*` session was
+ * skipped. The verbose log uses the rejection notes to explain empty
+ * pickers (most common cause: tmux pane lost its start_command after a
+ * re-attach, and the current command is `node` rather than `claude`).
  */
-export const collectSessions = (): AgentSession[] => {
+export const collectSessionsVerbose = (): CollectResult => {
     const list = spawnSync('tmux', ['list-sessions', '-F',
-        '#{session_name}|#{session_attached}|#{session_created}|#{session_activity}'], {
+        `#{session_name}${FIELD_SEP}#{session_attached}${FIELD_SEP}#{session_created}${FIELD_SEP}#{session_activity}`], {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'ignore'],
     });
-    if (list.status !== 0) return [];
+    if (list.status !== 0) return { sessions: [], rejected: [] };
 
-    const result: AgentSession[] = [];
+    const sessions: AgentSession[] = [];
+    const rejected: Array<{ name: string; reason: string }> = [];
     for (const line of (list.stdout ?? '').split('\n')) {
         if (!line) continue;
-        const [name, attached, created, activity] = line.split('|');
+        const [name, attached, created, activity] = line.split(FIELD_SEP);
         const parsed = parseSessionName(name);
-        if (!parsed) continue;
+        if (!parsed) {
+            // Not noisy enough to log every plain tmux session here —
+            // would clutter the verbose output on machines with many
+            // non-zeph sessions.
+            continue;
+        }
         const info = readPaneInfo(name);
         const agentKind = detectAgentKind(info);
-        if (!agentKind) continue;
+        if (!agentKind) {
+            rejected.push({
+                name,
+                reason: `no agent in pane (start=${info.startCommand ?? 'null'}, current=${info.currentCommand ?? 'null'})`,
+            });
+            continue;
+        }
         const agentSessionId = agentKind === 'claude' && info.currentPath
             ? detectClaudeSessionId(info.currentPath)
             : null;
-        result.push({
+        sessions.push({
             name,
             attached: attached === '1',
             agentKind,
@@ -242,8 +288,18 @@ export const collectSessions = (): AgentSession[] => {
             lastActivityAt: epochToIso(activity),
         });
     }
-    return result;
+    return { sessions, rejected };
 };
+
+/**
+ * Snapshot the live `zeph-*` tmux sessions on this machine, enriched
+ * with the running agent kind, CC session UUID (claude only), project,
+ * and tmux activity timestamps. Returns [] when tmux is unreachable
+ * or no agent sessions exist. Sessions whose pane is at a shell or
+ * running something other than claude/codex/gemini are filtered out
+ * — the phone can't usefully address them.
+ */
+export const collectSessions = (): AgentSession[] => collectSessionsVerbose().sessions;
 
 // ─── Push handling ──────────────────────────────────────────────────
 
@@ -354,12 +410,20 @@ export const computeListenerDeviceId = (host: string = hostname()): string => {
     return `dev_listener_${h}`;
 };
 
+interface StreamHandle {
+    done: Promise<SessionResult>;
+    terminate: () => void;
+}
+
 /**
- * Open one WebSocket and stream messages until it closes. Resolves when
- * the connection is gone; the outer loop decides whether to reconnect.
+ * Open one WebSocket and stream messages until it closes. `done` resolves
+ * when the connection is gone; the outer loop decides whether to reconnect.
+ * `terminate` lets a signal handler force-close from outside (otherwise
+ * SIGINT during an open WS would hang the loop until the server closed).
  */
-const streamSession = (wsUrl: string, apiKey: string): Promise<SessionResult> =>
-    new Promise<SessionResult>((resolve) => {
+const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
+    let ws: WebSocket | null = null;
+    const done = new Promise<SessionResult>((resolve) => {
         // deviceId + listenerNickname let the backend attach the connection
         // to a DeviceRecord (auto-created on first connect for apiKey auth).
         // Without these the `listener.sessions` reports are silently dropped
@@ -372,7 +436,8 @@ const streamSession = (wsUrl: string, apiKey: string): Promise<SessionResult> =>
             listenerNickname: nickname,
         });
         const url = `${wsUrl}?${params.toString()}`;
-        const ws = new WebSocket(url);
+        ws = new WebSocket(url);
+        const sock = ws;
 
         let pingTimer: NodeJS.Timeout | null = null;
         let pongTimer: NodeJS.Timeout | null = null;
@@ -385,12 +450,22 @@ const streamSession = (wsUrl: string, apiKey: string): Promise<SessionResult> =>
         };
 
         const reportSessions = (): void => {
-            if (ws.readyState !== WebSocket.OPEN) return;
-            const sessions = collectSessions();
-            ws.send(JSON.stringify({ type: 'listener.sessions', data: { sessions } }));
+            if (sock.readyState !== WebSocket.OPEN) return;
+            const { sessions, rejected } = collectSessionsVerbose();
+            sock.send(JSON.stringify({ type: 'listener.sessions', data: { sessions } }));
+            // One line per cycle gives the user immediate feedback on
+            // what the phone picker will see — particularly important
+            // during setup, when an empty picker has no other observable
+            // cause.
+            const names = sessions.map((s) => s.name).join(', ') || '∅';
+            log(`reported ${sessions.length} session(s): ${names}`);
+            // Explain skipped zeph-* sessions so the most common
+            // confusion (pane lost its claude start_command after a
+            // re-attach) shows up directly in the log.
+            for (const r of rejected) log(`  skip ${r.name}: ${r.reason}`);
         };
 
-        ws.on('open', () => {
+        sock.on('open', () => {
             log('connected');
             // Initial inventory so the phone's picker has something to
             // show as soon as the listener comes online.
@@ -398,16 +473,16 @@ const streamSession = (wsUrl: string, apiKey: string): Promise<SessionResult> =>
             sessionsTimer = setInterval(reportSessions, SESSION_REPORT_INTERVAL_MS);
 
             pingTimer = setInterval(() => {
-                if (ws.readyState !== WebSocket.OPEN) return;
-                ws.send(JSON.stringify({ type: 'ping' }));
+                if (sock.readyState !== WebSocket.OPEN) return;
+                sock.send(JSON.stringify({ type: 'ping' }));
                 pongTimer = setTimeout(() => {
                     log('! pong timeout — forcing reconnect');
-                    ws.terminate();
+                    sock.terminate();
                 }, PONG_TIMEOUT_MS);
             }, PING_INTERVAL_MS);
         });
 
-        ws.on('message', (raw) => {
+        sock.on('message', (raw) => {
             if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; }
             let msg: unknown;
             try {
@@ -422,15 +497,21 @@ const streamSession = (wsUrl: string, apiKey: string): Promise<SessionResult> =>
             // `push.sync` (offline batch on $connect) and other types ignored.
         });
 
-        ws.on('error', (err) => {
+        sock.on('error', (err) => {
             log(`! ws error: ${err.message}`);
         });
 
-        ws.on('close', (code, reasonBuf) => {
+        sock.on('close', (code, reasonBuf) => {
             cleanup();
-            resolve({ closeCode: code, reason: reasonBuf.toString('utf-8') });
+            resolve({ closeCode: code, reason: reasonBuf?.toString('utf-8') ?? '' });
         });
     });
+
+    return {
+        done,
+        terminate: () => { ws?.terminate(); },
+    };
+};
 
 const resolveWsUrl = (args: Record<string, string | boolean>, config: { wsUrl?: string }): string | null => {
     const fromArg = typeof args['ws-url'] === 'string' ? (args['ws-url'] as string) : null;
@@ -462,17 +543,23 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     log("Waiting for 'agent.command' pushes from the phone picker. Ctrl-C to stop.");
 
     let shuttingDown = false;
+    let activeHandle: StreamHandle | null = null;
     const stop = (sig: string): void => {
         if (shuttingDown) return;
         shuttingDown = true;
         log(`received ${sig}, stopping`);
+        // Force-close any open WS so the streamSession promise resolves
+        // immediately instead of waiting for the server to drop us.
+        activeHandle?.terminate();
     };
     process.on('SIGINT', () => stop('SIGINT'));
     process.on('SIGTERM', () => stop('SIGTERM'));
 
     let attempt = 0;
     while (!shuttingDown) {
-        const result = await streamSession(wsUrl, apiKey);
+        activeHandle = streamSession(wsUrl, apiKey);
+        const result = await activeHandle.done;
+        activeHandle = null;
 
         if (AUTH_FAILURE_CODES.has(result.closeCode ?? -1)) {
             console.error(`zeph listener: auth failure (${result.closeCode} ${result.reason}). Check API key.`);
