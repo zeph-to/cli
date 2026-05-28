@@ -15,20 +15,25 @@ import { basename } from 'path';
 /** First non-empty value among the supported per-agent project dir env vars. */
 const PROJECT_DIR_ENVS = ['CLAUDE_PROJECT_DIR', 'CURSOR_PROJECT_DIR', 'WINDSURF_PROJECT_DIR'] as const;
 
+const FALLBACK_NAME = 'project';
+
+/** basename(), with a stable fallback for edge paths like `/`. */
+const safeBasename = (path: string): string => basename(path) || FALLBACK_NAME;
+
 /** Resolve a project name for the tmux session: env > git root > cwd basename. */
 export const detectProjectName = (): string => {
     for (const key of PROJECT_DIR_ENVS) {
         const v = process.env[key];
-        if (v) return basename(v.replace(/\/+$/, '')) || 'project';
+        if (v) return safeBasename(v.replace(/\/+$/, ''));
     }
     try {
         const root = execFileSync('git', ['rev-parse', '--show-toplevel'], {
             encoding: 'utf-8',
             stdio: ['ignore', 'pipe', 'ignore'],
         }).trim();
-        if (root) return basename(root) || 'project';
+        if (root) return safeBasename(root);
     } catch { /* not a git repo — fall through */ }
-    return basename(process.cwd()) || 'project';
+    return safeBasename(process.cwd());
 };
 
 /** `zeph-<project>` — the canonical tmux session base name. */
@@ -95,8 +100,24 @@ const targetForAgent = (agent: string): SpawnTarget => {
 export const handleAgentSession = (agent: string): Promise<number> => {
     return new Promise<number>((resolve) => {
         const { cmd, args } = targetForAgent(agent);
+        const start = Date.now();
         const child = spawn(cmd, args, { stdio: 'inherit' });
-        child.on('exit', (code) => resolve(code ?? 0));
+        child.on('exit', (code) => {
+            const dur = Date.now() - start;
+            // Short-lived non-zero exits are the symptom of "ran from a
+            // pane that isn't a real TTY" (iTerm tmux integration pane,
+            // some IDE terminals). The user otherwise just sees their
+            // shell return with `[exited]` and no clue what went wrong.
+            if (code && code !== 0 && dur < 2000) {
+                console.error(
+                    `zeph: ${cmd} ${args.join(' ')} exited ${code} after ${dur}ms.\n` +
+                    `  If this terminal is itself inside tmux (or an iTerm/Warp\n` +
+                    `  tmux-integration pane), run \`zeph cc\` from a plain shell\n` +
+                    `  pane instead — \`tmux new\` needs a real TTY to attach.`,
+                );
+            }
+            resolve(code ?? 0);
+        });
         child.on('error', (err: NodeJS.ErrnoException) => {
             if (err.code === 'ENOENT') {
                 console.error(`zeph: '${cmd}' not found on PATH`);

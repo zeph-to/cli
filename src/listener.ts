@@ -36,9 +36,11 @@ const RECONNECT_MAX_MS = 30_000;
 const RECONNECT_JITTER_RATIO = 0.15;
 
 // How often the listener reports its tmux session inventory to the
-// backend (in addition to immediately on $connect). Cheap; tmux runs
-// locally and the payload is small.
-const SESSION_REPORT_INTERVAL_MS = 30_000;
+// backend (in addition to immediately on $connect). Cheap — tmux runs
+// locally, the payload is small, and the user expects the phone picker
+// to reflect new `zeph cc` sessions within a few seconds, not half a
+// minute.
+const SESSION_REPORT_INTERVAL_MS = 5_000;
 
 type AgentKind = 'claude' | 'codex' | 'gemini';
 const AGENT_KINDS: readonly AgentKind[] = ['claude', 'codex', 'gemini'];
