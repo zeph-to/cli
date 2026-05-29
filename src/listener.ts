@@ -23,7 +23,7 @@
 
 import { spawnSync } from 'child_process';
 import { createHash } from 'crypto';
-import { existsSync, readdirSync, statSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { homedir, hostname, userInfo } from 'os';
 import { join, basename } from 'path';
 import WebSocket from 'ws';
@@ -796,8 +796,66 @@ const resolveWsUrl = (args: Record<string, string | boolean>, config: { wsUrl?: 
     return fromArg || resolvedEnv('ZEPH_WS_URL') || config.wsUrl || null;
 };
 
+// ── Singleton guard (PID file) ──────────────────────────────────────
+
+const ZEPH_DIR = join(homedir(), '.zeph');
+const LISTENER_PID_FILE = join(ZEPH_DIR, 'listener.pid');
+
+/**
+ * Whether another `zeph listener` is already running on this machine.
+ * The wrapper's autostart and a user typing `zeph listener` by hand can
+ * race — both check this guard so we don't spawn duplicates that
+ * compete for the same `agent.command` pushes.
+ *
+ * Stale PID files (process gone) are treated as "no listener" so the
+ * wrapper can recover from crashes without manual cleanup.
+ */
+const otherListenerAlive = (): number | null => {
+    try {
+        const pid = Number(readFileSync(LISTENER_PID_FILE, 'utf-8').trim());
+        if (!Number.isFinite(pid) || pid <= 0 || pid === process.pid) return null;
+        process.kill(pid, 0); // existence check, throws if dead
+        return pid;
+    } catch {
+        return null;
+    }
+};
+
+const writeListenerPid = (): void => {
+    try {
+        mkdirSync(ZEPH_DIR, { recursive: true });
+        writeFileSync(LISTENER_PID_FILE, String(process.pid));
+    } catch (err) {
+        log(`! could not write ${LISTENER_PID_FILE}: ${(err as Error).message}`);
+    }
+};
+
+const removeListenerPid = (): void => {
+    try {
+        if (!existsSync(LISTENER_PID_FILE)) return;
+        // Only remove our own pid file — don't trample a successor's.
+        const pid = Number(readFileSync(LISTENER_PID_FILE, 'utf-8').trim());
+        if (pid === process.pid) unlinkSync(LISTENER_PID_FILE);
+    } catch { /* best-effort */ }
+};
+
 export const handleListener = async (args: Record<string, string | boolean>): Promise<number> => {
     verifyTmux();
+
+    // Refuse to start when another listener is already running. The
+    // wrapper's autostart calls us blindly on every `zeph cc`; the user
+    // running `zeph listener` directly does too. Bail with exit 0 (not
+    // an error — there *is* a listener, just not us).
+    const otherPid = otherListenerAlive();
+    if (otherPid) {
+        if (process.env.ZEPH_LISTENER_AUTOSTART === '1') {
+            // Autostart from the wrapper — stay quiet on the happy path.
+            return 0;
+        }
+        console.error(`zeph listener: another listener is already running (pid ${otherPid}). ` +
+            `Tail \`~/.zeph/listener.log\` to follow it, or kill ${otherPid} first.`);
+        return 0;
+    }
 
     const config = loadConfig();
     const apiKey = (args.key as string) || resolvedEnv('ZEPH_API_KEY') || config.apiKey;
@@ -816,8 +874,11 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
         return 1;
     }
 
+    writeListenerPid();
+    process.on('exit', removeListenerPid);
+
     log(`zeph listener starting — ${wsUrl}`);
-    log(`device=${computeListenerDeviceId()} host=${hostname()}`);
+    log(`device=${computeListenerDeviceId()} host=${hostname()} pid=${process.pid}`);
     log("Waiting for 'agent.command' pushes from the phone picker. Ctrl-C to stop.");
 
     let shuttingDown = false;
@@ -841,6 +902,7 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
 
         if (AUTH_FAILURE_CODES.has(result.closeCode ?? -1)) {
             console.error(`zeph listener: auth failure (${result.closeCode} ${result.reason}). Check API key.`);
+            removeListenerPid();
             return 3;
         }
 
@@ -852,5 +914,6 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
         attempt = Math.min(attempt + 1, 10);
     }
 
+    removeListenerPid();
     return 0;
 };

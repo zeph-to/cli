@@ -10,7 +10,9 @@
  * agent directly — letting power users keep their own multiplexer setup.
  */
 import { spawn, execFileSync, spawnSync } from 'child_process';
-import { basename } from 'path';
+import { existsSync, mkdirSync, openSync, readFileSync } from 'fs';
+import { homedir } from 'os';
+import { basename, join } from 'path';
 
 /** First non-empty value among the supported per-agent project dir env vars. */
 const PROJECT_DIR_ENVS = ['CLAUDE_PROJECT_DIR', 'CURSOR_PROJECT_DIR', 'WINDSURF_PROJECT_DIR'] as const;
@@ -76,12 +78,17 @@ interface SpawnTarget {
     args: string[];
 }
 
-const targetForAgent = (agent: string): SpawnTarget => {
+/** POSIX shell-quote so passthrough args survive being joined into a tmux shell-command string. */
+const SHELL_SAFE = /^[\w\-./=:@%+,]+$/;
+const shellQuote = (s: string): string =>
+    s.length > 0 && SHELL_SAFE.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
+
+const targetForAgent = (agent: string, extra: string[]): SpawnTarget => {
     // Already inside tmux → no nested session, just run the agent in the
     // current pane. Nested tmux prefix collisions are confusing and the
     // listener can't reach a session it didn't name anyway.
     if (process.env.TMUX) {
-        return { cmd: agent, args: [] };
+        return { cmd: agent, args: extra };
     }
     const base = tmuxSessionName(detectProjectName());
     // Auto-suffix when the default name is taken by another attached
@@ -90,16 +97,91 @@ const targetForAgent = (agent: string): SpawnTarget => {
     // same project.
     const session = findAvailableSession(base);
     // `tmux new -A`: attach if the named session exists, else create it.
-    return { cmd: 'tmux', args: ['new', '-A', '-s', session, agent] };
+    // tmux joins trailing argv into a single shell-command, so flags like
+    // `--resume` would be eaten by tmux's own parser. Build one quoted
+    // shell string instead, which tmux passes through verbatim.
+    const shellCmd = [agent, ...extra].map(shellQuote).join(' ');
+    return { cmd: 'tmux', args: ['new', '-A', '-s', session, shellCmd] };
+};
+
+// ── Background listener auto-start ────────────────────────────────────
+
+const ZEPH_DIR = join(homedir(), '.zeph');
+const LISTENER_PID_FILE = join(ZEPH_DIR, 'listener.pid');
+const LISTENER_LOG_FILE = join(ZEPH_DIR, 'listener.log');
+
+/** True when the PID file points at a still-alive process. */
+const listenerAlive = (): boolean => {
+    try {
+        const pid = Number(readFileSync(LISTENER_PID_FILE, 'utf-8').trim());
+        if (!Number.isFinite(pid) || pid <= 0) return false;
+        // Signal 0 = existence check; throws when the process is gone.
+        process.kill(pid, 0);
+        return true;
+    } catch {
+        return false;
+    }
+};
+
+/**
+ * Path to the running cli.js entry. We're invoked AS cli.js (the bin
+ * shim defined in package.json), so process.argv[1] is our entry point.
+ * Resolves whether the user calls `zeph cc` via the npm-installed shim
+ * or directly via `node dist/cli.js cc`.
+ */
+const resolveCliPath = (): string | null => {
+    const entry = process.argv[1];
+    if (!entry) return null;
+    // Sanity check: only autostart when we recognise the entry — refuse
+    // to spawn an unknown binary from a weird invocation.
+    if (!/cli\.(js|ts|mjs|cjs)$/.test(entry)) return null;
+    return entry;
+};
+
+/**
+ * Spawn `zeph listener` in the background if it isn't already running on
+ * this machine. The intent is that the user only ever has to know about
+ * `zeph cc` — the phone-to-tmux bridge tags along automatically. Output
+ * goes to `~/.zeph/listener.log` so it isn't lost on detach; the listener
+ * itself writes its own PID to `~/.zeph/listener.pid` on startup and
+ * removes it on graceful exit, so subsequent `zeph cc` invocations skip
+ * the spawn when a listener is already up.
+ *
+ * Failure here is non-fatal — `zeph cc` still launches the agent. The
+ * user just loses the phone-bridge feature until they restart.
+ */
+const ensureListenerRunning = (): void => {
+    if (listenerAlive()) return;
+    const cliPath = resolveCliPath();
+    if (!cliPath || !existsSync(cliPath)) return;
+    try {
+        mkdirSync(ZEPH_DIR, { recursive: true });
+        const out = openSync(LISTENER_LOG_FILE, 'a');
+        const child = spawn(process.execPath, [cliPath, 'listener'], {
+            detached: true,
+            stdio: ['ignore', out, out],
+            env: { ...process.env, ZEPH_LISTENER_AUTOSTART: '1' },
+        });
+        child.unref();
+        console.log(`zeph: listener autostarted in background (log: ${LISTENER_LOG_FILE})`);
+    } catch (err) {
+        console.error(`zeph: listener autostart failed: ${(err as Error).message}`);
+    }
 };
 
 /**
  * Launch the agent in a named tmux session (or directly if nested) and
- * forward its exit code. Returns when the agent exits.
+ * forward its exit code. `extra` is appended to the agent invocation, so
+ * `zeph cc --resume foo` runs `claude --resume foo` inside the session.
+ * Returns when the agent exits.
  */
-export const handleAgentSession = (agent: string): Promise<number> => {
+export const handleAgentSession = (agent: string, extra: string[] = []): Promise<number> => {
+    // Best-effort: make sure the phone-bridge daemon is running before we
+    // launch the agent. The user shouldn't need to remember a second
+    // command for the picker on their phone to work.
+    ensureListenerRunning();
     return new Promise<number>((resolve) => {
-        const { cmd, args } = targetForAgent(agent);
+        const { cmd, args } = targetForAgent(agent, extra);
         const start = Date.now();
         const child = spawn(cmd, args, { stdio: 'inherit' });
         child.on('exit', (code) => {
