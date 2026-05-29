@@ -53,17 +53,23 @@ tmux session via `tmux send-keys`.
 ### Architecture
 
 ```
-[phone]
-   │  push body: "@zeph-myapp 리팩토링 마무리해줘"
-   ▼
+[phone — "Active Agents" picker on Zeph app]
+   │  selects session, types message
+   ▼  POST /pushes/send  { type: 'agent.command',
+   │                       agentSessionName: 'zeph-myapp',
+   │                       body: '리팩토링 마무리해줘' }
 [Zeph backend]
    │  WebSocket fan-out (push.new)
    ▼
-[zeph listener (resident daemon)]
+[zeph listener — resident daemon, started by `zeph cc` automatically]
    │  tmux send-keys -l -t zeph-myapp "리팩토링 마무리해줘" + Enter
    ▼
 [tmux session "zeph-myapp" running claude / codex / gemini]
 ```
+
+The listener also reports its tmux session inventory back to the server
+every 5 seconds, so the phone picker stays in sync — no manual
+configuration needed once a session is running.
 
 ### Setup
 
@@ -82,11 +88,9 @@ tmux session via `tmux send-keys`.
    }
    ```
 
-   Alternatively set `ZEPH_WS_URL` in your shell env, or pass
-   `--ws-url` to the listener.
+   Alternatively set `ZEPH_WS_URL` in your shell env.
 
-3. **Run agents through the wrapper** so they end up in a named tmux
-   session the listener can address:
+3. **Run agents through the wrapper.** That's it.
 
    ```bash
    zeph cc        # claude  → tmux session "zeph-<project>"
@@ -94,9 +98,24 @@ tmux session via `tmux send-keys`.
    zeph gemini    # gemini  → tmux session "zeph-<project>"
    ```
 
+   The first `zeph cc` on a machine **auto-spawns a background
+   listener** (singleton, PID file at `~/.zeph/listener.pid`,
+   stdout/stderr at `~/.zeph/listener.log`). You never run
+   `zeph listener` by hand — every `zeph cc` checks the PID file and
+   skips the spawn when one is already alive, so opening a dozen
+   terminals doesn't create a dozen daemons. The daemon survives
+   between `zeph cc` invocations.
+
    Project name resolves from `CLAUDE_PROJECT_DIR` /
    `CURSOR_PROJECT_DIR` / `WINDSURF_PROJECT_DIR` if set, else the git
-   repo root, else the cwd basename.
+   repo root, else the cwd basename. Any extra args after the command
+   pass through to the agent verbatim:
+
+   ```bash
+   zeph cc --resume "abc123"
+   zeph cc --dangerously-skip-permissions
+   zeph codex --model gpt-5-high "fix the failing test"
+   ```
 
    **Multiple sessions in one project.** Open another terminal in the
    same folder, run `zeph cc` again, and the wrapper auto-suffixes:
@@ -112,33 +131,71 @@ tmux session via `tmux send-keys`.
    listener can't target an unnamed session that way, but you keep your
    existing multiplexer setup.
 
-4. **Run the listener** (once per machine; backgrounded or under
-   launchd/systemd):
+### Diagnostics
 
-   ```bash
-   zeph listener &
-   ```
+The auto-spawned listener writes to two files under `~/.zeph/`:
+
+- `listener.pid` — the running daemon's PID. `cat ~/.zeph/listener.pid`
+  + `ps -p <pid>` to confirm it's alive.
+- `listener.log` — stdout + stderr from the daemon. `tail -f` to watch.
+
+A healthy listener log shows one line per cycle:
+
+```
+[xx:xx:xx] reported 2 session(s): zeph-myapp, zeph-otherapp
+[xx:xx:xx] ✓ server persisted 2 session(s)
+```
+
+If you see `! server rejected listener.sessions: ...` instead, the
+message points at the failure (auth, missing device record, etc.) so
+you can fix the actual problem instead of guessing.
+
+To force a restart — e.g. after upgrading `@zeph-to/hook-sdk`:
+
+```bash
+kill $(cat ~/.zeph/listener.pid)
+rm ~/.zeph/listener.pid
+zeph cc        # autospawns the new build
+```
+
+To run it in the foreground (for development of the SDK itself):
+
+```bash
+zeph listener
+```
+
+You'll get the same logs you'd otherwise tail from `listener.log`.
+
+### Custom tmux sockets
+
+The listener auto-discovers the tmux socket — it probes the default
+location, walks per-user `$TMPDIR` paths (macOS `/var/folders/.../T/`),
+falls back to `/tmp/tmux-<uid>/`, and finally finds running tmux servers
+via `lsof` so stale socket files don't trip discovery. If your tmux
+uses `tmux -L <name>` or a non-standard `-S <path>`, set the override
+explicitly:
+
+```bash
+export ZEPH_TMUX_SOCKET=/path/to/socket
+```
+
+(The wrapper passes the env to the auto-spawned listener, so setting
+it in your shell rc is enough.)
 
 ### Wire format
 
-The phone-side picker is the supported way to drive this — the listener
-only acts on pushes with `type='agent.command'` carrying the tmux
-session name in `agentSessionName` and the message in `body`. Other
-pushes (Stop-hook auto-pushes, `zeph_ask` responses, channel
-broadcasts, plain notes) are ignored.
-
-End-to-end the listener runs:
+The listener only acts on pushes with `type='agent.command'` carrying
+the tmux session name in `agentSessionName` and the message in `body`.
+Other pushes (Stop-hook auto-pushes, `zeph_ask` responses, channel
+broadcasts, plain notes) are ignored. End-to-end:
 
 ```
 tmux send-keys -l -t <agentSessionName> "<body>"
 tmux send-keys    -t <agentSessionName> Enter
 ```
 
-…and the message lands in your CC/Codex/Gemini prompt.
-
-If you ever need to send one from the command line (debugging the
-backend, scripting), build the same structured push directly — there
-is no longer an `@<session>` body-prefix fallback:
+If you need to send one from the command line (debugging, scripting),
+build the structured push directly:
 
 ```bash
 curl -X POST "$ZEPH_BASE_URL/pushes/send" \
@@ -146,7 +203,7 @@ curl -X POST "$ZEPH_BASE_URL/pushes/send" \
   -H 'Content-Type: application/json' \
   -d '{
     "type": "agent.command",
-    "targetDeviceId": "dev_...",
+    "targetDeviceId": "dev_listener_<sha8(hostname)>",
     "agentSessionName": "zeph-myapp",
     "body": "테스트 통과시키고 PR 올려줘"
   }'
@@ -223,8 +280,8 @@ zeph notify --title "Hello" --json
 | `list` | List recent push notifications |
 | `dismiss <id>` | Dismiss a push (or `--all`) |
 | `test` | Verify connection and API key |
-| `cc` · `codex` · `gemini` | Run the agent in a `zeph-<project>` tmux session (auto-suffixed `-2`, `-3`, … on attached collisions) so the listener can address it |
-| `listener` | Resident daemon: subscribes via WebSocket and injects `agent.command` pushes into the matching tmux session |
+| `cc` · `codex` · `gemini` | Run the agent in a `zeph-<project>` tmux session (auto-suffixed `-2`, `-3`, … on attached collisions). Auto-spawns the background listener on first invocation so the phone picker just works. Trailing args pass through to the agent (`zeph cc --resume "..."`) |
+| `listener` | (Usually unnecessary — `zeph cc` autospawns it.) Resident daemon: subscribes via WebSocket, reports tmux session inventory every 5 s, injects `agent.command` pushes into the matching session. Run in the foreground for SDK development; otherwise let `zeph cc` manage it |
 
 ### Notify Options
 
@@ -307,6 +364,7 @@ The CLI checks `CLAUDE_PROJECT_DIR`, `CURSOR_PROJECT_DIR`,
 | `ZEPH_API_KEY` | API key (fallback when `--key` not provided) |
 | `ZEPH_BASE_URL` | API base URL (default: `https://api.zeph.to/v1`) |
 | `ZEPH_WS_URL` | WebSocket endpoint for `zeph listener` (no default — required) |
+| `ZEPH_TMUX_SOCKET` | Explicit tmux socket path for the listener (skips auto-discovery — use when your tmux runs with `-L <name>` or a custom `-S <path>`) |
 | `ZEPH_SESSION_ID` | AI session ID (fallback when `--session` not provided) |
 
 ## SDK Usage
