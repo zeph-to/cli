@@ -148,7 +148,13 @@ const log = (msg: string): void => console.log(`[${stamp()}] ${msg}`);
  * daemon). If tmux dies and respawns under a different path the user
  * has to restart the listener (rare).
  */
-let cachedSocketPath: string | null | undefined;
+let cachedSocketPath: string | null = null;
+/** True once we've confirmed a working socket. `cachedSocketPath` of
+ *  `null` is ambiguous on its own — it can mean either "use default
+ *  (we verified it works)" or "we haven't checked yet". This flag
+ *  removes the ambiguity so we don't re-probe every collectSessions
+ *  cycle (which was spamming the log with "tmux: default socket OK"). */
+let cacheValid = false;
 
 interface ProbeResult {
     ok: boolean;
@@ -270,7 +276,7 @@ let warnedNoServer = false;
 const findTmuxSocket = (): string | null => {
     // Successful discovery sticks. Failure does NOT — we want to pick
     // up a tmux server that the user launches *after* `zeph listener`.
-    if (cachedSocketPath) return cachedSocketPath;
+    if (cacheValid) return cachedSocketPath;
 
     // Explicit override — for users with `tmux -L <name>` setups or
     // unusual socket locations. Skip discovery entirely if set and
@@ -279,6 +285,7 @@ const findTmuxSocket = (): string | null => {
     if (override) {
         if (probeTmuxSocket(override)) {
             cachedSocketPath = override;
+            cacheValid = true;
             log(`tmux socket → ${override} (from ZEPH_TMUX_SOCKET)`);
             warnedNoServer = false;
             return override;
@@ -315,6 +322,7 @@ const findTmuxSocket = (): string | null => {
     // first call though it's enough.
     if (probeTmuxSocket(null)) {
         cachedSocketPath = null; // null means "use default"
+        cacheValid = true;
         if (!warnedNoServer) log('tmux: default socket OK');
         warnedNoServer = false;
         return null;
@@ -324,6 +332,7 @@ const findTmuxSocket = (): string | null => {
         if (!existsSync(path)) continue;
         if (probeTmuxSocket(path)) {
             cachedSocketPath = path;
+            cacheValid = true;
             log(`tmux socket → ${path}`);
             warnedNoServer = false;
             return path;
