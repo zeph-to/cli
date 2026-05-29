@@ -778,9 +778,20 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                 return; // malformed — ignore
             }
             if (!msg || typeof msg !== 'object') return;
-            const m = msg as { type?: string; data?: PushItem };
+            const m = msg as { type?: string; data?: unknown; message?: string };
             if (m.type === 'pong') return;
-            if (m.type === 'push.new' && m.data) handlePush(m.data);
+            if (m.type === 'push.new' && m.data) handlePush(m.data as PushItem);
+            // Surface server-side errors from listener.sessions reports.
+            // Without this the daemon happily logs "reported N session(s)"
+            // even when the server is silently dropping every message —
+            // exactly how the picker-empty bug stayed hidden for weeks.
+            if (m.type === 'listener.sessions.error') {
+                log(`! server rejected listener.sessions: ${m.message ?? '(no detail)'}`);
+            }
+            if (m.type === 'listener.sessions.ack') {
+                const d = m.data as { count?: number; updatedAt?: string } | undefined;
+                log(`✓ server persisted ${d?.count ?? '?'} session(s)`);
+            }
             // `push.sync` (offline batch on $connect) and other types ignored.
         });
 
