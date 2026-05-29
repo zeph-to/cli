@@ -9,6 +9,7 @@ export interface ZephConfig {
   apiKey?: string;
   hookId?: string;
   baseUrl?: string;
+  wsUrl?: string;
   deviceId?: string;
 }
 
