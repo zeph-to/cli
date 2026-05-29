@@ -87,11 +87,13 @@ Commands:
   list            List recent push notifications
   dismiss <id>    Dismiss a push notification (or --all)
   test            Send a test notification to verify setup
-  cc              Run 'claude' in a named tmux session ('zeph-<project>')
-  codex           Run 'codex' in a named tmux session
-  gemini          Run 'gemini' in a named tmux session
+  cc [args…]      Run 'claude' in a named tmux session ('zeph-<project>')
+  codex [args…]   Run 'codex' in a named tmux session
+  gemini [args…]  Run 'gemini' in a named tmux session
                   (auto-suffixed -2/-3/… when another zeph cc is already
-                   attached to the default name)
+                   attached to the default name; any args after the
+                   subcommand are forwarded verbatim, e.g.
+                   'zeph cc --resume')
   listener        Resident daemon — receives 'agent.command' pushes from
                   the phone picker and injects them into the matching
                   tmux session.
@@ -317,6 +319,18 @@ const handleError = (err: unknown, isJson: boolean): number => {
   return 1;
 };
 
+// ── Passthrough ─────────────────────────────────────────────────
+
+/**
+ * Collect raw argv after the given subcommand token so flags like
+ * `--resume` reach the wrapped agent verbatim instead of being swallowed
+ * by `parseArgs`. Returns [] when the command isn't found.
+ */
+const collectPassthrough = (argv: string[], cmd: string): string[] => {
+  const idx = argv.indexOf(cmd, 2);
+  return idx >= 0 ? argv.slice(idx + 1) : [];
+};
+
 // ── Main ────────────────────────────────────────────────────────
 
 const main = async (): Promise<number> => {
@@ -352,11 +366,11 @@ const main = async (): Promise<number> => {
     case 'test':
       return handleTest(args);
     case 'cc':
-      return handleAgentSession('claude');
+      return handleAgentSession('claude', collectPassthrough(process.argv, 'cc'));
     case 'codex':
-      return handleAgentSession('codex');
+      return handleAgentSession('codex', collectPassthrough(process.argv, 'codex'));
     case 'gemini':
-      return handleAgentSession('gemini');
+      return handleAgentSession('gemini', collectPassthrough(process.argv, 'gemini'));
     case 'listener':
       return handleListener(args);
     default:
