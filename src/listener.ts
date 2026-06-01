@@ -156,6 +156,19 @@ let cachedSocketPath: string | null = null;
  *  cycle (which was spamming the log with "tmux: default socket OK"). */
 let cacheValid = false;
 
+/**
+ * Mark the cached socket as no longer trustworthy — call this when a
+ * tmux command fails against the cached path. The next findTmuxSocket()
+ * will redo full discovery (default probe → /var/folders walk → lsof
+ * fallback) instead of returning a stale answer. Without this the
+ * listener wedged at "reported 0 session(s)" forever after a tmux
+ * server restart, even when a new server was live and discoverable.
+ */
+export const invalidateTmuxSocketCache = (): void => {
+    cacheValid = false;
+    cachedSocketPath = null;
+};
+
 interface ProbeResult {
     ok: boolean;
     stderr?: string;
@@ -541,6 +554,11 @@ export const collectSessionsVerbose = (): CollectResult => {
     if (list.status !== 0) {
         const stderr = (list.stderr ?? '').toString().trim();
         log(`  tmux list-sessions failed: status=${list.status}${stderr ? ', stderr=' + stderr : ''}`);
+        // Tmux call failed against the cached socket — the server it
+        // pointed at is gone (died, restarted at a different path, etc).
+        // Invalidate so the next cycle re-runs full discovery instead of
+        // wedging the listener at "reported 0 session(s)" forever.
+        invalidateTmuxSocketCache();
         return { sessions: [], rejected: [] };
     }
 
