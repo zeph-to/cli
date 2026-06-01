@@ -3,6 +3,15 @@ name: Release
 on:
   push:
     branches: [main]
+  # Manual trigger for retrying a release after a failed run without
+  # needing a no-op commit. semantic-release is idempotent — it'll skip
+  # publishing if the analyzed commit range produces no version bump.
+  workflow_dispatch:
+
+# Prevent two release runs racing each other on rapid pushes.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -16,14 +25,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # semantic-release needs full git history to scan commits since
+          # the last release tag.
           fetch-depth: 0
           persist-credentials: false
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
-      - run: npm install
+          # Cache node_modules across runs for faster CI.
+          cache: npm
+
+      # Reproducible install — fails if package-lock.json is out of date.
+      - run: npm ci
+
+      # Type-check + unit tests. Block the release on any failure so we
+      # never publish a broken build to npm.
       - run: npm run build
+      - run: npm test
+
       - name: Semantic Release
         run: npx semantic-release
         env:
