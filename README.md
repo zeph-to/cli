@@ -1,5 +1,10 @@
 # @zeph-to/hook-sdk
 
+[![npm](https://img.shields.io/npm/v/@zeph-to/hook-sdk.svg)](https://www.npmjs.com/package/@zeph-to/hook-sdk)
+[![downloads](https://img.shields.io/npm/dm/@zeph-to/hook-sdk.svg)](https://www.npmjs.com/package/@zeph-to/hook-sdk)
+[![node](https://img.shields.io/node/v/@zeph-to/hook-sdk.svg)](https://nodejs.org)
+[![license](https://img.shields.io/npm/l/@zeph-to/hook-sdk.svg)](./LICENSE)
+
 Push notification SDK + CLI for [Zeph](https://zeph.to), with an optional
 resident listener that **drives Claude Code / Codex / Gemini sessions
 from your phone** by injecting messages into named tmux sessions.
