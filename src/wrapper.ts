@@ -10,7 +10,7 @@
  * agent directly — letting power users keep their own multiplexer setup.
  */
 import { spawn, execFileSync, spawnSync } from 'child_process';
-import { existsSync, mkdirSync, openSync, readFileSync } from 'fs';
+import { existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { basename, join } from 'path';
 
@@ -150,12 +150,29 @@ const resolveCliPath = (): string | null => {
  * Failure here is non-fatal — `zeph cc` still launches the agent. The
  * user just loses the phone-bridge feature until they restart.
  */
+/**
+ * Rotate the listener log once it grows past 5 MB. The daemon runs for
+ * days and writes 2-3 lines per 5-s cycle, so without rotation the file
+ * climbs into the tens of megabytes range pretty quickly. We keep the
+ * previous run's tail under `.old` for post-mortem and start fresh.
+ */
+const LISTENER_LOG_MAX_BYTES = 5 * 1024 * 1024;
+
+const rotateListenerLogIfLarge = (): void => {
+    try {
+        if (!existsSync(LISTENER_LOG_FILE)) return;
+        if (statSync(LISTENER_LOG_FILE).size <= LISTENER_LOG_MAX_BYTES) return;
+        renameSync(LISTENER_LOG_FILE, LISTENER_LOG_FILE + '.old');
+    } catch { /* best-effort */ }
+};
+
 const ensureListenerRunning = (): void => {
     if (listenerAlive()) return;
     const cliPath = resolveCliPath();
     if (!cliPath || !existsSync(cliPath)) return;
     try {
         mkdirSync(ZEPH_DIR, { recursive: true });
+        rotateListenerLogIfLarge();
         const out = openSync(LISTENER_LOG_FILE, 'a');
         const child = spawn(process.execPath, [cliPath, 'listener'], {
             detached: true,

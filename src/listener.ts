@@ -393,13 +393,21 @@ export const parseSessionName = (name: string): { project: string; label: string
 const CLAUDE_PROJECTS_DIR = join(homedir(), '.claude', 'projects');
 
 /**
- * Locate the most recent Claude Code session UUID for the working
- * directory of a tmux pane. Mirrors `mcp-server/config.ts`'s
- * detectClaudeSessionId: CC writes per-session jsonl files at
- * `~/.claude/projects/<projectHash>/<UUID>.jsonl` where the hash is
- * the cwd with `/` replaced by `-`.
+ * Cache for detectClaudeSessionId. The function walks every jsonl file
+ * in `~/.claude/projects/<hash>/` on each call — after weeks of CC use
+ * that directory holds hundreds of session files, and we were calling
+ * this per tmux session per 5-second report cycle. Heavy disk I/O
+ * compounded with multiple sessions caused the report cycle to spike
+ * CPU and starve the host shell.
+ *
+ * The current-session UUID only changes when a new CC session starts
+ * in that directory (rare, on the order of hours), so a 60-second TTL
+ * is safe and cuts the per-cycle stat count by ~12×.
  */
-export const detectClaudeSessionId = (cwd: string): string | null => {
+const claudeSessionCache = new Map<string, { sessionId: string | null; expiresAt: number }>();
+const CLAUDE_SESSION_CACHE_TTL_MS = 60_000;
+
+const doDetectClaudeSessionId = (cwd: string): string | null => {
     try {
         const projectHash = cwd.replace(/\//g, '-');
         const sessionsDir = join(CLAUDE_PROJECTS_DIR, projectHash);
@@ -417,6 +425,33 @@ export const detectClaudeSessionId = (cwd: string): string | null => {
     } catch {
         return null;
     }
+};
+
+/**
+ * Locate the most recent Claude Code session UUID for the working
+ * directory of a tmux pane. Mirrors `mcp-server/config.ts`'s
+ * detectClaudeSessionId: CC writes per-session jsonl files at
+ * `~/.claude/projects/<projectHash>/<UUID>.jsonl` where the hash is
+ * the cwd with `/` replaced by `-`. Cached for 60s — see
+ * claudeSessionCache.
+ */
+export const detectClaudeSessionId = (cwd: string): string | null => {
+    const now = Date.now();
+    const cached = claudeSessionCache.get(cwd);
+    if (cached && cached.expiresAt > now) return cached.sessionId;
+
+    // Cap cache size so a long-lived listener that's seen many cwds
+    // doesn't grow unbounded. 64 is plenty for any realistic setup.
+    if (claudeSessionCache.size >= 64) {
+        // Evict the oldest-expiring entry — Map iteration order is
+        // insertion order, so the first key we hit is the oldest.
+        const firstKey = claudeSessionCache.keys().next().value;
+        if (firstKey !== undefined) claudeSessionCache.delete(firstKey);
+    }
+
+    const sessionId = doDetectClaudeSessionId(cwd);
+    claudeSessionCache.set(cwd, { sessionId, expiresAt: now + CLAUDE_SESSION_CACHE_TTL_MS });
+    return sessionId;
 };
 
 interface PaneInfo {
@@ -900,6 +935,18 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     log(`zeph listener starting — ${wsUrl}`);
     log(`device=${computeListenerDeviceId()} host=${hostname()} pid=${process.pid}`);
     log("Waiting for 'agent.command' pushes from the phone picker. Ctrl-C to stop.");
+
+    // Heartbeat memory log — once an hour. Lets the user (and us) spot
+    // gradual growth in a long-running daemon before it gets bad enough
+    // to make the host shell unresponsive. The MB counter is human-
+    // readable and tiny enough not to bloat the log.
+    const HEAP_LOG_INTERVAL_MS = 60 * 60 * 1000;
+    const heapLogTimer = setInterval(() => {
+        const m = process.memoryUsage();
+        const mb = (n: number) => Math.round(n / 1024 / 1024);
+        log(`heap: rss=${mb(m.rss)}MB heapUsed=${mb(m.heapUsed)}MB external=${mb(m.external)}MB`);
+    }, HEAP_LOG_INTERVAL_MS);
+    heapLogTimer.unref();
 
     let shuttingDown = false;
     let activeHandle: StreamHandle | null = null;
