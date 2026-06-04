@@ -124,18 +124,28 @@ const listenerAlive = (): boolean => {
 };
 
 /**
- * Path to the running cli.js entry. We're invoked AS cli.js (the bin
- * shim defined in package.json), so process.argv[1] is our entry point.
- * Resolves whether the user calls `zeph cc` via the npm-installed shim
- * or directly via `node dist/cli.js cc`.
+ * Path to the running cli.js entry. wrapper.js sits next to cli.js in
+ * dist/, so __dirname resolves it directly — independent of how the
+ * user invoked us.
+ *
+ * `process.argv[1]` is unreliable here: when `zeph` runs via the
+ * npm-installed bin shim (`/usr/local/bin/zeph` → cli.js via a wrapper
+ * script), argv[1] is the shim path (`.../bin/zeph`), NOT `cli.js`.
+ * That made the original `/cli\\.(js|ts|mjs|cjs)$/` check silently
+ * reject the entry and the autospawn never fired — exactly the bug
+ * the user hit ('원래 싱글톤으로 됐었잖아' — yes, on the local alias
+ * path where argv[1] IS cli.js; the bug only surfaced once the user
+ * switched to the global npm install).
+ *
+ * Fall back to argv[1] only when the __dirname-relative file doesn't
+ * exist (some packaging where dist layout differs).
  */
 const resolveCliPath = (): string | null => {
+    const local = join(__dirname, 'cli.js');
+    if (existsSync(local)) return local;
     const entry = process.argv[1];
-    if (!entry) return null;
-    // Sanity check: only autostart when we recognise the entry — refuse
-    // to spawn an unknown binary from a weird invocation.
-    if (!/cli\.(js|ts|mjs|cjs)$/.test(entry)) return null;
-    return entry;
+    if (entry && /cli\.(js|ts|mjs|cjs)$/.test(entry)) return entry;
+    return null;
 };
 
 /**
