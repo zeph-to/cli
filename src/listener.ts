@@ -511,9 +511,23 @@ const readPaneInfo = (session: string): PaneInfo => {
     };
 };
 
+/**
+ * Strip the surrounding quotes tmux uses when serialising commands
+ * with spaces. `tmux display-message -p '#{pane_start_command}'`
+ * outputs `"claude --resume xxx"` (literal double-quotes around the
+ * whole shell-command form the wrapper passed). Without unwrapping,
+ * the leading `"` made the basename check fail and the listener
+ * skipped the session as 'no agent in pane'.
+ */
+const unwrapQuotes = (cmd: string): string => {
+    const m = cmd.match(/^"(.+)"$/) || cmd.match(/^'(.+)'$/);
+    return m ? m[1] : cmd;
+};
+
 const firstTokenBasename = (cmd: string | null): string => {
     if (!cmd) return '';
-    return basename(cmd.split(/\s+/)[0] || '');
+    const stripped = unwrapQuotes(cmd.trim());
+    return basename(stripped.split(/\s+/)[0] || '');
 };
 
 /**
