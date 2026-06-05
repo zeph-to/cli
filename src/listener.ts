@@ -35,6 +35,18 @@ const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
 const RECONNECT_JITTER_RATIO = 0.15;
 
+// Hard ceiling on WebSocket connection open time. `ws` has no default
+// timeout; without this an unreachable backend (NAT drop, suspended
+// laptop network) can hang forever in CONNECTING state and the listener
+// quietly stops reporting.
+const WS_CONNECT_TIMEOUT_MS = 20_000;
+
+// If no successful round-trip (server-persisted ack) is observed within
+// this window, the socket is presumed half-open — TCP says alive but the
+// peer never replies. macOS App Nap / Wi-Fi handoff / VPN flap all
+// surface this way. Force-terminate so the reconnect loop runs.
+const WS_STALL_TIMEOUT_MS = 90_000;
+
 // How often the listener reports its tmux session inventory to the
 // backend (in addition to immediately on $connect). Cheap — tmux runs
 // locally, the payload is small, and the user expects the phone picker
@@ -761,12 +773,31 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
         let pingTimer: NodeJS.Timeout | null = null;
         let pongTimer: NodeJS.Timeout | null = null;
         let sessionsTimer: NodeJS.Timeout | null = null;
+        let connectTimer: NodeJS.Timeout | null = null;
+        let stallTimer: NodeJS.Timeout | null = null;
+        // Updated on every server-acked round-trip (ack / pong). The
+        // stall watchdog terminates the WS if this stays stale too long,
+        // which lets the reconnect loop recover from half-open sockets
+        // (suspended laptop, NAT drop, server unreachable but TCP alive).
+        let lastRoundTripAt = Date.now();
 
         const cleanup = (): void => {
             if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
             if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; }
             if (sessionsTimer) { clearInterval(sessionsTimer); sessionsTimer = null; }
+            if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
+            if (stallTimer) { clearInterval(stallTimer); stallTimer = null; }
         };
+
+        // If the WS doesn't reach OPEN within the timeout, kill it.
+        // Otherwise an unreachable backend (DNS / route / SG drop) keeps
+        // the socket in CONNECTING forever and `done` never resolves.
+        connectTimer = setTimeout(() => {
+            if (sock.readyState !== WebSocket.OPEN) {
+                log(`! connect timeout after ${WS_CONNECT_TIMEOUT_MS / 1000}s — terminating`);
+                sock.terminate();
+            }
+        }, WS_CONNECT_TIMEOUT_MS);
 
         const reportSessions = (): void => {
             if (sock.readyState !== WebSocket.OPEN) return;
@@ -806,6 +837,8 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
         };
 
         sock.on('open', () => {
+            if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
+            lastRoundTripAt = Date.now();
             log('connected');
             // Initial inventory so the phone's picker has something to
             // show as soon as the listener comes online.
@@ -820,10 +853,26 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                     sock.terminate();
                 }, PONG_TIMEOUT_MS);
             }, PING_INTERVAL_MS);
+
+            // Independent stall watchdog. If we go > WS_STALL_TIMEOUT_MS
+            // without any server message landing — ack, pong, anything —
+            // the socket is effectively half-open. ping/pong should catch
+            // most of this but a sleeping laptop can pause the JS timer
+            // such that pongTimer is checked AFTER the suspension and
+            // appears 'recently scheduled'. The watchdog uses wall-clock
+            // delta vs lastRoundTripAt so it's resilient to that.
+            stallTimer = setInterval(() => {
+                if (sock.readyState !== WebSocket.OPEN) return;
+                if (Date.now() - lastRoundTripAt > WS_STALL_TIMEOUT_MS) {
+                    log(`! no server traffic for ${Math.round((Date.now() - lastRoundTripAt) / 1000)}s — terminating`);
+                    sock.terminate();
+                }
+            }, 15_000);
         });
 
         sock.on('message', (raw) => {
             if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; }
+            lastRoundTripAt = Date.now();
             let msg: unknown;
             try {
                 msg = JSON.parse(raw.toString('utf-8'));
