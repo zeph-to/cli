@@ -24,15 +24,30 @@ npx @zeph-to/hook-sdk notify --title "Hello"
 ## Quick Start
 
 ```bash
-# Interactive — detects agents, saves config, installs plugins
-npx @zeph-to/hook-sdk install
+# Sign in via browser — auto-fetches your API key + hook into
+# ~/.zeph/config.json (no copy-paste)
+npx @zeph-to/hook-sdk login
 
-# Non-interactive (one line from Zeph app)
+# Install for your AI agents (rules + hooks + MCP). Reuses the saved
+# config; detects Claude Code / Cursor / Windsurf / Gemini / Codex / …
+npx @zeph-to/hook-sdk install
+```
+
+`login` opens a browser to the Zeph web app, asks you to confirm "connect
+this computer", then issues a fresh API key (labelled with your hostname)
+and reuses or creates a hook — writing both back to `~/.zeph/config.json`
+over a localhost loopback. No credential ever gets pasted into the
+terminal.
+
+Prefer to paste credentials yourself (or on a headless box with no
+browser)? Skip `login` and pass them to `install` directly:
+
+```bash
 npx @zeph-to/hook-sdk install --key ak_... --hook hook_...
 ```
 
-Saves to `~/.zeph/config.json`. All Zeph tools (CLI, MCP server, plugin
-hooks, listener) read this file.
+Either way it saves to `~/.zeph/config.json`. All Zeph tools (CLI, MCP
+server, plugin hooks, listener) read this file.
 
 To **send** notifications:
 
@@ -277,6 +292,7 @@ zeph notify --title "Hello" --json
 
 | Command | Description |
 |---------|-------------|
+| `login` | Browser sign-in: auto-fetch API key + hook into `~/.zeph/config.json` over a localhost loopback (`--web-url`, `--timeout`). No copy-paste |
 | `install` | One-command setup: detect agents, save config, install rules + hooks + MCP |
 | `uninstall` | Remove Zeph from all detected agents (`--dry-run`, `--purge`) |
 | `verify` | Check installation health across detected agents (`--ping` for a live API call) |
