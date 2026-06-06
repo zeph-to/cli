@@ -4,15 +4,22 @@ import { hostname } from 'node:os';
 import { spawn } from 'node:child_process';
 import type { AddressInfo } from 'node:net';
 import { loadConfig, saveConfig } from './config.js';
-import type { ZephConfig } from './config.js';
 
 const DEFAULT_WEB_URL = 'https://app.zeph.to';
 const DEFAULT_TIMEOUT_SEC = 300;
 
-type CallbackConfig = Pick<ZephConfig, 'apiKey' | 'hookId' | 'baseUrl' | 'wsUrl'>;
+/** Credentials returned by a completed login. apiKey is guaranteed present
+ *  (parseCallback rejects a missing key with 400). Shared by handleLogin and
+ *  handleInstall via runLoginFlow. */
+export type LoginFlowResult = {
+  apiKey: string;
+  hookId?: string;
+  baseUrl?: string;
+  wsUrl?: string;
+};
 
 type CallbackResult =
-  | { ok: true; config: CallbackConfig }
+  | { ok: true; config: LoginFlowResult }
   | { ok: false; status: number; reason: string };
 
 // ── Pure helpers (unit-tested) ───────────────────────────────────
@@ -31,7 +38,7 @@ export const buildBridgeUrl = (webUrl: string, port: number, state: string, host
   return `${base}/auth/cli-bridge?${params.toString()}`;
 };
 
-export const persistConfig = (next: CallbackConfig): void => {
+export const persistConfig = (next: LoginFlowResult): void => {
   const existing = loadConfig();
   saveConfig({ ...existing, ...stripUndefined(next) });
 };
@@ -92,14 +99,14 @@ const respond = (res: ServerResponse, status: number, body: string): void => {
 interface ServerHandle {
   port: number;
   /** Resolves with the validated config once the browser hits /cb. */
-  done: Promise<CallbackConfig>;
+  done: Promise<LoginFlowResult>;
   close: () => void;
 }
 
 const startLoopbackServer = (state: string): Promise<ServerHandle> => {
-  let settle!: (config: CallbackConfig) => void;
+  let settle!: (config: LoginFlowResult) => void;
   let fail!: (err: Error) => void;
-  const done = new Promise<CallbackConfig>((res, rej) => {
+  const done = new Promise<LoginFlowResult>((res, rej) => {
     settle = res;
     fail = rej;
   });
@@ -135,13 +142,27 @@ const headlessHint = (bridgeUrl: string): void => {
   console.error(`    ${bridgeUrl}\n`);
 };
 
-export const handleLogin = async (args: Record<string, string | boolean>): Promise<number> => {
-  // parseArgs yields `true` for a value-less flag (e.g. bare `--web-url`);
-  // guard so it can't slip through as a malformed URL or a 1-second timeout.
-  const rawWebUrl = args['web-url'];
-  const webUrl = typeof rawWebUrl === 'string' ? rawWebUrl : DEFAULT_WEB_URL;
-  const rawTimeout = args.timeout;
-  const timeoutSec = typeof rawTimeout === 'string' ? Number(rawTimeout) : DEFAULT_TIMEOUT_SEC;
+export const resolveWebUrl = (raw: string | boolean | undefined): string =>
+  typeof raw === 'string' ? raw : DEFAULT_WEB_URL;
+
+export const resolveTimeoutSec = (raw: string | boolean | undefined): number => {
+  if (typeof raw !== 'string') return DEFAULT_TIMEOUT_SEC;
+  const n = Number(raw);
+  // Reject NaN / non-positive — a bad --timeout must not fire setTimeout instantly.
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_TIMEOUT_SEC;
+};
+
+/**
+ * Core login flow shared by `handleLogin` (CLI command) and `handleInstall`
+ * (auto-trigger on missing credentials). Returns the issued credentials, or
+ * null when the browser can't open (headless) or the callback never arrives.
+ * `deps.open` is injectable for tests; defaults to the real browser launcher.
+ */
+export const runLoginFlow = async (
+  opts: { webUrl: string; timeoutSec: number },
+  deps: { open?: (url: string) => boolean } = {},
+): Promise<LoginFlowResult | null> => {
+  const open = deps.open ?? openBrowser;
   const state = randomBytes(16).toString('hex');
 
   let handle: ServerHandle;
@@ -149,31 +170,46 @@ export const handleLogin = async (args: Record<string, string | boolean>): Promi
     handle = await startLoopbackServer(state);
   } catch (err) {
     console.error(`  Error: could not start local server (${err instanceof Error ? err.message : 'unknown'})`);
-    return 1;
+    return null;
   }
 
-  const bridgeUrl = buildBridgeUrl(webUrl, handle.port, state, hostname());
+  const bridgeUrl = buildBridgeUrl(opts.webUrl, handle.port, state, hostname());
   console.log(`\n  Opening browser to sign in...\n    ${bridgeUrl}\n`);
 
-  if (!openBrowser(bridgeUrl)) headlessHint(bridgeUrl);
+  if (!open(bridgeUrl)) {
+    headlessHint(bridgeUrl);
+    handle.close();
+    return null;
+  }
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error('timed out waiting for browser')), timeoutSec * 1000);
+    timer = setTimeout(() => reject(new Error('timed out waiting for browser')), opts.timeoutSec * 1000);
     timer.unref();
   });
 
   try {
-    const config = await Promise.race([handle.done, timeout]);
-    console.log(`  + Config saved. API key: ${config.apiKey?.slice(0, 12)}…`);
-    if (config.hookId) console.log(`  + Hook: ${config.hookId}`);
-    console.log('\n  Done! Restart your agents.\n');
-    return 0;
-  } catch (err) {
-    console.error(`\n  Error: ${err instanceof Error ? err.message : 'login failed'}\n`);
-    return 1;
+    return await Promise.race([handle.done, timeout]);
+  } catch {
+    return null;
   } finally {
     if (timer) clearTimeout(timer);
     handle.close();
   }
+};
+
+export const handleLogin = async (args: Record<string, string | boolean>): Promise<number> => {
+  const webUrl = resolveWebUrl(args['web-url']);
+  const timeoutSec = resolveTimeoutSec(args.timeout);
+
+  const result = await runLoginFlow({ webUrl, timeoutSec });
+  if (!result) {
+    console.error('\n  Error: login did not complete\n');
+    return 1;
+  }
+
+  console.log(`  + Config saved. API key: ${result.apiKey.slice(0, 12)}…`);
+  if (result.hookId) console.log(`  + Hook: ${result.hookId}`);
+  console.log('\n  Done! Restart your agents.\n');
+  return 0;
 };

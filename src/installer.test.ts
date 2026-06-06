@@ -41,6 +41,23 @@ const expectedMcpEntry = (apiKey: string = '${ZEPH_API_KEY}') => ({
     env: { ZEPH_API_KEY: apiKey },
 });
 
+describe('shouldTriggerLogin', () => {
+    it('triggers for a brand-new interactive install (no key anywhere)', async () => {
+        const { shouldTriggerLogin } = await import('./installer.js');
+        expect(shouldTriggerLogin(false, undefined)).toBe(true);
+    });
+
+    it('does not trigger when a config/env key already exists', async () => {
+        const { shouldTriggerLogin } = await import('./installer.js');
+        expect(shouldTriggerLogin(false, 'ak_existing')).toBe(false);
+    });
+
+    it('does not trigger in non-interactive mode (--key/--hook given)', async () => {
+        const { shouldTriggerLogin } = await import('./installer.js');
+        expect(shouldTriggerLogin(true, undefined)).toBe(false);
+    });
+});
+
 describe('templates.ts: NOTIFY_CMD shape', () => {
     it('uses graceful zeph || npx fallback', async () => {
         const tmpl = await import('./templates.js');

@@ -90,6 +90,31 @@ describe('persistConfig', () => {
     });
 });
 
+describe('resolveTimeoutSec', () => {
+    it('falls back to default for a non-numeric value (no instant setTimeout)', async () => {
+        const { resolveTimeoutSec } = await import('./login.js');
+        expect(resolveTimeoutSec('abc')).toBe(300);
+        expect(resolveTimeoutSec('0')).toBe(300);
+        expect(resolveTimeoutSec(true)).toBe(300);
+        expect(resolveTimeoutSec('45')).toBe(45);
+    });
+});
+
+describe('runLoginFlow', () => {
+    it('returns null immediately when the browser cannot open (headless)', async () => {
+        const { runLoginFlow } = await import('./login.js');
+        const result = await runLoginFlow({ webUrl: 'https://x', timeoutSec: 60 }, { open: () => false });
+        expect(result).toBeNull();
+    });
+
+    it('returns null on timeout when no callback arrives', async () => {
+        const { runLoginFlow } = await import('./login.js');
+        // open succeeds but nothing hits /cb; short timeout resolves to null fast
+        const result = await runLoginFlow({ webUrl: 'https://x', timeoutSec: 0.05 }, { open: () => true });
+        expect(result).toBeNull();
+    });
+});
+
 describe('parseCallback', () => {
     it('accepts a matching state and extracts config', async () => {
         const { parseCallback } = await import('./login.js');
