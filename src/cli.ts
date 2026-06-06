@@ -5,6 +5,7 @@ import { execFileSync } from 'child_process';
 import { ZephHook } from './zeph-hook.js';
 import { AuthenticationError, QuotaExceededError, ZephError } from './errors.js';
 import { handleInstall } from './installer.js';
+import { handleLogin } from './login.js';
 import { handleUninstall } from './uninstall.js';
 import { handleVerify } from './verify.js';
 import { handleCheckUpdate } from './check-update.js';
@@ -80,6 +81,7 @@ const printUsage = () => {
 
 Commands:
   install         One-command setup: detect agents, save config, install rules
+  login           Browser sign-in: auto-fetch API key + hook into ~/.zeph/config.json
   uninstall       Remove Zeph from all detected agents
   verify          Check installation health across detected agents
   check-update    Check whether a newer Zeph version is available
@@ -113,6 +115,10 @@ List options:
 
 Dismiss options:
   --all              Dismiss all notifications
+
+Login options:
+  --web-url <url>    Web app URL to sign in at [default: https://app.zeph.to]
+  --timeout <sec>    Seconds to wait for the browser [default: 300]
 
 Install options:
   --key <api-key>    API key (non-interactive)
@@ -351,6 +357,8 @@ const main = async (): Promise<number> => {
     case 'install':
     case 'setup':
       return handleInstall(args);
+    case 'login':
+      return handleLogin(args);
     case 'uninstall':
       return handleUninstall(args);
     case 'verify':
