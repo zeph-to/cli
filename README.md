@@ -1,9 +1,9 @@
-# @zeph-to/hook-sdk
+# @zeph-to/cli
 
-[![npm](https://img.shields.io/npm/v/@zeph-to/hook-sdk.svg)](https://www.npmjs.com/package/@zeph-to/hook-sdk)
-[![downloads](https://img.shields.io/npm/dm/@zeph-to/hook-sdk.svg)](https://www.npmjs.com/package/@zeph-to/hook-sdk)
-[![node](https://img.shields.io/node/v/@zeph-to/hook-sdk.svg)](https://nodejs.org)
-[![license](https://img.shields.io/npm/l/@zeph-to/hook-sdk.svg)](./LICENSE)
+[![npm](https://img.shields.io/npm/v/@zeph-to/cli.svg)](https://www.npmjs.com/package/@zeph-to/cli)
+[![downloads](https://img.shields.io/npm/dm/@zeph-to/cli.svg)](https://www.npmjs.com/package/@zeph-to/cli)
+[![node](https://img.shields.io/node/v/@zeph-to/cli.svg)](https://nodejs.org)
+[![license](https://img.shields.io/npm/l/@zeph-to/cli.svg)](./LICENSE)
 
 Push notification SDK + CLI for [Zeph](https://zeph.to), with an optional
 resident listener that **drives Claude Code / Codex / Gemini sessions
@@ -16,9 +16,9 @@ from your phone** by injecting messages into named tmux sessions.
 ## Installation
 
 ```bash
-npm install -g @zeph-to/hook-sdk
+npm install -g @zeph-to/cli
 # or for one-off use
-npx @zeph-to/hook-sdk notify --title "Hello"
+npx @zeph-to/cli notify --title "Hello"
 ```
 
 ## Quick Start
@@ -26,11 +26,11 @@ npx @zeph-to/hook-sdk notify --title "Hello"
 ```bash
 # Sign in via browser — auto-fetches your API key + hook into
 # ~/.zeph/config.json (no copy-paste)
-npx @zeph-to/hook-sdk login
+npx @zeph-to/cli login
 
 # Install for your AI agents (rules + hooks + MCP). Reuses the saved
 # config; detects Claude Code / Cursor / Windsurf / Gemini / Codex / …
-npx @zeph-to/hook-sdk install
+npx @zeph-to/cli install
 ```
 
 `login` opens a browser to the Zeph web app, asks you to confirm "connect
@@ -43,7 +43,7 @@ Prefer to paste credentials yourself (or on a headless box with no
 browser)? Skip `login` and pass them to `install` directly:
 
 ```bash
-npx @zeph-to/hook-sdk install --key ak_... --hook hook_...
+npx @zeph-to/cli install --key ak_... --hook hook_...
 ```
 
 Either way it saves to `~/.zeph/config.json`. All Zeph tools (CLI, MCP
@@ -170,7 +170,7 @@ If you see `! server rejected listener.sessions: ...` instead, the
 message points at the failure (auth, missing device record, etc.) so
 you can fix the actual problem instead of guessing.
 
-To force a restart — e.g. after upgrading `@zeph-to/hook-sdk`:
+To force a restart — e.g. after upgrading `@zeph-to/cli`:
 
 ```bash
 kill $(cat ~/.zeph/listener.pid)
@@ -391,7 +391,7 @@ The CLI checks `CLAUDE_PROJECT_DIR`, `CURSOR_PROJECT_DIR`,
 ## SDK Usage
 
 ```typescript
-import { ZephHook } from '@zeph-to/hook-sdk';
+import { ZephHook } from '@zeph-to/cli';
 
 const hook = new ZephHook({ apiKey: 'ak_...' });
 
@@ -435,7 +435,7 @@ await hook.dismissAll();
 ### Error Handling
 
 ```typescript
-import { ZephHook, AuthenticationError, QuotaExceededError, ZephError } from '@zeph-to/hook-sdk';
+import { ZephHook, AuthenticationError, QuotaExceededError, ZephError } from '@zeph-to/cli';
 
 try {
   await hook.notify({ title: 'Hello' });

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 // Tests for the agent installers. The injectMcpJson regression catalysed
-// the hook-sdk hotfix branch — without the env field, Cursor/Windsurf MCP
+// the CLI hotfix branch — without the env field, Cursor/Windsurf MCP
 // can't find ZEPH_API_KEY since graphical IDEs don't reliably inherit
 // shell env. These tests pin that field down.
 
@@ -63,7 +63,7 @@ describe('templates.ts: NOTIFY_CMD shape', () => {
         const tmpl = await import('./templates.js');
         // CURSOR_HOOKS includes the NOTIFY_CMD inline
         expect(tmpl.CURSOR_HOOKS).toContain('command -v zeph');
-        expect(tmpl.CURSOR_HOOKS).toContain('npx -y @zeph-to/hook-sdk');
+        expect(tmpl.CURSOR_HOOKS).toContain('npx -y @zeph-to/cli');
     });
 
     it('CLINE_RULE keeps zeph_notify guidance (no Stop hook for Cline)', async () => {

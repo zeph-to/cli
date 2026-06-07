@@ -137,7 +137,7 @@ const startLoopbackServer = (state: string): Promise<ServerHandle> => {
 const headlessHint = (bridgeUrl: string): void => {
   console.error('\n  Could not open a browser.');
   console.error('  If this machine has no local browser, use the manual flow:');
-  console.error('    npx @zeph-to/hook-sdk install --key ak_… --hook hook_…');
+  console.error('    npx @zeph-to/cli install --key ak_… --hook hook_…');
   console.error('  Or open this URL in a browser on THIS computer:');
   console.error(`    ${bridgeUrl}\n`);
 };

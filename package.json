@@ -1,7 +1,7 @@
 {
-  "name": "@zeph-to/hook-sdk",
+  "name": "@zeph-to/cli",
   "version": "0.0.0-semantic-release",
-  "description": "Zeph push notification SDK + CLI for AI agents",
+  "description": "Zeph CLI + push notification SDK for AI agents",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -46,11 +46,11 @@
   "author": "Zeph <dev@zeph.to>",
   "repository": {
     "type": "git",
-    "url": "https://github.com/zeph-to/hook-sdk"
+    "url": "https://github.com/zeph-to/cli"
   },
-  "homepage": "https://github.com/zeph-to/hook-sdk",
+  "homepage": "https://github.com/zeph-to/cli",
   "bugs": {
-    "url": "https://github.com/zeph-to/hook-sdk/issues"
+    "url": "https://github.com/zeph-to/cli/issues"
   },
   "keywords": [
     "zeph",
