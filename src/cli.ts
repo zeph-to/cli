@@ -121,9 +121,12 @@ Login options:
   --timeout <sec>    Seconds to wait for the browser [default: 300]
 
 Install options:
-  --key <api-key>    API key (non-interactive)
+  (no --key, no saved config → opens browser login automatically;
+   headless falls back to manual key entry)
+  --key <api-key>    API key (non-interactive; skips browser login)
   --hook <hook-id>   Hook ID (non-interactive)
   --base-url <url>   Base URL (non-interactive)
+  --web-url <url>    Login web app URL [default: https://app.zeph.to]
   --only <agents>    Comma-separated agent ids to install for
                      (claude,cursor,windsurf,gemini,codex,copilot,cline,aider).
                      Skips the interactive picker.

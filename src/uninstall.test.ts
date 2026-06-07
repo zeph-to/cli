@@ -52,7 +52,7 @@ const seedCursorAndWindsurf = () => {
 
     const wsRules = write(
         '.codeium/windsurf/memories/global_rules.md',
-        '# My own windsurf rules\nkeep me\n\n<!-- ZEPH:START — managed by @zeph-to/hook-sdk, do not edit between markers -->\nzeph block\n<!-- ZEPH:END -->\n',
+        '# My own windsurf rules\nkeep me\n\n<!-- ZEPH:START — managed by @zeph-to/cli, do not edit between markers -->\nzeph block\n<!-- ZEPH:END -->\n',
     );
     const wsHooks = write('.codeium/windsurf/hooks.json', '{"hooks":{}}');
 
@@ -94,7 +94,10 @@ describe('handleUninstall — Cursor + Windsurf', () => {
         expect(readFileSync(f.wsRules, 'utf-8')).toContain('ZEPH:START');
     });
 
-    it('deletes a shared rule file only when it was Zeph-only', async () => {
+    // Uses the legacy `@zeph-to/hook-sdk` marker on purpose: blocks written by
+    // pre-rename installs must still be removable after the rename to
+    // `@zeph-to/cli` (removeManagedBlock matches the `<!-- ZEPH:START` prefix).
+    it('deletes a shared rule file only when it was Zeph-only (legacy marker)', async () => {
         mkdirSync(join(TMP, '.codeium'), { recursive: true });
         const onlyZeph = write(
             '.codeium/windsurf/memories/global_rules.md',

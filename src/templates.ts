@@ -17,12 +17,12 @@
 // and the agents can't drift apart.
 
 // Graceful resolution: prefer the installed `zeph` CLI, but fall back to
-// `npx -y @zeph-to/hook-sdk` so the hook still fires when the user
+// `npx -y @zeph-to/cli` so the hook still fires when the user
 // installed via a non-standard prefix and the binary isn't on PATH at hook
 // fire time (e.g. ~/.local/bin without PATH update). This mirrors the
 // pattern in plugin/hooks/zeph-{stop,ask}.sh.
 const NOTIFY_CMD =
-  '$(command -v zeph || echo "npx -y @zeph-to/hook-sdk") notify --title "Task done" 2>/dev/null || true';
+  '$(command -v zeph || echo "npx -y @zeph-to/cli") notify --title "Task done" 2>/dev/null || true';
 
 // ── Shared behavioral core ───────────────────────────────────────
 //
@@ -239,8 +239,14 @@ export const COPILOT_HOOKS = JSON.stringify({
 // our own block, delimited by these markers, so install/uninstall is
 // idempotent and the user's content is preserved.
 
-export const ZEPH_MARK_START = '<!-- ZEPH:START — managed by @zeph-to/hook-sdk, do not edit between markers -->';
+export const ZEPH_MARK_START = '<!-- ZEPH:START — managed by @zeph-to/cli, do not edit between markers -->';
 export const ZEPH_MARK_END = '<!-- ZEPH:END -->';
+
+// Match the start marker by stable prefix, not its full text. Installs from
+// older releases wrote `… managed by @zeph-to/hook-sdk …`; matching the prefix
+// keeps upsert/uninstall working across the rename instead of orphaning their
+// managed blocks.
+const ZEPH_MARK_START_PREFIX = '<!-- ZEPH:START';
 
 /**
  * Return `existing` with the Zeph-managed block inserted or replaced.
@@ -249,7 +255,7 @@ export const ZEPH_MARK_END = '<!-- ZEPH:END -->';
  */
 export const upsertManagedBlock = (existing: string, rule: string): string => {
   const block = `${ZEPH_MARK_START}\n${rule}\n${ZEPH_MARK_END}`;
-  const startIdx = existing.indexOf(ZEPH_MARK_START);
+  const startIdx = existing.indexOf(ZEPH_MARK_START_PREFIX);
   const endIdx = existing.indexOf(ZEPH_MARK_END);
   if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
     const before = existing.slice(0, startIdx).replace(/\n*$/, '');
@@ -262,7 +268,7 @@ export const upsertManagedBlock = (existing: string, rule: string): string => {
 
 /** Strip the Zeph-managed block from a shared file (for uninstall). */
 export const removeManagedBlock = (existing: string): string => {
-  const startIdx = existing.indexOf(ZEPH_MARK_START);
+  const startIdx = existing.indexOf(ZEPH_MARK_START_PREFIX);
   const endIdx = existing.indexOf(ZEPH_MARK_END);
   if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) return existing;
   const before = existing.slice(0, startIdx).replace(/\n*$/, '');

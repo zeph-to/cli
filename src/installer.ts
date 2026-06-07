@@ -6,6 +6,7 @@ import { createInterface } from 'readline';
 import { ZephHook } from './zeph-hook.js';
 import { loadConfig, resolvedEnv, saveConfig, CONFIG_FILE, VERSION } from './config.js';
 import type { ZephConfig } from './config.js';
+import { runLoginFlow, resolveWebUrl, resolveTimeoutSec } from './login.js';
 import { detectAgents } from './agents.js';
 import type { Agent } from './agents.js';
 import {
@@ -33,6 +34,13 @@ interface InstallArgs {
 
 const ok = (msg: string) => console.log(`    + ${msg}`);
 const fail = (msg: string) => console.log(`    - ${msg}`);
+
+/**
+ * True when install should auto-open browser login (ADR 0002): interactive
+ * context with no existing credential (--key/env/config all absent).
+ */
+export const shouldTriggerLogin = (nonInteractive: boolean, currentKey: string | undefined): boolean =>
+  !nonInteractive && !currentKey;
 
 const promptInput = (question: string): Promise<string> => {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -332,6 +340,77 @@ const testConnection = async (apiKey: string, baseUrl?: string): Promise<boolean
   }
 };
 
+// ── Credential Resolution ────────────────────────────────────────
+
+interface ResolvedCredentials {
+  apiKey?: string;
+  hookId?: string;
+  baseUrl?: string;
+}
+
+/** Interactive path when a credential already exists: prompt to keep/replace. */
+const promptExistingCredentials = async (
+  currentKey: string | undefined,
+  existing: ZephConfig,
+): Promise<ResolvedCredentials> => {
+  if (currentKey) console.log(`  Current API Key: ${currentKey.slice(0, 12)}...`);
+  const keyInput = await promptInput(
+    currentKey ? '  New API Key (Enter to keep): ' : '  API Key (from app > Settings > API Keys): ',
+  );
+
+  const currentHook = resolvedEnv('ZEPH_HOOK_ID') || existing.hookId;
+  if (currentHook) console.log(`  Current Hook ID: ${currentHook}`);
+  const hookInput = await promptInput(
+    currentHook ? '  New Hook ID (Enter to keep, "none" to remove): ' : '  Hook ID (optional, for prompt/input): ',
+  );
+
+  return {
+    apiKey: keyInput || currentKey,
+    hookId: hookInput === 'none' ? undefined : (hookInput || currentHook),
+    baseUrl: existing.baseUrl,
+  };
+};
+
+/**
+ * Resolve API key + hook for install. Priority: --key/env/config (non-interactive
+ * or "keep existing") → brand-new interactive opens browser login (ADR 0002),
+ * falling back to manual paste when headless. wsUrl/deviceId from a login are
+ * persisted by runLoginFlow and re-read at config-save time.
+ */
+const collectCredentials = async (
+  args: Record<string, string | boolean>,
+  installArgs: InstallArgs,
+  nonInteractive: boolean,
+  existing: ZephConfig,
+): Promise<ResolvedCredentials> => {
+  if (nonInteractive) {
+    return {
+      apiKey: installArgs.key || resolvedEnv('ZEPH_API_KEY') || existing.apiKey,
+      hookId: installArgs.hook === 'none' ? undefined : (installArgs.hook || resolvedEnv('ZEPH_HOOK_ID') || existing.hookId),
+      baseUrl: installArgs['base-url'] || resolvedEnv('ZEPH_BASE_URL') || existing.baseUrl,
+    };
+  }
+
+  console.log('');
+  const currentKey = resolvedEnv('ZEPH_API_KEY') || existing.apiKey;
+  if (!shouldTriggerLogin(nonInteractive, currentKey)) {
+    return promptExistingCredentials(currentKey, existing);
+  }
+
+  const result = await runLoginFlow({
+    webUrl: resolveWebUrl(args['web-url']),
+    timeoutSec: resolveTimeoutSec(args.timeout),
+  });
+  if (result) {
+    return { apiKey: result.apiKey, hookId: result.hookId, baseUrl: result.baseUrl };
+  }
+
+  // headless / timeout → manual paste
+  const apiKey = (await promptInput('  API Key (from app > Settings > API Keys): ')) || undefined;
+  const hookInput = await promptInput('  Hook ID (optional, for prompt/input): ');
+  return { apiKey, hookId: hookInput || undefined, baseUrl: existing.baseUrl };
+};
+
 // ── Main Install Flow ────────────────────────────────────────────
 
 export const handleInstall = async (args: Record<string, string | boolean>): Promise<number> => {
@@ -384,38 +463,9 @@ export const handleInstall = async (args: Record<string, string | boolean>): Pro
     }
   }
 
-  // 3. Collect credentials
+  // 3. Collect credentials (browser login auto-triggers for brand-new installs)
   const existing = loadConfig();
-  let apiKey: string | undefined;
-  let hookId: string | undefined;
-  let baseUrl: string | undefined;
-
-  if (nonInteractive) {
-    apiKey = installArgs.key || resolvedEnv('ZEPH_API_KEY') || existing.apiKey;
-    hookId = installArgs.hook === 'none' ? undefined : (installArgs.hook || resolvedEnv('ZEPH_HOOK_ID') || existing.hookId);
-    baseUrl = installArgs['base-url'] || resolvedEnv('ZEPH_BASE_URL') || existing.baseUrl;
-  } else {
-    console.log('');
-    const currentKey = resolvedEnv('ZEPH_API_KEY') || existing.apiKey;
-    if (currentKey) {
-      console.log(`  Current API Key: ${currentKey.slice(0, 12)}...`);
-    }
-    const keyInput = await promptInput(
-      currentKey ? '  New API Key (Enter to keep): ' : '  API Key (from app > Settings > API Keys): ',
-    );
-    apiKey = keyInput || currentKey;
-
-    const currentHook = resolvedEnv('ZEPH_HOOK_ID') || existing.hookId;
-    if (currentHook) {
-      console.log(`  Current Hook ID: ${currentHook}`);
-    }
-    const hookInput = await promptInput(
-      currentHook ? '  New Hook ID (Enter to keep, "none" to remove): ' : '  Hook ID (optional, for prompt/input): ',
-    );
-    hookId = hookInput === 'none' ? undefined : (hookInput || currentHook);
-
-    baseUrl = existing.baseUrl;
-  }
+  const { apiKey, hookId, baseUrl } = await collectCredentials(args, installArgs, nonInteractive, existing);
 
   if (!apiKey) {
     console.error('\n  Error: API key is required.\n');
@@ -435,13 +485,16 @@ export const handleInstall = async (args: Record<string, string | boolean>): Pro
     console.log('    - Test connection');
   }
 
-  // 5. Save config
+  // 5. Save config — merge over the latest on-disk config (re-read, since a
+  //    login in step 3 may have written wsUrl/deviceId). hookId set or cleared.
   console.log('');
   const config: ZephConfig = {
+    ...loadConfig(),
     apiKey,
-    ...(hookId && { hookId }),
     ...(baseUrl && { baseUrl }),
   };
+  if (hookId) config.hookId = hookId;
+  else delete config.hookId;
   saveConfig(config);
   ok(`Config saved to ${CONFIG_FILE}`);
 

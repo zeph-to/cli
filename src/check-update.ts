@@ -3,7 +3,7 @@ import { VERSION } from './config.js';
 // Compares installed versions against the npm registry. Pure read-only —
 // never installs anything; just tells the user if a newer release exists.
 
-const PACKAGES = ['@zeph-to/hook-sdk', '@zeph-to/mcp-server'] as const;
+const PACKAGES = ['@zeph-to/cli', '@zeph-to/mcp-server'] as const;
 
 /** Fetch the `latest` dist-tag version for a package from the npm registry. */
 const fetchLatest = async (pkg: string): Promise<string | null> => {
@@ -34,7 +34,7 @@ export const isNewer = (latest: string, current: string): boolean => {
 export const handleCheckUpdate = async (args: Record<string, string | boolean>): Promise<number> => {
     const isJson = args.json === true;
 
-    // The hook-sdk's own installed version is known from package.json.
+    // The CLI's own installed version is known from package.json.
     // mcp-server's installed version isn't reliably knowable from here
     // (it's a separate package, often run via npx), so we only report its
     // latest — the user compares against whatever they have.
@@ -42,7 +42,7 @@ export const handleCheckUpdate = async (args: Record<string, string | boolean>):
 
     for (const pkg of PACKAGES) {
         const latest = await fetchLatest(pkg);
-        const current = pkg === '@zeph-to/hook-sdk' ? VERSION : null;
+        const current = pkg === '@zeph-to/cli' ? VERSION : null;
         const outdated = !!(latest && current && isNewer(latest, current));
         results.push({ pkg, current, latest, outdated });
     }
@@ -70,7 +70,7 @@ export const handleCheckUpdate = async (args: Record<string, string | boolean>):
     }
 
     if (anyOutdated) {
-        console.log('\n  Update with: npx @zeph-to/hook-sdk install\n');
+        console.log('\n  Update with: npx @zeph-to/cli install\n');
     } else {
         console.log('');
     }

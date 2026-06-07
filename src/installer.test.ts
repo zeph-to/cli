@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 // Tests for the agent installers. The injectMcpJson regression catalysed
-// the hook-sdk hotfix branch — without the env field, Cursor/Windsurf MCP
+// the CLI hotfix branch — without the env field, Cursor/Windsurf MCP
 // can't find ZEPH_API_KEY since graphical IDEs don't reliably inherit
 // shell env. These tests pin that field down.
 
@@ -41,12 +41,29 @@ const expectedMcpEntry = (apiKey: string = '${ZEPH_API_KEY}') => ({
     env: { ZEPH_API_KEY: apiKey },
 });
 
+describe('shouldTriggerLogin', () => {
+    it('triggers for a brand-new interactive install (no key anywhere)', async () => {
+        const { shouldTriggerLogin } = await import('./installer.js');
+        expect(shouldTriggerLogin(false, undefined)).toBe(true);
+    });
+
+    it('does not trigger when a config/env key already exists', async () => {
+        const { shouldTriggerLogin } = await import('./installer.js');
+        expect(shouldTriggerLogin(false, 'ak_existing')).toBe(false);
+    });
+
+    it('does not trigger in non-interactive mode (--key/--hook given)', async () => {
+        const { shouldTriggerLogin } = await import('./installer.js');
+        expect(shouldTriggerLogin(true, undefined)).toBe(false);
+    });
+});
+
 describe('templates.ts: NOTIFY_CMD shape', () => {
     it('uses graceful zeph || npx fallback', async () => {
         const tmpl = await import('./templates.js');
         // CURSOR_HOOKS includes the NOTIFY_CMD inline
         expect(tmpl.CURSOR_HOOKS).toContain('command -v zeph');
-        expect(tmpl.CURSOR_HOOKS).toContain('npx -y @zeph-to/hook-sdk');
+        expect(tmpl.CURSOR_HOOKS).toContain('npx -y @zeph-to/cli');
     });
 
     it('CLINE_RULE keeps zeph_notify guidance (no Stop hook for Cline)', async () => {
