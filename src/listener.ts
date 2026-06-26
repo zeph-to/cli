@@ -23,7 +23,7 @@
 
 import { spawnSync } from 'child_process';
 import { createHash } from 'crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { homedir, hostname, userInfo } from 'os';
 import { join, basename } from 'path';
 import WebSocket from 'ws';
@@ -648,6 +648,21 @@ export const collectSessions = (): AgentSession[] => collectSessionsVerbose().se
 
 // ─── Push handling ──────────────────────────────────────────────────
 
+/**
+ * One file riding on an `agent.command` push. agent.command attachments
+ * are uploaded in *plaintext* (the listener has no per-user crypto key),
+ * so `iv`/`encryptedKey` should be absent. If either is present the file
+ * is encrypted and the listener can't read it — it gets skipped.
+ */
+interface PushFileAttachment {
+    fileKey: string;
+    fileName: string;
+    fileType?: string;
+    fileSize?: number;
+    iv?: string;
+    encryptedKey?: string;
+}
+
 interface PushItem {
     pushId: string;
     type?: string;
@@ -657,6 +672,8 @@ interface PushItem {
     isEncrypted?: boolean;
     /** Set when type='agent.command' — tmux session name to inject into. */
     agentSessionName?: string;
+    /** Optional image/file attachments (agent.command only, plaintext). */
+    files?: PushFileAttachment[];
 }
 
 interface HandlePushDeps {
@@ -664,6 +681,8 @@ interface HandlePushDeps {
     inject?: (session: string, text: string) => boolean;
     rateLimit?: (session: string) => boolean;
     now?: () => number;
+    /** Injectable for tests; defaults to the REST-backed downloader. */
+    downloadAttachments?: (pushId: string, files: PushFileAttachment[]) => Promise<string[]>;
 }
 
 /**
@@ -696,6 +715,132 @@ const tryInject = (session: string, text: string, deps: HandlePushDeps): boolean
     return ok;
 };
 
+// ─── Attachment download (agent.command files[]) ────────────────────
+
+const ATTACHMENTS_DIR = join(homedir(), '.zeph', 'attachments');
+const DEFAULT_API_BASE = 'https://api.zeph.to/v1';
+
+// apiKey + baseUrl for the file-download REST calls, set once in
+// handleListener. The default downloader reads it. null until the daemon
+// resolves credentials (handlePush isn't called before then in the real
+// flow, but the guard keeps it safe).
+let attachmentCtx: { apiKey: string; baseUrl: string } | null = null;
+
+export const setAttachmentContext = (ctx: { apiKey: string; baseUrl: string }): void => {
+    attachmentCtx = ctx;
+};
+
+/**
+ * Make a filesystem-safe single path segment: take the basename (drops
+ * any `../` prefix), strip control chars and embedded separators, remove
+ * leading dots, and cap length. Empty/dot-only names use the fallback.
+ */
+const safeSegment = (raw: string, fallback: string): string => {
+    const cleaned = basename(raw)
+        .replace(/[\x00-\x1f\x7f]/g, '')
+        .replace(/[/\\]/g, '_')
+        .replace(/^\.+/, '')
+        .trim();
+    return (cleaned || fallback).slice(0, 200);
+};
+
+/** Resolve fileKey → presigned URL → bytes. Throws on any HTTP failure so
+ *  the caller can isolate one file's failure from the rest of the batch. */
+const fetchAttachmentBytes = async (
+    fileKey: string,
+    ctx: { apiKey: string; baseUrl: string },
+): Promise<Buffer> => {
+    const metaUrl = `${ctx.baseUrl.replace(/\/+$/, '')}/files/${encodeURIComponent(fileKey)}`;
+    const meta = await fetch(metaUrl, { headers: { 'X-API-Key': ctx.apiKey } });
+    if (!meta.ok) throw new Error(`metadata ${meta.status}`);
+    const { downloadUrl } = (await meta.json()) as { downloadUrl?: string };
+    if (!downloadUrl) throw new Error('response had no downloadUrl');
+    // The presigned URL is self-authenticating — no API key header.
+    const bin = await fetch(downloadUrl);
+    if (!bin.ok) throw new Error(`download ${bin.status}`);
+    return Buffer.from(await bin.arrayBuffer());
+};
+
+/**
+ * Download every plaintext attachment to
+ * `~/.zeph/attachments/<pushId>/<fileName>` and return absolute paths.
+ * Encrypted files are skipped (no key). A single file's failure is logged
+ * and skipped — it never aborts the batch, so a partial download still
+ * injects whatever succeeded. Files are kept (not deleted) so the agent
+ * can read them after injection.
+ */
+const downloadAttachments = async (
+    pushId: string,
+    files: PushFileAttachment[],
+    ctx: { apiKey: string; baseUrl: string },
+): Promise<string[]> => {
+    const dir = join(ATTACHMENTS_DIR, safeSegment(pushId, 'push'));
+    const paths: string[] = [];
+    for (const [i, f] of files.entries()) {
+        if (f.iv || f.encryptedKey) {
+            log(`! attachment "${f.fileName}": encrypted (iv/encryptedKey present) — listener can't decrypt, skipping`);
+            continue;
+        }
+        try {
+            const bytes = await fetchAttachmentBytes(f.fileKey, ctx);
+            mkdirSync(dir, { recursive: true });
+            const abs = join(dir, safeSegment(f.fileName || `file-${i}`, `file-${i}`));
+            writeFileSync(abs, bytes);
+            paths.push(abs);
+            log(`⇣ ${f.fileName} → ${abs} (${bytes.length}B)`);
+        } catch (err) {
+            log(`! attachment "${f.fileName}": download failed — ${(err as Error).message}`);
+        }
+    }
+    return paths;
+};
+
+const defaultDownloadAttachments = (pushId: string, files: PushFileAttachment[]): Promise<string[]> => {
+    if (!attachmentCtx) {
+        log('! attachment context not initialised — skipping files');
+        return Promise.resolve([]);
+    }
+    return downloadAttachments(pushId, files, attachmentCtx);
+};
+
+/**
+ * Combine the command body with downloaded file paths, one per line.
+ * Claude Code reads local image paths from the prompt text, so appending
+ * absolute paths makes the agent load them. Empty body → paths only.
+ */
+const composeInjection = (body: string, paths: string[]): string =>
+    paths.length ? [body, ...paths].filter(Boolean).join('\n') : body;
+
+// Downloaded attachments are kept after injection (the agent reads them
+// from disk), so they accumulate. A per-push dir older than this is GC'd —
+// long enough to outlive any realistic agent read, short enough that the
+// directory can't grow without bound on a long-running daemon.
+const ATTACHMENT_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Remove attachment sub-directories whose mtime is older than `ttl`.
+ * Best-effort: an entry that can't be statted or removed is skipped, not
+ * fatal. Returns the count removed. `dir`/`ttl` are injectable for tests.
+ */
+export const gcAttachments = (
+    now: number = Date.now(),
+    dir: string = ATTACHMENTS_DIR,
+    ttl: number = ATTACHMENT_TTL_MS,
+): number => {
+    let removed = 0;
+    let entries: string[];
+    try { entries = readdirSync(dir); } catch { return 0; }
+    for (const name of entries) {
+        const full = join(dir, name);
+        try {
+            if (now - statSync(full).mtimeMs <= ttl) continue;
+            rmSync(full, { recursive: true, force: true });
+            removed++;
+        } catch { /* skip unreadable/unremovable entries */ }
+    }
+    return removed;
+};
+
 /**
  * Process one push. Returns true when an injection actually fired.
  * Exported for unit testing with mocked deps.
@@ -705,17 +850,31 @@ const tryInject = (session: string, text: string, deps: HandlePushDeps): boolean
  * `body`. Everything else (Stop-hook auto-pushes, zeph_ask responses,
  * encrypted pushes, normal text/link/file notifications) is ignored.
  */
-export const handlePush = (
+export const handlePush = async (
     push: PushItem,
     deps: HandlePushDeps = {},
-): boolean => {
+): Promise<boolean> => {
     if (push.isEncrypted) {
         // Per-device keys aren't wired yet; encrypted pushes are opaque
         // to the listener.
         return false;
     }
     if (push.type !== 'agent.command' || !push.agentSessionName) return false;
-    return tryInject(push.agentSessionName, push.body ?? '', deps);
+
+    // Download any attachments BEFORE injecting so the agent can read the
+    // local paths immediately. A download-phase failure is isolated: the
+    // body text still injects so the command itself isn't blocked.
+    let paths: string[] = [];
+    if (push.files?.length) {
+        const download = deps.downloadAttachments ?? defaultDownloadAttachments;
+        try {
+            paths = await download(push.pushId, push.files);
+        } catch (err) {
+            log(`! ${push.agentSessionName}: attachment download failed — ${(err as Error).message}`);
+        }
+    }
+
+    return tryInject(push.agentSessionName, composeInjection(push.body ?? '', paths), deps);
 };
 
 // ─── WS connect loop ─────────────────────────────────────────────────
@@ -896,7 +1055,13 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             if (!msg || typeof msg !== 'object') return;
             const m = msg as { type?: string; data?: unknown; message?: string };
             if (m.type === 'pong') return;
-            if (m.type === 'push.new' && m.data) handlePush(m.data as PushItem);
+            if (m.type === 'push.new' && m.data) {
+                // Fire-and-forget: handlePush is async (attachment download)
+                // but the WS read loop must stay responsive. Errors are
+                // logged, never thrown into the socket handler.
+                void handlePush(m.data as PushItem).catch((err) =>
+                    log(`! handlePush: ${(err as Error).message}`));
+            }
             // Surface server-side errors from listener.sessions reports.
             // Without this the daemon happily logs "reported N session(s)"
             // even when the server is silently dropping every message —
@@ -999,6 +1164,11 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
         console.error('zeph listener: API key required. Run `zeph install` or set ZEPH_API_KEY.');
         return 3;
     }
+    // Base URL for attachment downloads (GET /v1/files/{fileKey}). Same
+    // resolution order as the rest of the CLI; falls back to the prod API.
+    const baseUrl = (args['base-url'] as string) || resolvedEnv('ZEPH_BASE_URL') || config.baseUrl || DEFAULT_API_BASE;
+    setAttachmentContext({ apiKey, baseUrl });
+
     const wsUrl = resolveWsUrl(args, config);
     if (!wsUrl) {
         console.error(
@@ -1028,6 +1198,16 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
         log(`heap: rss=${mb(m.rss)}MB heapUsed=${mb(m.heapUsed)}MB external=${mb(m.external)}MB`);
     }, HEAP_LOG_INTERVAL_MS);
     heapLogTimer.unref();
+
+    // Sweep stale attachment dirs at startup, then hourly. Keeps
+    // ~/.zeph/attachments from growing without bound over a long run.
+    const sweepAttachments = (): void => {
+        const n = gcAttachments();
+        if (n > 0) log(`gc: removed ${n} stale attachment dir(s)`);
+    };
+    sweepAttachments();
+    const gcTimer = setInterval(sweepAttachments, 60 * 60 * 1000);
+    gcTimer.unref();
 
     let shuttingDown = false;
     let activeHandle: StreamHandle | null = null;
