@@ -86,10 +86,93 @@ const openBrowser = (url: string): boolean => {
 
 // ── Loopback server ──────────────────────────────────────────────
 
-const DONE_HTML =
-  '<!doctype html><meta charset="utf-8"><title>Zeph</title>' +
-  '<body style="font-family:system-ui;text-align:center;padding:3rem">' +
-  '<h2>Connected</h2><p>You can close this tab and return to the terminal.</p></body>';
+// The callback page is served from a loopback server with no network access,
+// so it inlines all styles and a single load-time animation — no external
+// fonts or assets. It's on screen for only a few seconds before the user
+// returns to the terminal, so its whole job is to confirm state and point back.
+
+const esc = (s: string): string =>
+  s.replace(/[&<>"]/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c] as string
+  ));
+
+type PageVariant = 'ok' | 'error';
+
+// Glyph drawn inside a 56×56 ring. `ok` = check, `error` = exclamation
+// (the trailing `h0.01` path renders as a dot via the round line cap).
+const GLYPH: Record<PageVariant, string> = {
+  ok: '<path d="M17 29l7.5 7.5L39 19"/>',
+  error: '<path d="M28 15v17"/><path d="M28 40h0.01"/>',
+};
+
+const PAGE_STYLE = `*{box-sizing:border-box;margin:0}
+:root{--bg:#0A0C12;--text:#EAEEF8;--muted:#79829A;--primary:#8B9BFF;
+--ok:#5FE3B3;--warn:#FF8C7A;--card:rgba(255,255,255,.03);--line:rgba(255,255,255,.09);--accent:var(--primary)}
+body.ok{--accent:var(--ok)}body.error{--accent:var(--warn)}
+@media(prefers-color-scheme:light){:root{--bg:#F4F6FB;--text:#171A22;--muted:#5C6478;
+--card:rgba(10,12,18,.025);--line:rgba(10,12,18,.09)}}
+html,body{height:100%}
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);color:var(--text);
+display:grid;place-items:center;padding:2rem;position:relative;overflow:hidden}
+body::before{content:"";position:fixed;inset:0;z-index:0;opacity:0;animation:glow 1.1s ease forwards;
+background:radial-gradient(60% 48% at 50% 14%,color-mix(in oklab,var(--accent) 24%,transparent),transparent 70%)}
+.card{position:relative;z-index:1;text-align:center;max-width:30rem;
+display:flex;flex-direction:column;align-items:center;gap:.85rem}
+.glyph{width:72px;height:72px;margin-bottom:.3rem}
+.glyph .ring,.glyph .mark>*{fill:none;stroke:var(--accent);stroke-width:3;stroke-linecap:round;stroke-linejoin:round}
+.glyph .ring{stroke:color-mix(in oklab,var(--accent) 38%,transparent);
+stroke-dasharray:151;stroke-dashoffset:151;animation:draw .7s ease forwards}
+.glyph .mark>*{stroke-dasharray:44;stroke-dashoffset:44;animation:draw .5s .45s ease forwards}
+h1{font-size:clamp(1.55rem,5vw,2.05rem);font-weight:700;letter-spacing:-.03em;line-height:1.06;animation:rise .6s .15s both}
+p{color:var(--muted);font-size:1.02rem;line-height:1.5;max-width:23rem;animation:rise .6s .25s both}
+.chip{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.82rem;color:var(--text);
+background:var(--card);border:1px solid var(--line);border-radius:.55rem;padding:.45rem .7rem;
+margin-top:.35rem;animation:rise .6s .35s both}
+.brand{position:fixed;bottom:1.4rem;left:0;right:0;z-index:1;text-align:center;
+font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.72rem;letter-spacing:.4em;
+text-transform:lowercase;color:var(--muted);opacity:.55}
+@keyframes glow{to{opacity:1}}
+@keyframes draw{to{stroke-dashoffset:0}}
+@keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){*{animation-duration:.001s!important;animation-delay:0s!important}
+body::before{opacity:1}.glyph .ring,.glyph .mark>*{stroke-dashoffset:0}}`;
+
+const renderPage = (
+  variant: PageVariant,
+  title: string,
+  message: string,
+  hint?: string,
+): string =>
+  `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
+  `<meta name="viewport" content="width=device-width,initial-scale=1">` +
+  `<title>Zeph</title><style>${PAGE_STYLE}</style></head>` +
+  `<body class="${variant}"><main class="card">` +
+  `<svg class="glyph" viewBox="0 0 56 56" aria-hidden="true">` +
+  `<circle class="ring" cx="28" cy="28" r="24"/><g class="mark">${GLYPH[variant]}</g></svg>` +
+  `<h1>${esc(title)}</h1><p>${esc(message)}</p>` +
+  (hint ? `<code class="chip">${esc(hint)}</code>` : '') +
+  `</main><footer class="brand">zeph</footer></body></html>`;
+
+// Turn an internal callback failure reason into end-user guidance: name what
+// happened and how to recover, in the interface's voice — never an apology.
+const errorPage = (reason: string): string => {
+  const copy: Record<string, [string, string]> = {
+    'state mismatch': [
+      "Sign-in didn't match",
+      "This link didn't match the request that started it. Return to your terminal and run login again.",
+    ],
+    'missing key': [
+      'No key came back',
+      'The sign-in finished without a key. Return to your terminal and run login again.',
+    ],
+    'not found': [
+      'Nothing to see here',
+      'This page only handles the Zeph login callback.',
+    ],
+  };
+  const [title, message] = copy[reason] ?? ['Something went wrong', reason];
+  return renderPage('error', title, message);
+};
 
 const respond = (res: ServerResponse, status: number, body: string): void => {
   res.writeHead(status, { 'content-type': 'text/html; charset=utf-8' });
@@ -114,12 +197,17 @@ const startLoopbackServer = (state: string): Promise<ServerHandle> => {
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const result = parseCallback(req.url ?? '/', state);
     if (!result.ok) {
-      respond(res, result.status, `<p>${result.reason}</p>`);
+      respond(res, result.status, errorPage(result.reason));
       if (result.status === 403) fail(new Error('state mismatch — refused'));
       return;
     }
     persistConfig(result.config);
-    respond(res, 200, DONE_HTML);
+    respond(res, 200, renderPage(
+      'ok',
+      "You're connected",
+      'Close this tab and head back to your terminal.',
+      'zeph is ready',
+    ));
     settle(result.config);
   });
 
