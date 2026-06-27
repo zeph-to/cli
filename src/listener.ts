@@ -753,7 +753,9 @@ const fetchAttachmentBytes = async (
     const metaUrl = `${ctx.baseUrl.replace(/\/+$/, '')}/files/${encodeURIComponent(fileKey)}`;
     const meta = await fetch(metaUrl, { headers: { 'X-API-Key': ctx.apiKey } });
     if (!meta.ok) throw new Error(`metadata ${meta.status}`);
-    const { downloadUrl } = (await meta.json()) as { downloadUrl?: string };
+    // Server wraps responses as { data: { downloadUrl } } (see lib/response ok()).
+    const body = (await meta.json()) as { data?: { downloadUrl?: string }; downloadUrl?: string };
+    const downloadUrl = body.data?.downloadUrl ?? body.downloadUrl;
     if (!downloadUrl) throw new Error('response had no downloadUrl');
     // The presigned URL is self-authenticating — no API key header.
     const bin = await fetch(downloadUrl);
