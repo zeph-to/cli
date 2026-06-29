@@ -1,8 +1,16 @@
-import { describe, expect, it, beforeEach } from 'vitest';
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, existsSync, utimesSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { parseSessionName, checkRateLimit, handlePush, gcAttachments } from './listener.js';
+import {
+    parseSessionName,
+    checkRateLimit,
+    handlePush,
+    gcAttachments,
+    computeBackoff,
+    AUTH_FAILURE_CODES,
+    computeListenerDeviceId,
+} from './listener.js';
 
 describe('checkRateLimit', () => {
     beforeEach(() => {
@@ -263,5 +271,116 @@ describe('parseSessionName', () => {
         expect(parseSessionName('zeph')).toBeNull();   // no dash, no project
         expect(parseSessionName('zeph-')).toBeNull();  // empty project
         expect(parseSessionName('')).toBeNull();
+    });
+});
+
+describe('computeBackoff', () => {
+    // base(attempt) = min(RECONNECT_BASE_MS * 2^attempt, RECONNECT_MAX_MS)
+    //   = min(1000 * 2^attempt, 30000): 1000, 2000, 4000, 8000, 16000, then
+    //   capped at 30000 from attempt 5 onward.
+    // jitter = base * 0.15 * (random*2 - 1) → result ∈ [0.85·base, 1.15·base].
+    const BASE: Record<number, number> = { 0: 1000, 1: 2000, 2: 4000, 3: 8000, 4: 16000 };
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    it('returns the exact exponential base at the jitter midpoint', () => {
+        // random=0.5 → (0.5*2-1)=0 → zero jitter → result equals base.
+        vi.spyOn(Math, 'random').mockReturnValue(0.5);
+        for (const attempt of [0, 1, 2, 3, 4]) {
+            expect(computeBackoff(attempt)).toBe(BASE[attempt]);
+        }
+    });
+
+    it('grows monotonically (at the jitter midpoint) until the cap', () => {
+        vi.spyOn(Math, 'random').mockReturnValue(0.5);
+        let prev = -1;
+        for (const attempt of [0, 1, 2, 3, 4]) {
+            const cur = computeBackoff(attempt);
+            expect(cur).toBeGreaterThan(prev);
+            prev = cur;
+        }
+    });
+
+    it('jitter floor (random=0) sits at 0.85·base', () => {
+        vi.spyOn(Math, 'random').mockReturnValue(0);
+        for (const attempt of [0, 1, 2, 3, 4]) {
+            expect(computeBackoff(attempt)).toBeCloseTo(BASE[attempt] * 0.85, 6);
+        }
+    });
+
+    it('jitter ceiling (random just under 1) sits near 1.15·base', () => {
+        // random→1 gives factor→+1; use a value extremely close so the band
+        // edge is exercised without relying on Math.random ever returning 1.
+        vi.spyOn(Math, 'random').mockReturnValue(0.999999);
+        for (const attempt of [0, 1, 2, 3, 4]) {
+            const v = computeBackoff(attempt);
+            expect(v).toBeGreaterThan(BASE[attempt] * 1.149);
+            expect(v).toBeLessThanOrEqual(BASE[attempt] * 1.15);
+        }
+    });
+
+    it('caps the base at RECONNECT_MAX_MS for high attempt counts', () => {
+        vi.spyOn(Math, 'random').mockReturnValue(0.5); // zero jitter → exact cap
+        // 1000*2^5 = 32000 > 30000, so attempt 5+ is pinned to the 30000 cap.
+        for (const attempt of [5, 6, 10, 50, 1000]) {
+            expect(computeBackoff(attempt)).toBe(30000);
+        }
+    });
+
+    it('keeps the jittered result inside the ±15% band at the cap', () => {
+        vi.spyOn(Math, 'random').mockReturnValue(0);   // floor
+        expect(computeBackoff(10)).toBeCloseTo(30000 * 0.85, 6);
+        vi.spyOn(Math, 'random').mockReturnValue(0.999999); // ceiling
+        expect(computeBackoff(10)).toBeLessThanOrEqual(30000 * 1.15);
+    });
+
+    it('keeps every jittered delay inside the ±15% band across the full random range (fuzz)', () => {
+        // Real Math.random. The ±15% band is the invariant computeBackoff
+        // actually guarantees; assert it directly (the old ">= 0" bound was
+        // always true since the floor 0.85·base is strictly positive).
+        const EPSILON = 1e-9; // absorb float rounding at the exact band edges
+        for (let i = 0; i < 5000; i++) {
+            const attempt = i % 12; // spans pre-cap and capped regions
+            const base = Math.min(1000 * 2 ** attempt, 30000);
+            const v = computeBackoff(attempt);
+            expect(v).toBeGreaterThanOrEqual(base * 0.85 - EPSILON);
+            expect(v).toBeLessThanOrEqual(base * 1.15 + EPSILON);
+        }
+    });
+});
+
+describe('AUTH_FAILURE_CODES', () => {
+    it('contains exactly the three auth-failure close codes', () => {
+        expect([...AUTH_FAILURE_CODES].sort()).toEqual([4001, 4002, 4003]);
+    });
+
+    it('matches the codes the reconnect loop must give up on', () => {
+        for (const code of [4001, 4002, 4003]) {
+            expect(AUTH_FAILURE_CODES.has(code)).toBe(true);
+        }
+    });
+
+    it('does not include transient/normal close codes (those reconnect)', () => {
+        // 1000 normal, 1001 going away, 1006 abnormal, 1011 server error,
+        // 1012 service restart, 4000 generic app close — all retryable.
+        for (const code of [1000, 1001, 1006, 1011, 1012, 4000, -1]) {
+            expect(AUTH_FAILURE_CODES.has(code)).toBe(false);
+        }
+    });
+});
+
+describe('computeListenerDeviceId', () => {
+    it('is deterministic for the same hostname', () => {
+        expect(computeListenerDeviceId('my-host')).toBe(computeListenerDeviceId('my-host'));
+    });
+
+    it('differs across hostnames', () => {
+        expect(computeListenerDeviceId('host-a')).not.toBe(computeListenerDeviceId('host-b'));
+    });
+
+    it('emits the dev_listener_<sha8> shape (8 lowercase hex chars)', () => {
+        expect(computeListenerDeviceId('my-host')).toMatch(/^dev_listener_[0-9a-f]{8}$/);
     });
 });
