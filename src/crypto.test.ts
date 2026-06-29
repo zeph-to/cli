@@ -53,6 +53,24 @@ describe('initCrypto', () => {
         expect(stored).toHaveProperty('privateKey');
     });
 
+    it('never sends the private key to the server on upload (security)', async () => {
+        const calls: { url: string; init?: RequestInit }[] = [];
+        vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+            calls.push({ url, init });
+            return {
+                ok: true,
+                json: async () => ({ data: { encryptionEnabled: true, encryptionKeys: null } }),
+            } as unknown as Response;
+        }));
+        const { initCrypto } = await import('./crypto.js');
+        await initCrypto('ak_test', 'https://api.example.com/v1');
+        const put = calls.find((c) => c.init?.method === 'PUT' && c.url.endsWith('/users/me/keys'));
+        expect(put).toBeDefined();
+        const body = JSON.parse(String(put?.init?.body ?? '{}'));
+        expect(body).toHaveProperty('publicKey');
+        expect(body).not.toHaveProperty('privateKey');
+    });
+
     it('local-only mode works without apiKey', async () => {
         const { initCrypto, getPublicKey } = await import('./crypto.js');
         const pub = await initCrypto();
