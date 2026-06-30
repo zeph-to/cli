@@ -282,13 +282,19 @@ const fetchServerKeys = async (apiKey: string, baseUrl?: string): Promise<Server
   }
 };
 
+// SECURITY: only the PUBLIC key is ever sent to the server. The server
+// rejects private-key uploads outright (per-device E2E — escrow removed),
+// and a private key must never leave this host. Sending the full
+// ExportedKeyPair previously leaked the private key onto the wire on every
+// init and the rejection was swallowed silently. The per-device migration
+// (see ADR-0007) reworks this path; until then, register the public key only.
 const uploadServerKeys = async (keys: ExportedKeyPair, apiKey: string, baseUrl?: string): Promise<void> => {
   try {
     const url = `${(baseUrl ?? 'https://api.zeph.to/v1').replace(/\/$/, '')}/users/me/keys`;
     await fetch(url, {
       method: 'PUT',
       headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify(keys),
+      body: JSON.stringify({ publicKey: keys.publicKey }),
     });
   } catch { /* non-critical */ }
 };

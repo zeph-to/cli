@@ -78,7 +78,7 @@ const SHELL_COMMANDS = new Set(['bash', 'zsh', 'fish', 'sh', 'dash', 'ksh', 'tcs
 
 // Auth-failure close codes: retrying with the same bad credentials hammers
 // the server forever, so the listener exits instead.
-const AUTH_FAILURE_CODES = new Set([4001, 4002, 4003]);
+export const AUTH_FAILURE_CODES: ReadonlySet<number> = new Set([4001, 4002, 4003]);
 
 const buckets = new Map<string, { tokens: number; lastRefillAt: number }>();
 
@@ -891,7 +891,7 @@ const verifyTmux = (): void => {
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-const computeBackoff = (attempt: number): number => {
+export const computeBackoff = (attempt: number): number => {
     const base = Math.min(RECONNECT_BASE_MS * Math.pow(2, attempt), RECONNECT_MAX_MS);
     const jitter = base * RECONNECT_JITTER_RATIO * (Math.random() * 2 - 1);
     return Math.max(0, base + jitter);
