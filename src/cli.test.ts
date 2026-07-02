@@ -61,6 +61,29 @@ describe('config.ts: resolvedEnv', () => {
     });
 });
 
+describe('config.ts: detectProjectDir', () => {
+    it('honors the env precedence order', async () => {
+        process.env.CURSOR_PROJECT_DIR = '/cursor/proj';
+        process.env.WINDSURF_PROJECT_DIR = '/windsurf/proj';
+        const { detectProjectDir } = await import('./config.js');
+        expect(detectProjectDir()).toBe('/cursor/proj');
+        process.env.CLAUDE_PROJECT_DIR = '/claude/proj';
+        expect(detectProjectDir()).toBe('/claude/proj');
+    });
+
+    it('ignores unresolved ${VAR} placeholders', async () => {
+        process.env.CLAUDE_PROJECT_DIR = '${CLAUDE_PROJECT_DIR}';
+        process.env.CURSOR_PROJECT_DIR = '/cursor/proj';
+        const { detectProjectDir } = await import('./config.js');
+        expect(detectProjectDir()).toBe('/cursor/proj');
+    });
+
+    it('falls back to cwd when no env is set', async () => {
+        const { detectProjectDir } = await import('./config.js');
+        expect(detectProjectDir()).toBe(process.cwd());
+    });
+});
+
 describe('config.ts: load/save round-trip', () => {
     it('saveConfig + loadConfig round-trips at $HOME/.zeph/config.json', async () => {
         const { saveConfig, loadConfig } = await import('./config.js');

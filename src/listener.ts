@@ -28,6 +28,7 @@ import { homedir, hostname, userInfo } from 'os';
 import { join, basename } from 'path';
 import WebSocket from 'ws';
 import { loadConfig, resolvedEnv } from './config.js';
+import { matchAgentByPaneCommand, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 
 const PING_INTERVAL_MS = 25_000;
 const PONG_TIMEOUT_MS = 10_000;
@@ -53,9 +54,6 @@ const WS_STALL_TIMEOUT_MS = 90_000;
 // to reflect new `zeph cc` sessions within a few seconds, not half a
 // minute.
 const SESSION_REPORT_INTERVAL_MS = 5_000;
-
-type AgentKind = 'claude' | 'codex' | 'gemini';
-const AGENT_KINDS: readonly AgentKind[] = ['claude', 'codex', 'gemini'];
 
 interface AgentSession {
     name: string;
@@ -415,70 +413,6 @@ export const parseSessionName = (name: string): { project: string; label: string
     return { project: rest, label: null };
 };
 
-const CLAUDE_PROJECTS_DIR = join(homedir(), '.claude', 'projects');
-
-/**
- * Cache for detectClaudeSessionId. The function walks every jsonl file
- * in `~/.claude/projects/<hash>/` on each call — after weeks of CC use
- * that directory holds hundreds of session files, and we were calling
- * this per tmux session per 5-second report cycle. Heavy disk I/O
- * compounded with multiple sessions caused the report cycle to spike
- * CPU and starve the host shell.
- *
- * The current-session UUID only changes when a new CC session starts
- * in that directory (rare, on the order of hours), so a 60-second TTL
- * is safe and cuts the per-cycle stat count by ~12×.
- */
-const claudeSessionCache = new Map<string, { sessionId: string | null; expiresAt: number }>();
-const CLAUDE_SESSION_CACHE_TTL_MS = 60_000;
-
-const doDetectClaudeSessionId = (cwd: string): string | null => {
-    try {
-        const projectHash = cwd.replace(/\//g, '-');
-        const sessionsDir = join(CLAUDE_PROJECTS_DIR, projectHash);
-        let latest: { name: string; mtime: number } | undefined;
-        for (const entry of readdirSync(sessionsDir)) {
-            const m = entry.match(/^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/);
-            if (!m) continue;
-            const stat = statSync(join(sessionsDir, entry));
-            if (!stat.isFile()) continue;
-            if (!latest || stat.mtimeMs > latest.mtime) {
-                latest = { name: m[1], mtime: stat.mtimeMs };
-            }
-        }
-        return latest?.name ?? null;
-    } catch {
-        return null;
-    }
-};
-
-/**
- * Locate the most recent Claude Code session UUID for the working
- * directory of a tmux pane. Mirrors `mcp-server/config.ts`'s
- * detectClaudeSessionId: CC writes per-session jsonl files at
- * `~/.claude/projects/<projectHash>/<UUID>.jsonl` where the hash is
- * the cwd with `/` replaced by `-`. Cached for 60s — see
- * claudeSessionCache.
- */
-export const detectClaudeSessionId = (cwd: string): string | null => {
-    const now = Date.now();
-    const cached = claudeSessionCache.get(cwd);
-    if (cached && cached.expiresAt > now) return cached.sessionId;
-
-    // Cap cache size so a long-lived listener that's seen many cwds
-    // doesn't grow unbounded. 64 is plenty for any realistic setup.
-    if (claudeSessionCache.size >= 64) {
-        // Evict the oldest-expiring entry — Map iteration order is
-        // insertion order, so the first key we hit is the oldest.
-        const firstKey = claudeSessionCache.keys().next().value;
-        if (firstKey !== undefined) claudeSessionCache.delete(firstKey);
-    }
-
-    const sessionId = doDetectClaudeSessionId(cwd);
-    claudeSessionCache.set(cwd, { sessionId, expiresAt: now + CLAUDE_SESSION_CACHE_TTL_MS });
-    return sessionId;
-};
-
 interface PaneInfo {
     currentCommand: string | null;
     startCommand: string | null;
@@ -531,26 +465,19 @@ const firstTokenBasename = (cmd: string | null): string => {
 };
 
 /**
- * Identify the agent type from the tmux pane. Prefer `pane_start_command`
+ * Identify the agent from the tmux pane. Prefer `pane_start_command`
  * because the foreground process is usually `node`/`python3` (the
  * interpreter), which doesn't tell us *what* was launched. Fall back to
  * `pane_current_command` when start_command is empty — tmux clears
  * start_command in some re-attach cases, especially when a pre-existing
  * session was joined via `tmux new -A` instead of being created fresh.
- * That fallback is safe because we only accept literal `claude` /
- * `codex` / `gemini` as a match.
+ * That fallback is safe because only the literal binaries registered in
+ * remote-agents.ts are accepted as a match.
  */
-const detectAgentKind = (info: PaneInfo): AgentKind | null => {
-    const startBase = firstTokenBasename(info.startCommand);
-    for (const k of AGENT_KINDS) {
-        if (startBase === k) return k;
-    }
-    const currentBase = firstTokenBasename(info.currentCommand);
-    for (const k of AGENT_KINDS) {
-        if (currentBase === k) return k;
-    }
-    return null;
-};
+export const detectRemoteAgent = (info: PaneInfo): RegisteredRemoteAgent | null =>
+    matchAgentByPaneCommand(firstTokenBasename(info.startCommand))
+    ?? matchAgentByPaneCommand(firstTokenBasename(info.currentCommand))
+    ?? null;
 
 const epochToIso = (epoch: string | undefined): string | undefined => {
     if (!epoch) return undefined;
@@ -611,21 +538,21 @@ export const collectSessionsVerbose = (): CollectResult => {
             continue;
         }
         const info = readPaneInfo(name);
-        const agentKind = detectAgentKind(info);
-        if (!agentKind) {
+        const agent = detectRemoteAgent(info);
+        if (!agent) {
             rejected.push({
                 name,
                 reason: `no agent in pane (start=${info.startCommand ?? 'null'}, current=${info.currentCommand ?? 'null'})`,
             });
             continue;
         }
-        const agentSessionId = agentKind === 'claude' && info.currentPath
-            ? detectClaudeSessionId(info.currentPath)
+        const agentSessionId = info.currentPath
+            ? (agent.resolveSessionId?.(info.currentPath) ?? null)
             : null;
         sessions.push({
             name,
             attached: attached === '1',
-            agentKind,
+            agentKind: agent.kind,
             agentSessionId,
             project: parsed.project,
             label: parsed.label,
@@ -638,11 +565,12 @@ export const collectSessionsVerbose = (): CollectResult => {
 
 /**
  * Snapshot the live `zeph-*` tmux sessions on this machine, enriched
- * with the running agent kind, CC session UUID (claude only), project,
- * and tmux activity timestamps. Returns [] when tmux is unreachable
- * or no agent sessions exist. Sessions whose pane is at a shell or
- * running something other than claude/codex/gemini are filtered out
- * — the phone can't usefully address them.
+ * with the running agent kind, the agent's own session id (when the
+ * registry has a resolver — currently Claude Code only), project, and
+ * tmux activity timestamps. Returns [] when tmux is unreachable or no
+ * agent sessions exist. Sessions whose pane is at a shell or running
+ * something not registered in remote-agents.ts are filtered out — the
+ * phone can't usefully address them.
  */
 export const collectSessions = (): AgentSession[] => collectSessionsVerbose().sessions;
 
