@@ -7,21 +7,24 @@ import { join } from 'node:path';
 // computes its cache path from CONFIG_DIR at import time, so each test
 // re-imports it under a throwaway HOME.
 
-const originalHome = process.env.HOME;
+const ENV_KEYS = ['HOME', 'ZEPH_AGENT_RULES_URL', 'ZEPH_BASE_URL'] as const;
+const originalEnv: Record<string, string | undefined> = {};
+for (const key of ENV_KEYS) originalEnv[key] = process.env[key];
 let TMP: string;
 
 beforeEach(() => {
     TMP = mkdtempSync(join(tmpdir(), 'agent-rules-test-'));
+    for (const key of ENV_KEYS) delete process.env[key];
     process.env.HOME = TMP;
-    delete process.env.ZEPH_AGENT_RULES_URL;
     vi.resetModules();
 });
 
 afterEach(() => {
     rmSync(TMP, { recursive: true, force: true });
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
-    delete process.env.ZEPH_AGENT_RULES_URL;
+    for (const key of ENV_KEYS) {
+        if (originalEnv[key] === undefined) delete process.env[key];
+        else process.env[key] = originalEnv[key];
+    }
 });
 
 const importModule = async () => await import('./agent-rules-fetch.js');
@@ -149,5 +152,27 @@ describe('loadManifestFromCache', () => {
             JSON.stringify({ manifest: { ...VALID_MANIFEST, engineVersion: 99 } }));
         const m = await importModule();
         expect(m.loadManifestFromCache()).toBe('bundled');
+    });
+});
+
+describe('rulesUrl stage derivation', () => {
+    it('derives the manifest path from the configured base URL (dev /d1)', async () => {
+        mkdirSync(join(TMP, '.zeph'), { recursive: true });
+        writeFileSync(join(TMP, '.zeph', 'config.json'),
+            JSON.stringify({ baseUrl: 'https://api.zeph.to/d1' }));
+        const m = await importModule();
+        expect(m.rulesUrl()).toBe('https://api.zeph.to/d1/agent-detection/manifest');
+    });
+
+    it('falls back to the prod /v1 base without config', async () => {
+        const m = await importModule();
+        expect(m.rulesUrl()).toBe('https://api.zeph.to/v1/agent-detection/manifest');
+    });
+
+    it('explicit ZEPH_AGENT_RULES_URL still wins', async () => {
+        process.env.ZEPH_AGENT_RULES_URL = 'https://example.test/rules.json';
+        vi.resetModules();
+        const m = await importModule();
+        expect(m.rulesUrl()).toBe('https://example.test/rules.json');
     });
 });

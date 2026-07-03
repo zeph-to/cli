@@ -160,6 +160,26 @@ export const evaluateState = (
     return { state: 'unknown' };
 };
 
+/**
+ * Safe one-pattern probe for output-match watches (§S5 v2). Same caps
+ * as rule evaluation — user-authored watch patterns are exactly as
+ * untrusted as OTA rules. Returns the matched line for the push body.
+ */
+export const findPatternMatch = (pattern: string, paneText: string): { line: string } | null => {
+    let text = paneText;
+    if (Buffer.byteLength(text, 'utf-8') > MAX_INPUT_BYTES) {
+        text = text.slice(-MAX_INPUT_BYTES);
+    }
+    const compiled = compilePattern(pattern);
+    if (!compiled) return null;
+    const match = compiled.exec(text);
+    if (!match) return null;
+    const start = text.lastIndexOf('\n', match.index) + 1;
+    const endIdx = text.indexOf('\n', match.index);
+    const line = text.slice(start, endIdx === -1 ? undefined : endIdx).trim();
+    return { line };
+};
+
 // ── Flap suppression ─────────────────────────────────────────────
 
 export interface StateTracker {

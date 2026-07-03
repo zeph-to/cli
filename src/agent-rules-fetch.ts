@@ -12,7 +12,7 @@
  */
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
-import { CONFIG_DIR, resolvedEnv } from './config.js';
+import { CONFIG_DIR, loadConfig, resolvedEnv } from './config.js';
 import {
     clearRegexCache, ENGINE_VERSION,
     type DetectionManifest, type DetectionRule,
@@ -21,7 +21,10 @@ import { DEFAULT_MANIFEST } from './agent-rules.default.js';
 
 export const RULES_CACHE_FILE = join(CONFIG_DIR, 'agent-rules.json');
 export const RULES_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
-const DEFAULT_RULES_URL = 'https://api.zeph.to/v1/agent-detection/manifest';
+// Fallback only — the manifest path normally derives from the resolved
+// API base so the stage prefix (prod /v1, dev /d1) follows the user's
+// config instead of being hardcoded here.
+const DEFAULT_API_BASE = 'https://api.zeph.to/v1';
 // Matches the server-side serving cap; anything bigger is not a manifest.
 const MAX_MANIFEST_BYTES = 256 * 1024;
 const FETCH_TIMEOUT_MS = 10_000;
@@ -129,8 +132,12 @@ const readCachedEtag = (): string | undefined => {
     }
 };
 
-export const rulesUrl = (): string =>
-    resolvedEnv('ZEPH_AGENT_RULES_URL') ?? DEFAULT_RULES_URL;
+export const rulesUrl = (): string => {
+    const override = resolvedEnv('ZEPH_AGENT_RULES_URL');
+    if (override) return override;
+    const base = resolvedEnv('ZEPH_BASE_URL') ?? loadConfig().baseUrl ?? DEFAULT_API_BASE;
+    return `${base.replace(/\/$/, '')}/agent-detection/manifest`;
+};
 
 export interface RefreshResult {
     source: ManifestSource;

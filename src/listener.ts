@@ -29,7 +29,7 @@ import { join, basename } from 'path';
 import WebSocket from 'ws';
 import { loadConfig, resolvedEnv } from './config.js';
 import { matchAgentByPaneCommand, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
-import { advanceState, evaluateState, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
+import { advanceState, evaluateState, findPatternMatch, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
 
 const PING_INTERVAL_MS = 25_000;
@@ -570,6 +570,71 @@ const pruneSessionStates = (liveNames: Set<string>): void => {
     }
 };
 
+// ─── Pattern watches (SPEC-AGENT-AWARENESS §S5 v2) ─────────────────
+
+export interface PatternWatch {
+    sessionName: string;
+    pattern: string;
+}
+
+let patternWatches: PatternWatch[] = [];
+// One-shot: after a hit we stop re-evaluating that watch locally. The
+// server deletes the record on hit, and the next ack prunes it here —
+// the fired-set only bridges the gap between hit and ack.
+const firedWatchKeys = new Set<string>();
+const patternWatchKey = (w: PatternWatch): string => `${w.sessionName}${w.pattern}`;
+
+/** Ack payload → active watch list. Prunes fired-markers for dead watches. */
+export const setPatternWatches = (raw: unknown): void => {
+    patternWatches = Array.isArray(raw)
+        ? raw.filter((w): w is PatternWatch =>
+            typeof w === 'object' && w !== null
+            && typeof (w as PatternWatch).sessionName === 'string'
+            && typeof (w as PatternWatch).pattern === 'string')
+        : [];
+    const live = new Set(patternWatches.map(patternWatchKey));
+    for (const key of firedWatchKeys) {
+        if (!live.has(key)) firedWatchKeys.delete(key);
+    }
+};
+
+/** Test hook. */
+export const resetPatternWatches = (): void => {
+    patternWatches = [];
+    firedWatchKeys.clear();
+};
+
+export interface WatchHit {
+    sessionName: string;
+    pattern: string;
+    matchedLine: string;
+}
+
+/**
+ * Probe every un-fired watch whose session is live. `capture` is
+ * injectable for tests; production passes capturePaneText.
+ */
+export const collectWatchHits = (
+    liveNames: ReadonlySet<string>,
+    capture: (session: string) => string | null = capturePaneText,
+): WatchHit[] => {
+    const hits: WatchHit[] = [];
+    const textCache = new Map<string, string | null>();
+    for (const w of patternWatches) {
+        if (!liveNames.has(w.sessionName)) continue;
+        const key = patternWatchKey(w);
+        if (firedWatchKeys.has(key)) continue;
+        if (!textCache.has(w.sessionName)) textCache.set(w.sessionName, capture(w.sessionName));
+        const text = textCache.get(w.sessionName);
+        if (text === null || text === undefined) continue;
+        const match = findPatternMatch(w.pattern, text);
+        if (!match) continue;
+        firedWatchKeys.add(key);
+        hits.push({ sessionName: w.sessionName, pattern: w.pattern, matchedLine: match.line });
+    }
+    return hits;
+};
+
 // ─── Screen peek (SPEC-AGENT-AWARENESS §S4) ────────────────────────
 
 // Pane lines returned to the phone. Taller than the state-detection
@@ -1060,6 +1125,13 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             if (sock.readyState !== WebSocket.OPEN) return;
             const { sessions, rejected } = collectSessionsVerbose();
             sock.send(JSON.stringify({ type: 'listener.sessions', data: { sessions } }));
+            // Output-match watches (§S5 v2): probe watched panes and
+            // report hits. One-shot per watch; the server consumes the
+            // record and the next ack prunes it locally.
+            for (const hit of collectWatchHits(new Set(sessions.map((s) => s.name)))) {
+                sock.send(JSON.stringify({ type: 'listener.watch.hit', data: hit }));
+                log(`🔔 watch hit: ${hit.sessionName} ~ /${hit.pattern}/`);
+            }
             // One line per cycle gives the user immediate feedback on
             // what the phone picker will see — particularly important
             // during setup, when an empty picker has no other observable
@@ -1165,8 +1237,10 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                 log(`! server rejected listener.sessions: ${m.message ?? '(no detail)'}`);
             }
             if (m.type === 'listener.sessions.ack') {
-                const d = m.data as { count?: number; updatedAt?: string } | undefined;
+                const d = m.data as { count?: number; updatedAt?: string; watches?: unknown } | undefined;
                 log(`✓ server persisted ${d?.count ?? '?'} session(s)`);
+                // Pattern watches ride the ack (§S5 v2) — refresh ours.
+                setPatternWatches(d?.watches);
             }
             // `push.sync` (offline batch on $connect) and other types ignored.
         });

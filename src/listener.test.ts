@@ -13,6 +13,9 @@ import {
     deriveSessionState,
     handleScreenRequest,
     resetSessionStates,
+    collectWatchHits,
+    setPatternWatches,
+    resetPatternWatches,
 } from './listener.js';
 
 describe('checkRateLimit', () => {
@@ -482,5 +485,53 @@ describe('handleScreenRequest', () => {
         expect(reply?.requestId).toBe('r42');
         expect(['unknown_session', 'rate_limited']).toContain(reply?.error);
         expect(reply?.content).toBeUndefined();
+    });
+});
+
+describe('pattern watches (§S5 v2)', () => {
+    beforeEach(() => {
+        resetPatternWatches();
+    });
+
+    it('reports a hit with the matched line and fires only once', () => {
+        setPatternWatches([{ sessionName: 'zeph-a', pattern: 'ready on port \\d+' }]);
+        const capture = () => 'building…\nServer ready on port 3000\n❯';
+        const first = collectWatchHits(new Set(['zeph-a']), capture);
+        expect(first).toEqual([{
+            sessionName: 'zeph-a',
+            pattern: 'ready on port \\d+',
+            matchedLine: 'Server ready on port 3000',
+        }]);
+        expect(collectWatchHits(new Set(['zeph-a']), capture)).toEqual([]);
+    });
+
+    it('skips watches whose session is not live', () => {
+        setPatternWatches([{ sessionName: 'zeph-gone', pattern: 'x' }]);
+        expect(collectWatchHits(new Set(['zeph-a']), () => 'x marks the spot')).toEqual([]);
+    });
+
+    it('does not fire without a match and stays armed', () => {
+        setPatternWatches([{ sessionName: 'zeph-a', pattern: 'DONE' }]);
+        expect(collectWatchHits(new Set(['zeph-a']), () => 'still working')).toEqual([]);
+        expect(collectWatchHits(new Set(['zeph-a']), () => 'all DONE here')).toHaveLength(1);
+    });
+
+    it('re-arms when the server re-sends a previously fired watch', () => {
+        setPatternWatches([{ sessionName: 'zeph-a', pattern: 'hit' }]);
+        expect(collectWatchHits(new Set(['zeph-a']), () => 'hit!')).toHaveLength(1);
+        // Ack without the watch → pruned. A later ack re-adds it fresh.
+        setPatternWatches([]);
+        setPatternWatches([{ sessionName: 'zeph-a', pattern: 'hit' }]);
+        expect(collectWatchHits(new Set(['zeph-a']), () => 'hit again')).toHaveLength(1);
+    });
+
+    it('ignores malformed watch payloads', () => {
+        setPatternWatches([{ nope: true }, 'garbage', null]);
+        expect(collectWatchHits(new Set(['zeph-a']), () => 'anything')).toEqual([]);
+    });
+
+    it('handles unreadable panes gracefully', () => {
+        setPatternWatches([{ sessionName: 'zeph-a', pattern: 'x' }]);
+        expect(collectWatchHits(new Set(['zeph-a']), () => null)).toEqual([]);
     });
 });
