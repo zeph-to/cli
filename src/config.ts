@@ -18,6 +18,21 @@ export const resolvedEnv = (key: string): string | undefined => {
   return val && !val.startsWith('${') ? val : undefined;
 };
 
+// Per-agent project-dir env vars, in precedence order. Deliberately NOT part
+// of the remote-agent registry: Cursor/Windsurf carry project-dir envs but
+// are not remote-controllable via tmux — the two tables have different
+// membership.
+export const PROJECT_DIR_ENV_VARS = ['CLAUDE_PROJECT_DIR', 'CURSOR_PROJECT_DIR', 'WINDSURF_PROJECT_DIR'] as const;
+
+/** First set project-dir env (unresolved `${VAR}` placeholders ignored), else cwd. */
+export const detectProjectDir = (): string => {
+  for (const key of PROJECT_DIR_ENV_VARS) {
+    const val = resolvedEnv(key);
+    if (val) return val;
+  }
+  return process.cwd();
+};
+
 export const loadConfig = (): ZephConfig => {
   try {
     return JSON.parse(readFileSync(CONFIG_FILE, 'utf-8')) as ZephConfig;

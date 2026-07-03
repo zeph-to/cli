@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Weekly drift check against zeph-to/plugin main — catches CORE_RULES /
+    # gate-vector changes that land in the plugin repo between cli PRs.
+    - cron: '0 3 * * 1'
 
 jobs:
   vitest:
@@ -20,3 +24,20 @@ jobs:
       - run: npm ci
 
       - run: npm test
+
+  plugin-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: zeph-to/plugin
+          path: plugin
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check generated artifacts against plugin main
+        run: node scripts/sync-from-plugin.mjs --check --plugin ./plugin

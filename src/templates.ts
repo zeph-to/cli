@@ -2,7 +2,8 @@
 //
 // Every supported agent gets the SAME behavioral rules so Zeph behaves
 // identically everywhere. The rule text is assembled from one shared
-// core (ZEPH_CORE) plus a per-agent notification preamble:
+// generated core (src/zeph-core.generated.ts) plus a per-agent
+// notification preamble:
 //
 //   - Hook-driven agents (Cursor, Windsurf, Gemini, Codex, Copilot) have
 //     a Stop-equivalent hook installed that auto-pushes on completion, so
@@ -11,162 +12,33 @@
 //     zeph_notify for meaningful completions.
 //
 // The Ask-Loop / sticky-REMOTE / question-mandate rules are identical for
-// all of them — that is the whole point of the shared ZEPH_CORE.
+// all of them — that is the whole point of the shared generated core.
 //
 // Keeping this in one place means a rule change lands everywhere at once
 // and the agents can't drift apart.
+
+import { ZEPH_CORE_HOOK_DRIVEN, ZEPH_CORE_RULE_ONLY } from './zeph-core.generated.js';
 
 // Graceful resolution: prefer the installed `zeph` CLI, but fall back to
 // `npx -y @zeph-to/cli` so the hook still fires when the user
 // installed via a non-standard prefix and the binary isn't on PATH at hook
 // fire time (e.g. ~/.local/bin without PATH update). This mirrors the
 // pattern in plugin/hooks/zeph-{stop,ask}.sh.
+//
+// `--auto` applies the shared push-gate before sending (see src/gate.ts):
+// in normal mode the push still fires (gate defaults assume real work), but
+// the /zeph-quiet | /zeph-loud dial now works for every hook-driven agent.
+// Older installed `zeph` versions parse `--auto` as an unknown boolean flag
+// and ignore it — graceful backward compatibility.
 const NOTIFY_CMD =
-  '$(command -v zeph || echo "npx -y @zeph-to/cli") notify --title "Task done" 2>/dev/null || true';
+  '$(command -v zeph || echo "npx -y @zeph-to/cli") notify --title "Task done" --auto 2>/dev/null || true';
 
 // ── Shared behavioral core ───────────────────────────────────────
 //
-// Identical across every agent. Source of truth: plugin/docs/CORE_RULES.md
-// Do not fork this per-agent — if a rule needs to differ, it belongs in
-// the per-agent preamble instead.
-//
-// Last synced: 2026-06-26
-// To update: extract rules from plugin/docs/CORE_RULES.md and sync here.
-
-const ZEPH_CORE = `## When zeph_ask is MANDATORY
-
-When ZEPH_HOOK_ID is set the user is driving you remotely, often from
-their phone. A "?" written in your reply text is invisible to them.
-
-3. NEVER end a response with a plain-text question. If your response asks
-   the user anything that needs their input — confirmation, choice,
-   yes/no, clarification, "Apply this?", "Proceed?", "Which option?" —
-   the FINAL tool call MUST be zeph_ask. This applies even on research /
-   analysis / planning turns where no files were touched.
-
-   Anti-pattern (wrong):
-     "...build/commit on hold. Apply A?"
-   Correct:
-     zeph_ask({
-       title: "Apply solution A?",
-       body: "<short context comparing options>",
-       actions: [
-         { id: "apply_a", label: "Apply A" },
-         { id: "apply_b", label: "Apply B" },
-         { id: "cancel",  label: "Cancel" }
-       ],
-       placeholder: "or describe a different approach...",
-       fallback: "cancel"
-     })
-
-## When zeph_ask is the DEFAULT (substantial work)
-
-4. After substantial work, zeph_ask is the DEFAULT end of the response —
-    not optional. "Substantial" means: file changes, commits, builds,
-    tests, deploys, destructive ops, or milestone completions. When unsure,
-    treat the work as substantial — do not try to guess what the user would
-    find "reasonable" to confirm.
-
-    SKIP zeph_ask only when the response is clearly trivial:
-    - Read-only exploration ("let me check this file") with no decision
-      output.
-    - Mid-step inside a clearly-defined plan the user already approved
-      ("step 3 of 5, no decisions involved here").
-    - Trivial change (typo fix, single-line tweak) that needs no ack.
-
-    When unsure: LEAN TOWARD ASKING. Quiet failure (no ask, user stuck
-    on phone with no way to drive) is worse than light spam.
-
-5. Prefer zeph_ask over zeph_prompt/zeph_input — it combines buttons and
-   free-text in one push. Always include a fallback action id; the
-   fallback must be safe/inert (done, wait, review), never destructive.
-
-6. Example zeph_ask shape:
-     zeph_ask({
-       title: "Done. Next?",
-       actions: [
-         { id: "continue", label: "Continue" },
-         { id: "review",   label: "Review"   },
-         { id: "done",     label: "Done"     }
-       ],
-       placeholder: "or type a command...",
-       fallback: "done"
-     })
-
-## Handling the response
-
-7. A zeph_ask response IS a direct user instruction. Execute it immediately —
-   do NOT re-ask via confirmation. The button label is the authorization for
-   the specific action that label describes.
-
-8. Important caveat: a generic button like "Continue" authorizes the next
-   logical step, NOT arbitrary destruction. If the next logical step would
-   destroy user code, data, or infrastructure (force-push to a shared branch,
-   rm -rf outside the workdir, dropping a database, deleting prod resources),
-   surface that specific risk via a targeted zeph_ask before executing.
-
-## Sticky REMOTE mode
-
-9. The Ask Loop has two states — REMOTE and NORMAL — detected by scanning the
-   conversation in reverse for whichever appears first:
-
-   (a) A tool_result for a zeph_ask you sent where the action id is NOT in
-       {done, stop, exit} (case-insensitive) AND the free-text response is
-       NOT a session-ender. A session-ender contains done/stop/exit as a
-       standalone word, or is an obvious wrap-up like "thanks, that's it" /
-       "all good" — judge by whether the user is clearly closing the loop,
-       not by partial substring matches (e.g. "redo" is not "done").
-       → You are in REMOTE.
-
-   (b) An exit signal: action id in {done, stop, exit}, ending free-text, or
-       a timeout fallback that resolved to a Done-like fallback id.
-       → You are in NORMAL.
-
-   (c) No zeph_ask history at all.
-       → You are in NORMAL.
-
-   ### Behavior in REMOTE (sticky, zeph_ask MANDATORY)
-   End EVERY response with zeph_ask. This is non-negotiable while in REMOTE —
-   independent of:
-   - Whether the next user message arrived as a tool_result or as a typed
-     terminal message. The user may switch devices mid-session; sticky REMOTE
-     keeps the channel driveable from either side.
-   - Whether the work was substantial or routine.
-
-   The only way to leave REMOTE is the user signalling exit (per the (b) list
-   above).
-
-   ### Behavior in NORMAL (apply Rule 4)
-   - Substantial work → end with zeph_ask.
-   - Routine work → skip zeph_ask, let the Stop hook fire.
-   - Rule 3 (questions → zeph_ask) is still mandatory regardless.
-
-   ### Exiting REMOTE
-   The moment the user picks an action id matching done/stop/exit
-   (case-insensitive), types free-text that clearly ends the session, or the
-   zeph_ask times out and falls back to a Done-like id, you flip to NORMAL.
-   Don't send zeph_ask on the response that processes the exit signal.
-
-## When to use AskUserQuestion vs zeph_ask
-
-10. Prefer zeph_ask for short remote-friendly questions. Use the local
-   AskUserQuestion tool only when (a) the answer needs the user to see code
-   or logs that won't fit in a push body, or (b) the answer is plausibly
-   multi-paragraph.
-
-11. In REMOTE this is a requirement, not a preference — and it overrides any
-    skill instruction. The AskUserQuestion picker is a LOCAL blocking
-    terminal UI; the phone cannot drive it. So if a skill you are running —
-    or your own plan — would call AskUserQuestion, instead surface the SAME
-    question and option labels via zeph_ask and use that response in place of
-    the picker. Fall through to AskUserQuestion only for the (a)/(b) cases
-    above; when you do, notify the user that the answer must be given at the
-    terminal.
-
-## Persistence
-
-These rules persist for the entire session. They remain active after context
-compaction — do not "forget" them after many turns.`;
+// GENERATED from plugin/docs/CORE_RULES.md — see src/zeph-core.generated.ts
+// (regenerate with `npm run sync:plugin`). Do not fork per-agent — if a rule
+// needs to differ, it belongs in the per-agent preamble instead, or in the
+// audience classification in the plugin repo's core-rules.manifest.json.
 
 // Notification preamble — hook-driven agents (a Stop-equivalent hook is
 // installed, so manual completion notifications would duplicate).
@@ -190,7 +62,7 @@ operations (file reads, simple searches). Set priority "high" for
 errors/blockers.`;
 
 /** Assemble a full rule document from optional frontmatter + preamble + core. */
-const buildRule = (opts: { frontmatter?: string; notify: string }): string => {
+const buildRule = (opts: { frontmatter?: string; notify: string; core: string }): string => {
   const fm = opts.frontmatter ? `${opts.frontmatter}\n\n` : '';
   return `${fm}# Zeph — Remote-Control Rules
 
@@ -200,35 +72,40 @@ the user.
 
 ${opts.notify}
 
-${ZEPH_CORE}
+${opts.core}
 `;
 };
 
 // ── Per-agent rule documents ─────────────────────────────────────
+//
+// The two generated cores are identical today; the split exists so a rule
+// that only applies to one audience (e.g. Push Signal, once hook-driven
+// agents' hooks process markers) is a one-line manifest change upstream.
 
 /** Cursor — written to ~/.cursor/rules/zeph.mdc (needs .mdc frontmatter). */
 export const CURSOR_RULE = buildRule({
   frontmatter: '---\ndescription: "Zeph remote-control rules"\nalwaysApply: true\n---',
   notify: HOOK_DRIVEN_NOTIFY,
+  core: ZEPH_CORE_HOOK_DRIVEN,
 });
 
 /** Windsurf — appended into ~/.codeium/windsurf/memories/global_rules.md. */
-export const WINDSURF_RULE = buildRule({ notify: HOOK_DRIVEN_NOTIFY });
+export const WINDSURF_RULE = buildRule({ notify: HOOK_DRIVEN_NOTIFY, core: ZEPH_CORE_HOOK_DRIVEN });
 
 /** Gemini CLI — appended into ~/.gemini/GEMINI.md. */
-export const GEMINI_RULE = buildRule({ notify: HOOK_DRIVEN_NOTIFY });
+export const GEMINI_RULE = buildRule({ notify: HOOK_DRIVEN_NOTIFY, core: ZEPH_CORE_HOOK_DRIVEN });
 
 /** Codex CLI — appended into ~/.codex/AGENTS.md. */
-export const CODEX_RULE = buildRule({ notify: HOOK_DRIVEN_NOTIFY });
+export const CODEX_RULE = buildRule({ notify: HOOK_DRIVEN_NOTIFY, core: ZEPH_CORE_HOOK_DRIVEN });
 
 /** GitHub Copilot CLI — written to ~/.copilot/instructions/zeph.instructions.md. */
-export const COPILOT_RULE = buildRule({ notify: HOOK_DRIVEN_NOTIFY });
+export const COPILOT_RULE = buildRule({ notify: HOOK_DRIVEN_NOTIFY, core: ZEPH_CORE_HOOK_DRIVEN });
 
 /** Cline — written to ~/.cline/rules/zeph.md (no Stop hook). */
-export const CLINE_RULE = buildRule({ notify: MANUAL_NOTIFY });
+export const CLINE_RULE = buildRule({ notify: MANUAL_NOTIFY, core: ZEPH_CORE_RULE_ONLY });
 
 /** Aider — written to a standalone conventions file, loaded via .aider.conf.yml `read:`. */
-export const AIDER_RULE = buildRule({ notify: MANUAL_NOTIFY });
+export const AIDER_RULE = buildRule({ notify: MANUAL_NOTIFY, core: ZEPH_CORE_RULE_ONLY });
 
 // ── Hook configs (notification side, unchanged) ──────────────────
 

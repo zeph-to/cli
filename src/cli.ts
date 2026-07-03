@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { existsSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { ZephHook } from './zeph-hook.js';
 import { AuthenticationError, QuotaExceededError, ZephError } from './errors.js';
@@ -11,23 +10,9 @@ import { handleVerify } from './verify.js';
 import { handleCheckUpdate } from './check-update.js';
 import { handleAgentSession } from './wrapper.js';
 import { handleListener } from './listener.js';
-import { loadConfig, resolvedEnv, VERSION } from './config.js';
-
-const PROJECT_DIR_VARS = ['CLAUDE_PROJECT_DIR', 'CURSOR_PROJECT_DIR', 'WINDSURF_PROJECT_DIR'] as const;
-
-const detectProjectDir = (): string =>
-  PROJECT_DIR_VARS.reduce<string | undefined>((found, key) => found || process.env[key], undefined) ?? process.cwd();
-
-const isMuted = (): boolean => {
-  try {
-    const dir = detectProjectDir();
-    const raw = execFileSync('cksum', { input: dir, encoding: 'utf-8' });
-    const hash = raw.split(' ')[0];
-    return existsSync(`/tmp/zeph-muted-${hash}`);
-  } catch {
-    return false;
-  }
-};
+import { detectProjectDir, loadConfig, resolvedEnv, VERSION } from './config.js';
+import { decidePush, GATE_DEFAULTS, isMuted, normalizeMarker, readPushMode } from './gate.js';
+import { findAgentBySubcommand, REMOTE_AGENTS } from './remote-agents.js';
 
 const detectBranchAndProject = (): { branch?: string; project: string } => {
   const dir = detectProjectDir();
@@ -76,6 +61,12 @@ const parseArgs = (argv: string[]): Record<string, string | boolean> => {
 
 // ── Output ──────────────────────────────────────────────────────
 
+/** One usage line per registered remote agent — generated so help text can't drift from the table. */
+const usageAgentLines = (): string =>
+  REMOTE_AGENTS.map(
+    (a) => `  ${`${a.subcommands[0]} [args…]`.padEnd(15)} Run '${a.binary}' in a named tmux session ('zeph-<project>')`,
+  ).join('\n');
+
 const printUsage = () => {
   console.log(`Usage: zeph <command> [options]
 
@@ -89,9 +80,7 @@ Commands:
   list            List recent push notifications
   dismiss <id>    Dismiss a push notification (or --all)
   test            Send a test notification to verify setup
-  cc [args…]      Run 'claude' in a named tmux session ('zeph-<project>')
-  codex [args…]   Run 'codex' in a named tmux session
-  gemini [args…]  Run 'gemini' in a named tmux session
+${usageAgentLines()}
                   (auto-suffixed -2/-3/… when another zeph cc is already
                    attached to the default name; any args after the
                    subcommand are forwarded verbatim, e.g.
@@ -108,6 +97,11 @@ Notify options:
   --priority <p>     Priority (low|normal|high|urgent) [default: normal]
   --device <id>      Target device ID
   --session <id>     AI session ID (or set ZEPH_SESSION_ID env)
+  --auto             Apply the push gate before sending (honors the
+                     /zeph-quiet | /zeph-loud dial; silent exit when gated)
+  --marker <m>       Push Signal marker for --auto (skip|push|high)
+  --tools <n>        Turn tool count for --auto [default: assume real work]
+  --nonreadonly <n>  Non-read-only tool count for --auto
 
 List options:
   --limit <n>        Number of pushes (1-20, default 5)
@@ -182,9 +176,33 @@ const createHook = (args: Record<string, string | boolean>): ZephHook | null => 
   });
 };
 
+/** Parse a gate count flag; garbage input falls back to the default (never accidentally silences). */
+const gateCount = (raw: string | boolean | undefined, fallback: number): number => {
+  const n = typeof raw === 'string' ? Number(raw) : NaN;
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+
 const handleNotify = async (args: Record<string, string | boolean>): Promise<number> => {
   const isJson = args.json === true;
-  if (isMuted()) return 0;
+  const projectDir = detectProjectDir();
+  if (isMuted(projectDir)) return 0;
+
+  // --auto: apply the shared push-gate before sending. Inputs default to
+  // GATE_DEFAULTS ("assume real work") so dumb hooks keep their historical
+  // always-push behavior in normal mode, while the /zeph-quiet | /zeph-loud
+  // dial now works for every hook-driven agent. Gated-out → silent success.
+  if (args.auto === true) {
+    const verdict = decidePush({
+      toolCount: gateCount(args.tools, GATE_DEFAULTS.toolCount),
+      nonReadonlyCount: gateCount(args.nonreadonly, GATE_DEFAULTS.nonReadonlyCount),
+      alreadyAsked: GATE_DEFAULTS.alreadyAsked,
+      marker: normalizeMarker(typeof args.marker === 'string' ? args.marker : undefined),
+      pushMode: readPushMode(projectDir),
+    });
+    if (!verdict.push) return 0;
+    if (verdict.priority === 'high' && !args.priority) args.priority = 'high';
+  }
+
   const hook = createHook(args);
   if (!hook) return 3;
 
@@ -356,6 +374,12 @@ const main = async (): Promise<number> => {
     return 0;
   }
 
+  // Remote-control subcommands (`zeph cc` / `zeph codex` / …) come from the
+  // registry — one table row per agent, no hardcoded cases. Pass the typed
+  // command token to collectPassthrough (aliases map to the same agent).
+  const remote = findAgentBySubcommand(command);
+  if (remote) return handleAgentSession(remote, collectPassthrough(process.argv, command));
+
   switch (command) {
     case 'install':
     case 'setup':
@@ -376,12 +400,6 @@ const main = async (): Promise<number> => {
       return handleDismiss(args);
     case 'test':
       return handleTest(args);
-    case 'cc':
-      return handleAgentSession('claude', collectPassthrough(process.argv, 'cc'));
-    case 'codex':
-      return handleAgentSession('codex', collectPassthrough(process.argv, 'codex'));
-    case 'gemini':
-      return handleAgentSession('gemini', collectPassthrough(process.argv, 'gemini'));
     case 'listener':
       return handleListener(args);
     default:

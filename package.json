@@ -24,6 +24,7 @@
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
+    "sync:plugin": "node scripts/sync-from-plugin.mjs",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {

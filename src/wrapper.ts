@@ -13,9 +13,8 @@ import { spawn, execFileSync, spawnSync } from 'child_process';
 import { existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { basename, join } from 'path';
-
-/** First non-empty value among the supported per-agent project dir env vars. */
-const PROJECT_DIR_ENVS = ['CLAUDE_PROJECT_DIR', 'CURSOR_PROJECT_DIR', 'WINDSURF_PROJECT_DIR'] as const;
+import { PROJECT_DIR_ENV_VARS, resolvedEnv } from './config.js';
+import type { RemoteAgent } from './remote-agents.js';
 
 const FALLBACK_NAME = 'project';
 
@@ -24,8 +23,8 @@ const safeBasename = (path: string): string => basename(path) || FALLBACK_NAME;
 
 /** Resolve a project name for the tmux session: env > git root > cwd basename. */
 export const detectProjectName = (): string => {
-    for (const key of PROJECT_DIR_ENVS) {
-        const v = process.env[key];
+    for (const key of PROJECT_DIR_ENV_VARS) {
+        const v = resolvedEnv(key);
         if (v) return safeBasename(v.replace(/\/+$/, ''));
     }
     try {
@@ -202,13 +201,13 @@ const ensureListenerRunning = (): void => {
  * `zeph cc --resume foo` runs `claude --resume foo` inside the session.
  * Returns when the agent exits.
  */
-export const handleAgentSession = (agent: string, extra: string[] = []): Promise<number> => {
+export const handleAgentSession = (agent: RemoteAgent, extra: string[] = []): Promise<number> => {
     // Best-effort: make sure the phone-bridge daemon is running before we
     // launch the agent. The user shouldn't need to remember a second
     // command for the picker on their phone to work.
     ensureListenerRunning();
     return new Promise<number>((resolve) => {
-        const { cmd, args } = targetForAgent(agent, extra);
+        const { cmd, args } = targetForAgent(agent.binary, extra);
         const start = Date.now();
         const child = spawn(cmd, args, { stdio: 'inherit' });
         child.on('exit', (code) => {
