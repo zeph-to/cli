@@ -11,6 +11,7 @@ import {
     AUTH_FAILURE_CODES,
     computeListenerDeviceId,
     deriveSessionState,
+    handleScreenRequest,
     resetSessionStates,
 } from './listener.js';
 
@@ -434,5 +435,52 @@ describe('deriveSessionState', () => {
         const b = deriveSessionState('zeph-b', 'claude', BLOCKED_PANE, 0);
         expect(a.state).toBe('working');
         expect(b.state).toBe('blocked');
+    });
+});
+
+describe('handleScreenRequest', () => {
+    const myDevice = computeListenerDeviceId();
+
+    it('ignores non-screen ephemeral traffic', () => {
+        expect(handleScreenRequest({ subtype: 'clipboard', targetDeviceId: myDevice })).toBeNull();
+        expect(handleScreenRequest({})).toBeNull();
+    });
+
+    it('ignores requests addressed to another device', () => {
+        expect(handleScreenRequest({
+            subtype: 'agent.screen.request',
+            targetDeviceId: 'dev_someone_else',
+            sessionName: 'zeph-proj',
+            requestId: 'r1',
+        })).toBeNull();
+    });
+
+    it('ignores requests missing requestId or sessionName', () => {
+        expect(handleScreenRequest({
+            subtype: 'agent.screen.request',
+            targetDeviceId: myDevice,
+            requestId: 'r1',
+        })).toBeNull();
+        expect(handleScreenRequest({
+            subtype: 'agent.screen.request',
+            targetDeviceId: myDevice,
+            sessionName: 'zeph-proj',
+        })).toBeNull();
+    });
+
+    it('answers unknown sessions with an error snapshot (no tmux access attempted)', () => {
+        // No zeph-* tmux sessions exist in the test environment, so any
+        // name fails the inventory guard — the pane is never read.
+        const reply = handleScreenRequest({
+            subtype: 'agent.screen.request',
+            targetDeviceId: myDevice,
+            sessionName: 'zeph-not-there',
+            requestId: 'r42',
+        });
+        expect(reply).not.toBeNull();
+        expect(reply?.subtype).toBe('agent.screen.snapshot');
+        expect(reply?.requestId).toBe('r42');
+        expect(['unknown_session', 'rate_limited']).toContain(reply?.error);
+        expect(reply?.content).toBeUndefined();
     });
 });

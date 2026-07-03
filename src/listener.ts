@@ -570,6 +570,74 @@ const pruneSessionStates = (liveNames: Set<string>): void => {
     }
 };
 
+// ─── Screen peek (SPEC-AGENT-AWARENESS §S4) ────────────────────────
+
+// Pane lines returned to the phone. Taller than the state-detection
+// capture — the user wants to READ this, not regex it.
+const SCREEN_PEEK_LINES = 60;
+// Ephemeral frames ride API Gateway WS (32KB frame limit); stay well
+// under it after JSON envelope overhead.
+const SCREEN_PEEK_MAX_BYTES = 24 * 1024;
+
+export interface ScreenRequest {
+    subtype?: string;
+    targetDeviceId?: string;
+    sessionName?: string;
+    requestId?: string;
+}
+
+export interface ScreenSnapshot {
+    subtype: 'agent.screen.snapshot';
+    requestId: string;
+    sessionName: string;
+    content?: string;
+    truncated?: boolean;
+    error?: string;
+    capturedAt: string;
+}
+
+/**
+ * Answer a phone's screen-peek request for one of OUR sessions.
+ * Returns null when the message isn't addressed to this machine (other
+ * ephemeral traffic — clipboard, mirrors — flows through constantly).
+ *
+ * Security posture: only sessions the inventory already exposes are
+ * readable — the phone can see exactly the panes it can already send
+ * commands into, nothing else. Rate-limited with the same per-session
+ * token bucket as command injection.
+ */
+export const handleScreenRequest = (req: ScreenRequest): ScreenSnapshot | null => {
+    if (req.subtype !== 'agent.screen.request') return null;
+    if (!req.requestId || !req.sessionName) return null;
+    if (req.targetDeviceId !== computeListenerDeviceId()) return null;
+
+    const capturedAt = new Date().toISOString();
+    const base = { subtype: 'agent.screen.snapshot' as const, requestId: req.requestId, sessionName: req.sessionName, capturedAt };
+
+    if (!checkRateLimit(`screen:${req.sessionName}`)) {
+        return { ...base, error: 'rate_limited' };
+    }
+    if (!collectSessions().some((s) => s.name === req.sessionName)) {
+        return { ...base, error: 'unknown_session' };
+    }
+    const r = spawnSync('tmux', tmuxArgs(['capture-pane', '-p', '-t', req.sessionName, '-S', `-${SCREEN_PEEK_LINES}`]), {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (r.status !== 0) {
+        return { ...base, error: 'capture_failed' };
+    }
+    let content = r.stdout ?? '';
+    let truncated = false;
+    while (Buffer.byteLength(content, 'utf-8') > SCREEN_PEEK_MAX_BYTES) {
+        // Cut from the top — the bottom of the pane is what the user needs.
+        const cut = content.indexOf('\n', Math.floor(content.length / 8));
+        content = cut > 0 ? content.slice(cut + 1) : content.slice(-SCREEN_PEEK_MAX_BYTES);
+        truncated = true;
+    }
+    return { ...base, content, truncated };
+};
+
 export interface CollectResult {
     sessions: AgentSession[];
     /** Diagnostic notes per rejected session — surfaced under `--verbose`. */
@@ -1079,6 +1147,15 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                 // logged, never thrown into the socket handler.
                 void handlePush(m.data as PushItem).catch((err) =>
                     log(`! handlePush: ${(err as Error).message}`));
+            }
+            if (m.type === 'ephemeral' && m.data) {
+                // Screen peek (§S4): the phone asks for this machine's live
+                // pane content over the ephemeral relay; the reply rides the
+                // same channel. Nothing is persisted server-side.
+                const reply = handleScreenRequest(m.data as ScreenRequest);
+                if (reply && sock.readyState === WebSocket.OPEN) {
+                    sock.send(JSON.stringify({ type: 'ephemeral', data: reply }));
+                }
             }
             // Surface server-side errors from listener.sessions reports.
             // Without this the daemon happily logs "reported N session(s)"
