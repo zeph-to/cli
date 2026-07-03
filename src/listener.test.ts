@@ -10,6 +10,8 @@ import {
     computeBackoff,
     AUTH_FAILURE_CODES,
     computeListenerDeviceId,
+    deriveSessionState,
+    resetSessionStates,
 } from './listener.js';
 
 describe('checkRateLimit', () => {
@@ -382,5 +384,55 @@ describe('computeListenerDeviceId', () => {
 
     it('emits the dev_listener_<sha8> shape (8 lowercase hex chars)', () => {
         expect(computeListenerDeviceId('my-host')).toMatch(/^dev_listener_[0-9a-f]{8}$/);
+    });
+});
+
+describe('deriveSessionState', () => {
+    beforeEach(() => {
+        resetSessionStates();
+    });
+
+    const WORKING_PANE = '✻ Churning… (12s · esc to interrupt)';
+    const BLOCKED_PANE = 'Do you want to proceed?\n❯ 1. Yes\nEnter to select · esc to cancel';
+
+    it('reports state fields from the first capture (baseline)', () => {
+        const r = deriveSessionState('zeph-proj', 'claude', WORKING_PANE, 1000);
+        expect(r.state).toBe('working');
+        expect(r.stateChangedAt).toBe(new Date(1000).toISOString());
+        expect(r.stateRuleId).toBe('claude-working-interrupt-hint');
+    });
+
+    it('debounces a transition across two cycles', () => {
+        deriveSessionState('zeph-proj', 'claude', WORKING_PANE, 0);
+        const mid = deriveSessionState('zeph-proj', 'claude', BLOCKED_PANE, 5000);
+        expect(mid.state).toBe('working'); // candidate only
+        const done = deriveSessionState('zeph-proj', 'claude', BLOCKED_PANE, 10000);
+        expect(done.state).toBe('blocked');
+        expect(done.stateChangedAt).toBe(new Date(10000).toISOString());
+    });
+
+    it('promotes a pending candidate on a hash-identical cycle', () => {
+        // Screen froze on the blocked dialog: cycle 2 evaluates it,
+        // cycle 3 sees identical bytes. The replayed observation must
+        // still count as the second sighting.
+        deriveSessionState('zeph-proj', 'claude', WORKING_PANE, 0);
+        deriveSessionState('zeph-proj', 'claude', BLOCKED_PANE, 5000);
+        const r = deriveSessionState('zeph-proj', 'claude', BLOCKED_PANE, 10000);
+        expect(r.state).toBe('blocked');
+    });
+
+    it('returns no fields and forgets the session when the pane is unreadable', () => {
+        deriveSessionState('zeph-proj', 'claude', WORKING_PANE, 0);
+        expect(deriveSessionState('zeph-proj', 'claude', null, 5000)).toEqual({});
+        // Next readable capture is a fresh baseline, confirmed immediately.
+        const r = deriveSessionState('zeph-proj', 'claude', BLOCKED_PANE, 10000);
+        expect(r.state).toBe('blocked');
+    });
+
+    it('tracks sessions independently', () => {
+        const a = deriveSessionState('zeph-a', 'claude', WORKING_PANE, 0);
+        const b = deriveSessionState('zeph-b', 'claude', BLOCKED_PANE, 0);
+        expect(a.state).toBe('working');
+        expect(b.state).toBe('blocked');
     });
 });

@@ -29,6 +29,8 @@ import { join, basename } from 'path';
 import WebSocket from 'ws';
 import { loadConfig, resolvedEnv } from './config.js';
 import { matchAgentByPaneCommand, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
+import { advanceState, evaluateState, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
+import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
 
 const PING_INTERVAL_MS = 25_000;
 const PONG_TIMEOUT_MS = 10_000;
@@ -64,6 +66,15 @@ interface AgentSession {
     label?: string | null;
     createdAt?: string;
     lastActivityAt?: string;
+    /**
+     * Detected agent state (wire contract — flows to the server and the
+     * phone's Agents tab). Absent when the pane can't be captured or
+     * detection is unavailable. `done` never appears here: it's derived
+     * client-side (SPEC-AGENT-AWARENESS §S1/§S6).
+     */
+    state?: AgentState;
+    stateChangedAt?: string;
+    stateRuleId?: string;
 }
 
 // Per-session token bucket — caps a runaway/compromised sender. 30/min
@@ -486,6 +497,79 @@ const epochToIso = (epoch: string | undefined): string | undefined => {
     return new Date(n * 1000).toISOString();
 };
 
+// ─── Agent state detection (SPEC-AGENT-AWARENESS §S1) ──────────────
+
+// How many pane lines the state rules see. The live status area every
+// agent renders sits in the last handful of lines; 40 leaves margin for
+// tall dialogs without hauling whole scrollbacks through regex.
+const STATE_CAPTURE_LINES = 40;
+
+interface SessionStateEntry {
+    tracker: StateTracker;
+    /** Last raw evaluation — replayed on hash-equal cycles so a pending
+     *  candidate still collects its second sighting on a static screen. */
+    lastObserved: EvaluationResult;
+    contentHash: string;
+}
+
+const sessionStates = new Map<string, SessionStateEntry>();
+
+/** Test hook. */
+export const resetSessionStates = (): void => {
+    sessionStates.clear();
+};
+
+const capturePaneText = (session: string): string | null => {
+    const r = spawnSync('tmux', tmuxArgs(['capture-pane', '-p', '-t', session, '-S', `-${STATE_CAPTURE_LINES}`]), {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (r.status !== 0) return null;
+    return r.stdout ?? '';
+};
+
+/**
+ * Fold one pane capture into the per-session state machine and return
+ * the wire fields for this report cycle. Exported (with `paneText`
+ * injected) so tests can drive it without tmux.
+ *
+ * Hash short-circuit: an unchanged screen skips rule evaluation but
+ * still replays the previous observation through the debounce — cheap
+ * cycles stay cheap without wedging candidate promotion.
+ */
+export const deriveSessionState = (
+    name: string,
+    agentKind: AgentKind,
+    paneText: string | null,
+    now: number = Date.now(),
+): Pick<AgentSession, 'state' | 'stateChangedAt' | 'stateRuleId'> => {
+    if (paneText === null) {
+        // Pane unreadable this cycle (session racing shutdown, tmux
+        // hiccup) — report nothing rather than a stale confident state.
+        sessionStates.delete(name);
+        return {};
+    }
+    const contentHash = createHash('sha1').update(paneText).digest('hex');
+    const entry = sessionStates.get(name);
+    const observed = entry && entry.contentHash === contentHash
+        ? entry.lastObserved
+        : evaluateState(paneText, agentKind, getActiveManifest(), entry?.tracker.confirmed ?? 'unknown');
+    const tracker = advanceState(entry?.tracker, observed, now);
+    sessionStates.set(name, { tracker, lastObserved: observed, contentHash });
+    return {
+        state: tracker.confirmed,
+        stateChangedAt: new Date(tracker.confirmedAt).toISOString(),
+        stateRuleId: tracker.ruleId,
+    };
+};
+
+/** Drop trackers for sessions gone from the inventory. */
+const pruneSessionStates = (liveNames: Set<string>): void => {
+    for (const name of sessionStates.keys()) {
+        if (!liveNames.has(name)) sessionStates.delete(name);
+    }
+};
+
 export interface CollectResult {
     sessions: AgentSession[];
     /** Diagnostic notes per rejected session — surfaced under `--verbose`. */
@@ -558,8 +642,10 @@ export const collectSessionsVerbose = (): CollectResult => {
             label: parsed.label,
             createdAt: epochToIso(created),
             lastActivityAt: epochToIso(activity),
+            ...deriveSessionState(name, agent.kind, capturePaneText(name)),
         });
     }
+    pruneSessionStates(new Set(sessions.map((s) => s.name)));
     return { sessions, rejected };
 };
 
@@ -910,7 +996,9 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             // what the phone picker will see — particularly important
             // during setup, when an empty picker has no other observable
             // cause.
-            const names = sessions.map((s) => s.name).join(', ') || '∅';
+            const names = sessions
+                .map((s) => (s.state ? `${s.name}[${s.state}]` : s.name))
+                .join(', ') || '∅';
             log(`reported ${sessions.length} session(s): ${names}`);
             // Explain skipped zeph-* sessions so the most common
             // confusion (pane lost its claude start_command after a
@@ -1138,6 +1226,18 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     sweepAttachments();
     const gcTimer = setInterval(sweepAttachments, 60 * 60 * 1000);
     gcTimer.unref();
+
+    // Agent detection rules: disk cache immediately (offline-safe),
+    // then a background OTA refresh now and every 6 h (§S7).
+    loadManifestFromCache();
+    const refreshRules = (): void => {
+        void refreshManifest().then((r) => {
+            log(`rules: source=${r.source} outcome=${r.outcome}${r.version ? ` version=${r.version}` : ''}`);
+        });
+    };
+    refreshRules();
+    const rulesTimer = setInterval(refreshRules, RULES_REFRESH_INTERVAL_MS);
+    rulesTimer.unref();
 
     let shuttingDown = false;
     let activeHandle: StreamHandle | null = null;
