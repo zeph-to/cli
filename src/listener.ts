@@ -428,6 +428,7 @@ interface PaneInfo {
     currentCommand: string | null;
     startCommand: string | null;
     currentPath: string | null;
+    panePid: number | null;
 }
 
 // U+241F "Symbol for Unit Separator" — a *printable* Unicode glyph
@@ -441,18 +442,20 @@ const FIELD_SEP = '␟';
 
 const readPaneInfo = (session: string): PaneInfo => {
     const r = spawnSync('tmux', tmuxArgs(['display-message', '-p', '-t', session,
-        `#{pane_current_command}${FIELD_SEP}#{pane_start_command}${FIELD_SEP}#{pane_current_path}`]), {
+        `#{pane_current_command}${FIELD_SEP}#{pane_start_command}${FIELD_SEP}#{pane_current_path}${FIELD_SEP}#{pane_pid}`]), {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'ignore'],
     });
-    if (r.status !== 0) return { currentCommand: null, startCommand: null, currentPath: null };
+    if (r.status !== 0) return { currentCommand: null, startCommand: null, currentPath: null, panePid: null };
     const parts = (r.stdout ?? '').trim().split(FIELD_SEP);
-    if (parts.length !== 3) return { currentCommand: null, startCommand: null, currentPath: null };
-    const [current, start, path] = parts;
+    if (parts.length !== 4) return { currentCommand: null, startCommand: null, currentPath: null, panePid: null };
+    const [current, start, path, pid] = parts;
+    const parsedPid = Number(pid);
     return {
         currentCommand: current || null,
         startCommand: start || null,
         currentPath: path || null,
+        panePid: Number.isInteger(parsedPid) && parsedPid > 0 ? parsedPid : null,
     };
 };
 
@@ -764,7 +767,7 @@ export const collectSessionsVerbose = (): CollectResult => {
             continue;
         }
         const agentSessionId = info.currentPath
-            ? (agent.resolveSessionId?.(info.currentPath) ?? null)
+            ? (agent.resolveSessionId?.(info.currentPath, info.panePid ?? undefined) ?? null)
             : null;
         sessions.push({
             name,
