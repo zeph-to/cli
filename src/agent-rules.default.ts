@@ -24,7 +24,7 @@ import { ENGINE_VERSION, type DetectionManifest } from './agent-state.js';
 
 export const DEFAULT_MANIFEST: DetectionManifest = {
     engineVersion: ENGINE_VERSION,
-    version: '2026.07.04.1',
+    version: '2026.07.04.2',
     agents: {
         claude: [
             {
@@ -59,6 +59,25 @@ export const DEFAULT_MANIFEST: DetectionManifest = {
                 state: 'working',
                 priority: 800,
                 contains: ['esc to interrupt'],
+            },
+            {
+                // Newer CC skins drop the "esc to interrupt" hint; the
+                // live token counter on the spinner line
+                // ("✶ Churning… (1m 2s · ↓ 1.2k tokens)") only renders
+                // while the agent is actually running.
+                id: 'claude-working-token-counter',
+                state: 'working',
+                priority: 790,
+                regex: ['[↓↑]\\s?[\\d.,]+k? tokens'],
+            },
+            {
+                // Elapsed-time spinner suffix ("(12s · ..." / "(1m 2s ·")
+                // — second fallback for skins that hide the token counter
+                // early in a turn.
+                id: 'claude-working-elapsed-spinner',
+                state: 'working',
+                priority: 780,
+                regex: ['…\\s*\\((?:\\d+m )?\\d+s ·'],
             },
             {
                 // Idle prompt: `❯` at line start in the tail, with no

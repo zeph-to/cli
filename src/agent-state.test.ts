@@ -101,7 +101,11 @@ describe('manifest safety', () => {
     it('honors disabledRuleIds as a kill-switch', () => {
         const manifest: DetectionManifest = {
             ...DEFAULT_MANIFEST,
-            disabledRuleIds: ['claude-working-interrupt-hint'],
+            disabledRuleIds: [
+                'claude-working-interrupt-hint',
+                'claude-working-token-counter',
+                'claude-working-elapsed-spinner',
+            ],
         };
         expect(evaluateState(PANE_WORKING, 'claude', manifest).state).toBe('unknown');
     });
@@ -175,5 +179,43 @@ describe('advanceState flap suppression', () => {
         expect(t.candidate).toBe('blocked');       // idle candidate replaced
         t = advanceState(t, at('blocked'), 15000);
         expect(t.confirmed).toBe('blocked');
+    });
+});
+
+describe('working detection on hint-less CC skins (2026.07.04.2 rules)', () => {
+    // Real capture from a Fable 5 session: no "esc to interrupt" hint,
+    // prompt box ❯ visible WHILE working — the token-counter spinner
+    // line is the only working signal.
+    const PANE_WORKING_NO_HINT = [
+        '⏺ Running 3 shell commands…',
+        '',
+        '✶ Fiddle-faddling… (1m 2s · ↓ 1.2k tokens)',
+        '',
+        '─────────────────────────────',
+        '❯',
+        '─────────────────────────────',
+        '  Fable 5 | cli • feat/agent-state | 55%',
+    ].join('\n');
+
+    it('classifies the token-counter spinner as working (not idle)', () => {
+        const r = evaluateState(PANE_WORKING_NO_HINT, 'claude', DEFAULT_MANIFEST);
+        expect(r.state).toBe('working');
+        expect(r.ruleId).toBe('claude-working-token-counter');
+    });
+
+    it('elapsed-only spinner (before token counter appears) is working', () => {
+        const pane = '✻ Pondering… (3s · esc? no)\n❯';
+        expect(evaluateState(pane, 'claude', DEFAULT_MANIFEST).state).toBe('working');
+    });
+
+    it('still idle when spinner line is gone', () => {
+        const pane = [
+            '⏺ Done.',
+            '─────────────',
+            '❯',
+            '─────────────',
+            '  ? for shortcuts',
+        ].join('\n');
+        expect(evaluateState(pane, 'claude', DEFAULT_MANIFEST).state).toBe('idle');
     });
 });
