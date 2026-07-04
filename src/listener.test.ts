@@ -10,6 +10,12 @@ import {
     computeBackoff,
     AUTH_FAILURE_CODES,
     computeListenerDeviceId,
+    deriveSessionState,
+    handleScreenRequest,
+    resetSessionStates,
+    collectWatchHits,
+    setPatternWatches,
+    resetPatternWatches,
 } from './listener.js';
 
 describe('checkRateLimit', () => {
@@ -382,5 +388,150 @@ describe('computeListenerDeviceId', () => {
 
     it('emits the dev_listener_<sha8> shape (8 lowercase hex chars)', () => {
         expect(computeListenerDeviceId('my-host')).toMatch(/^dev_listener_[0-9a-f]{8}$/);
+    });
+});
+
+describe('deriveSessionState', () => {
+    beforeEach(() => {
+        resetSessionStates();
+    });
+
+    const WORKING_PANE = '✻ Churning… (12s · esc to interrupt)';
+    const BLOCKED_PANE = 'Do you want to proceed?\n❯ 1. Yes\nEnter to select · esc to cancel';
+
+    it('reports state fields from the first capture (baseline)', () => {
+        const r = deriveSessionState('zeph-proj', 'claude', WORKING_PANE, 1000);
+        expect(r.state).toBe('working');
+        expect(r.stateChangedAt).toBe(new Date(1000).toISOString());
+        expect(r.stateRuleId).toBe('claude-working-interrupt-hint');
+    });
+
+    it('debounces a transition across two cycles', () => {
+        deriveSessionState('zeph-proj', 'claude', WORKING_PANE, 0);
+        const mid = deriveSessionState('zeph-proj', 'claude', BLOCKED_PANE, 5000);
+        expect(mid.state).toBe('working'); // candidate only
+        const done = deriveSessionState('zeph-proj', 'claude', BLOCKED_PANE, 10000);
+        expect(done.state).toBe('blocked');
+        expect(done.stateChangedAt).toBe(new Date(10000).toISOString());
+    });
+
+    it('promotes a pending candidate on a hash-identical cycle', () => {
+        // Screen froze on the blocked dialog: cycle 2 evaluates it,
+        // cycle 3 sees identical bytes. The replayed observation must
+        // still count as the second sighting.
+        deriveSessionState('zeph-proj', 'claude', WORKING_PANE, 0);
+        deriveSessionState('zeph-proj', 'claude', BLOCKED_PANE, 5000);
+        const r = deriveSessionState('zeph-proj', 'claude', BLOCKED_PANE, 10000);
+        expect(r.state).toBe('blocked');
+    });
+
+    it('returns no fields and forgets the session when the pane is unreadable', () => {
+        deriveSessionState('zeph-proj', 'claude', WORKING_PANE, 0);
+        expect(deriveSessionState('zeph-proj', 'claude', null, 5000)).toEqual({});
+        // Next readable capture is a fresh baseline, confirmed immediately.
+        const r = deriveSessionState('zeph-proj', 'claude', BLOCKED_PANE, 10000);
+        expect(r.state).toBe('blocked');
+    });
+
+    it('tracks sessions independently', () => {
+        const a = deriveSessionState('zeph-a', 'claude', WORKING_PANE, 0);
+        const b = deriveSessionState('zeph-b', 'claude', BLOCKED_PANE, 0);
+        expect(a.state).toBe('working');
+        expect(b.state).toBe('blocked');
+    });
+});
+
+describe('handleScreenRequest', () => {
+    const myDevice = computeListenerDeviceId();
+
+    it('ignores non-screen ephemeral traffic', () => {
+        expect(handleScreenRequest({ subtype: 'clipboard', targetDeviceId: myDevice })).toBeNull();
+        expect(handleScreenRequest({})).toBeNull();
+    });
+
+    it('ignores requests addressed to another device', () => {
+        expect(handleScreenRequest({
+            subtype: 'agent.screen.request',
+            targetDeviceId: 'dev_someone_else',
+            sessionName: 'zeph-proj',
+            requestId: 'r1',
+        })).toBeNull();
+    });
+
+    it('ignores requests missing requestId or sessionName', () => {
+        expect(handleScreenRequest({
+            subtype: 'agent.screen.request',
+            targetDeviceId: myDevice,
+            requestId: 'r1',
+        })).toBeNull();
+        expect(handleScreenRequest({
+            subtype: 'agent.screen.request',
+            targetDeviceId: myDevice,
+            sessionName: 'zeph-proj',
+        })).toBeNull();
+    });
+
+    it('answers unknown sessions with an error snapshot (no tmux access attempted)', () => {
+        // No zeph-* tmux sessions exist in the test environment, so any
+        // name fails the inventory guard — the pane is never read.
+        const reply = handleScreenRequest({
+            subtype: 'agent.screen.request',
+            targetDeviceId: myDevice,
+            sessionName: 'zeph-not-there',
+            requestId: 'r42',
+        });
+        expect(reply).not.toBeNull();
+        expect(reply?.subtype).toBe('agent.screen.snapshot');
+        expect(reply?.requestId).toBe('r42');
+        expect(['unknown_session', 'rate_limited']).toContain(reply?.error);
+        expect(reply?.content).toBeUndefined();
+    });
+});
+
+describe('pattern watches (§S5 v2)', () => {
+    beforeEach(() => {
+        resetPatternWatches();
+    });
+
+    it('reports a hit with the matched line and fires only once', () => {
+        setPatternWatches([{ sessionName: 'zeph-a', pattern: 'ready on port \\d+' }]);
+        const capture = () => 'building…\nServer ready on port 3000\n❯';
+        const first = collectWatchHits(new Set(['zeph-a']), capture);
+        expect(first).toEqual([{
+            sessionName: 'zeph-a',
+            pattern: 'ready on port \\d+',
+            matchedLine: 'Server ready on port 3000',
+        }]);
+        expect(collectWatchHits(new Set(['zeph-a']), capture)).toEqual([]);
+    });
+
+    it('skips watches whose session is not live', () => {
+        setPatternWatches([{ sessionName: 'zeph-gone', pattern: 'x' }]);
+        expect(collectWatchHits(new Set(['zeph-a']), () => 'x marks the spot')).toEqual([]);
+    });
+
+    it('does not fire without a match and stays armed', () => {
+        setPatternWatches([{ sessionName: 'zeph-a', pattern: 'DONE' }]);
+        expect(collectWatchHits(new Set(['zeph-a']), () => 'still working')).toEqual([]);
+        expect(collectWatchHits(new Set(['zeph-a']), () => 'all DONE here')).toHaveLength(1);
+    });
+
+    it('re-arms when the server re-sends a previously fired watch', () => {
+        setPatternWatches([{ sessionName: 'zeph-a', pattern: 'hit' }]);
+        expect(collectWatchHits(new Set(['zeph-a']), () => 'hit!')).toHaveLength(1);
+        // Ack without the watch → pruned. A later ack re-adds it fresh.
+        setPatternWatches([]);
+        setPatternWatches([{ sessionName: 'zeph-a', pattern: 'hit' }]);
+        expect(collectWatchHits(new Set(['zeph-a']), () => 'hit again')).toHaveLength(1);
+    });
+
+    it('ignores malformed watch payloads', () => {
+        setPatternWatches([{ nope: true }, 'garbage', null]);
+        expect(collectWatchHits(new Set(['zeph-a']), () => 'anything')).toEqual([]);
+    });
+
+    it('handles unreadable panes gracefully', () => {
+        setPatternWatches([{ sessionName: 'zeph-a', pattern: 'x' }]);
+        expect(collectWatchHits(new Set(['zeph-a']), () => null)).toEqual([]);
     });
 });

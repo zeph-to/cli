@@ -29,6 +29,8 @@ import { join, basename } from 'path';
 import WebSocket from 'ws';
 import { loadConfig, resolvedEnv } from './config.js';
 import { matchAgentByPaneCommand, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
+import { advanceState, evaluateState, findPatternMatch, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
+import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
 
 const PING_INTERVAL_MS = 25_000;
 const PONG_TIMEOUT_MS = 10_000;
@@ -64,6 +66,15 @@ interface AgentSession {
     label?: string | null;
     createdAt?: string;
     lastActivityAt?: string;
+    /**
+     * Detected agent state (wire contract — flows to the server and the
+     * phone's Agents tab). Absent when the pane can't be captured or
+     * detection is unavailable. `done` never appears here: it's derived
+     * client-side (SPEC-AGENT-AWARENESS §S1/§S6).
+     */
+    state?: AgentState;
+    stateChangedAt?: string;
+    stateRuleId?: string;
 }
 
 // Per-session token bucket — caps a runaway/compromised sender. 30/min
@@ -486,6 +497,212 @@ const epochToIso = (epoch: string | undefined): string | undefined => {
     return new Date(n * 1000).toISOString();
 };
 
+// ─── Agent state detection (SPEC-AGENT-AWARENESS §S1) ──────────────
+
+// How many pane lines the state rules see. The live status area every
+// agent renders sits in the last handful of lines; 40 leaves margin for
+// tall dialogs without hauling whole scrollbacks through regex.
+const STATE_CAPTURE_LINES = 40;
+
+interface SessionStateEntry {
+    tracker: StateTracker;
+    /** Last raw evaluation — replayed on hash-equal cycles so a pending
+     *  candidate still collects its second sighting on a static screen. */
+    lastObserved: EvaluationResult;
+    contentHash: string;
+}
+
+const sessionStates = new Map<string, SessionStateEntry>();
+
+/** Test hook. */
+export const resetSessionStates = (): void => {
+    sessionStates.clear();
+};
+
+const capturePaneText = (session: string): string | null => {
+    const r = spawnSync('tmux', tmuxArgs(['capture-pane', '-p', '-t', session, '-S', `-${STATE_CAPTURE_LINES}`]), {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (r.status !== 0) return null;
+    return r.stdout ?? '';
+};
+
+/**
+ * Fold one pane capture into the per-session state machine and return
+ * the wire fields for this report cycle. Exported (with `paneText`
+ * injected) so tests can drive it without tmux.
+ *
+ * Hash short-circuit: an unchanged screen skips rule evaluation but
+ * still replays the previous observation through the debounce — cheap
+ * cycles stay cheap without wedging candidate promotion.
+ */
+export const deriveSessionState = (
+    name: string,
+    agentKind: AgentKind,
+    paneText: string | null,
+    now: number = Date.now(),
+): Pick<AgentSession, 'state' | 'stateChangedAt' | 'stateRuleId'> => {
+    if (paneText === null) {
+        // Pane unreadable this cycle (session racing shutdown, tmux
+        // hiccup) — report nothing rather than a stale confident state.
+        sessionStates.delete(name);
+        return {};
+    }
+    const contentHash = createHash('sha1').update(paneText).digest('hex');
+    const entry = sessionStates.get(name);
+    const observed = entry && entry.contentHash === contentHash
+        ? entry.lastObserved
+        : evaluateState(paneText, agentKind, getActiveManifest(), entry?.tracker.confirmed ?? 'unknown');
+    const tracker = advanceState(entry?.tracker, observed, now);
+    sessionStates.set(name, { tracker, lastObserved: observed, contentHash });
+    return {
+        state: tracker.confirmed,
+        stateChangedAt: new Date(tracker.confirmedAt).toISOString(),
+        stateRuleId: tracker.ruleId,
+    };
+};
+
+/** Drop trackers for sessions gone from the inventory. */
+const pruneSessionStates = (liveNames: Set<string>): void => {
+    for (const name of sessionStates.keys()) {
+        if (!liveNames.has(name)) sessionStates.delete(name);
+    }
+};
+
+// ─── Pattern watches (SPEC-AGENT-AWARENESS §S5 v2) ─────────────────
+
+export interface PatternWatch {
+    sessionName: string;
+    pattern: string;
+}
+
+let patternWatches: PatternWatch[] = [];
+// One-shot: after a hit we stop re-evaluating that watch locally. The
+// server deletes the record on hit, and the next ack prunes it here —
+// the fired-set only bridges the gap between hit and ack.
+const firedWatchKeys = new Set<string>();
+const patternWatchKey = (w: PatternWatch): string => `${w.sessionName}${w.pattern}`;
+
+/** Ack payload → active watch list. Prunes fired-markers for dead watches. */
+export const setPatternWatches = (raw: unknown): void => {
+    patternWatches = Array.isArray(raw)
+        ? raw.filter((w): w is PatternWatch =>
+            typeof w === 'object' && w !== null
+            && typeof (w as PatternWatch).sessionName === 'string'
+            && typeof (w as PatternWatch).pattern === 'string')
+        : [];
+    const live = new Set(patternWatches.map(patternWatchKey));
+    for (const key of firedWatchKeys) {
+        if (!live.has(key)) firedWatchKeys.delete(key);
+    }
+};
+
+/** Test hook. */
+export const resetPatternWatches = (): void => {
+    patternWatches = [];
+    firedWatchKeys.clear();
+};
+
+export interface WatchHit {
+    sessionName: string;
+    pattern: string;
+    matchedLine: string;
+}
+
+/**
+ * Probe every un-fired watch whose session is live. `capture` is
+ * injectable for tests; production passes capturePaneText.
+ */
+export const collectWatchHits = (
+    liveNames: ReadonlySet<string>,
+    capture: (session: string) => string | null = capturePaneText,
+): WatchHit[] => {
+    const hits: WatchHit[] = [];
+    const textCache = new Map<string, string | null>();
+    for (const w of patternWatches) {
+        if (!liveNames.has(w.sessionName)) continue;
+        const key = patternWatchKey(w);
+        if (firedWatchKeys.has(key)) continue;
+        if (!textCache.has(w.sessionName)) textCache.set(w.sessionName, capture(w.sessionName));
+        const text = textCache.get(w.sessionName);
+        if (text === null || text === undefined) continue;
+        const match = findPatternMatch(w.pattern, text);
+        if (!match) continue;
+        firedWatchKeys.add(key);
+        hits.push({ sessionName: w.sessionName, pattern: w.pattern, matchedLine: match.line });
+    }
+    return hits;
+};
+
+// ─── Screen peek (SPEC-AGENT-AWARENESS §S4) ────────────────────────
+
+// Pane lines returned to the phone. Taller than the state-detection
+// capture — the user wants to READ this, not regex it.
+const SCREEN_PEEK_LINES = 60;
+// Ephemeral frames ride API Gateway WS (32KB frame limit); stay well
+// under it after JSON envelope overhead.
+const SCREEN_PEEK_MAX_BYTES = 24 * 1024;
+
+export interface ScreenRequest {
+    subtype?: string;
+    targetDeviceId?: string;
+    sessionName?: string;
+    requestId?: string;
+}
+
+export interface ScreenSnapshot {
+    subtype: 'agent.screen.snapshot';
+    requestId: string;
+    sessionName: string;
+    content?: string;
+    truncated?: boolean;
+    error?: string;
+    capturedAt: string;
+}
+
+/**
+ * Answer a phone's screen-peek request for one of OUR sessions.
+ * Returns null when the message isn't addressed to this machine (other
+ * ephemeral traffic — clipboard, mirrors — flows through constantly).
+ *
+ * Security posture: only sessions the inventory already exposes are
+ * readable — the phone can see exactly the panes it can already send
+ * commands into, nothing else. Rate-limited with the same per-session
+ * token bucket as command injection.
+ */
+export const handleScreenRequest = (req: ScreenRequest): ScreenSnapshot | null => {
+    if (req.subtype !== 'agent.screen.request') return null;
+    if (!req.requestId || !req.sessionName) return null;
+    if (req.targetDeviceId !== computeListenerDeviceId()) return null;
+
+    const capturedAt = new Date().toISOString();
+    const base = { subtype: 'agent.screen.snapshot' as const, requestId: req.requestId, sessionName: req.sessionName, capturedAt };
+
+    if (!checkRateLimit(`screen:${req.sessionName}`)) {
+        return { ...base, error: 'rate_limited' };
+    }
+    if (!collectSessions().some((s) => s.name === req.sessionName)) {
+        return { ...base, error: 'unknown_session' };
+    }
+    const r = spawnSync('tmux', tmuxArgs(['capture-pane', '-p', '-t', req.sessionName, '-S', `-${SCREEN_PEEK_LINES}`]), {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (r.status !== 0) {
+        return { ...base, error: 'capture_failed' };
+    }
+    let content = r.stdout ?? '';
+    let truncated = false;
+    while (Buffer.byteLength(content, 'utf-8') > SCREEN_PEEK_MAX_BYTES) {
+        // Cut from the top — the bottom of the pane is what the user needs.
+        const cut = content.indexOf('\n', Math.floor(content.length / 8));
+        content = cut > 0 ? content.slice(cut + 1) : content.slice(-SCREEN_PEEK_MAX_BYTES);
+        truncated = true;
+    }
+    return { ...base, content, truncated };
+};
+
 export interface CollectResult {
     sessions: AgentSession[];
     /** Diagnostic notes per rejected session — surfaced under `--verbose`. */
@@ -558,8 +775,10 @@ export const collectSessionsVerbose = (): CollectResult => {
             label: parsed.label,
             createdAt: epochToIso(created),
             lastActivityAt: epochToIso(activity),
+            ...deriveSessionState(name, agent.kind, capturePaneText(name)),
         });
     }
+    pruneSessionStates(new Set(sessions.map((s) => s.name)));
     return { sessions, rejected };
 };
 
@@ -906,11 +1125,20 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             if (sock.readyState !== WebSocket.OPEN) return;
             const { sessions, rejected } = collectSessionsVerbose();
             sock.send(JSON.stringify({ type: 'listener.sessions', data: { sessions } }));
+            // Output-match watches (§S5 v2): probe watched panes and
+            // report hits. One-shot per watch; the server consumes the
+            // record and the next ack prunes it locally.
+            for (const hit of collectWatchHits(new Set(sessions.map((s) => s.name)))) {
+                sock.send(JSON.stringify({ type: 'listener.watch.hit', data: hit }));
+                log(`🔔 watch hit: ${hit.sessionName} ~ /${hit.pattern}/`);
+            }
             // One line per cycle gives the user immediate feedback on
             // what the phone picker will see — particularly important
             // during setup, when an empty picker has no other observable
             // cause.
-            const names = sessions.map((s) => s.name).join(', ') || '∅';
+            const names = sessions
+                .map((s) => (s.state ? `${s.name}[${s.state}]` : s.name))
+                .join(', ') || '∅';
             log(`reported ${sessions.length} session(s): ${names}`);
             // Explain skipped zeph-* sessions so the most common
             // confusion (pane lost its claude start_command after a
@@ -992,6 +1220,15 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                 void handlePush(m.data as PushItem).catch((err) =>
                     log(`! handlePush: ${(err as Error).message}`));
             }
+            if (m.type === 'ephemeral' && m.data) {
+                // Screen peek (§S4): the phone asks for this machine's live
+                // pane content over the ephemeral relay; the reply rides the
+                // same channel. Nothing is persisted server-side.
+                const reply = handleScreenRequest(m.data as ScreenRequest);
+                if (reply && sock.readyState === WebSocket.OPEN) {
+                    sock.send(JSON.stringify({ type: 'ephemeral', data: reply }));
+                }
+            }
             // Surface server-side errors from listener.sessions reports.
             // Without this the daemon happily logs "reported N session(s)"
             // even when the server is silently dropping every message —
@@ -1000,8 +1237,10 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                 log(`! server rejected listener.sessions: ${m.message ?? '(no detail)'}`);
             }
             if (m.type === 'listener.sessions.ack') {
-                const d = m.data as { count?: number; updatedAt?: string } | undefined;
+                const d = m.data as { count?: number; updatedAt?: string; watches?: unknown } | undefined;
                 log(`✓ server persisted ${d?.count ?? '?'} session(s)`);
+                // Pattern watches ride the ack (§S5 v2) — refresh ours.
+                setPatternWatches(d?.watches);
             }
             // `push.sync` (offline batch on $connect) and other types ignored.
         });
@@ -1138,6 +1377,18 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     sweepAttachments();
     const gcTimer = setInterval(sweepAttachments, 60 * 60 * 1000);
     gcTimer.unref();
+
+    // Agent detection rules: disk cache immediately (offline-safe),
+    // then a background OTA refresh now and every 6 h (§S7).
+    loadManifestFromCache();
+    const refreshRules = (): void => {
+        void refreshManifest().then((r) => {
+            log(`rules: source=${r.source} outcome=${r.outcome}${r.version ? ` version=${r.version}` : ''}`);
+        });
+    };
+    refreshRules();
+    const rulesTimer = setInterval(refreshRules, RULES_REFRESH_INTERVAL_MS);
+    rulesTimer.unref();
 
     let shuttingDown = false;
     let activeHandle: StreamHandle | null = null;
