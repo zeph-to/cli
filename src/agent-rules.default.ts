@@ -24,7 +24,7 @@ import { ENGINE_VERSION, type DetectionManifest } from './agent-state.js';
 
 export const DEFAULT_MANIFEST: DetectionManifest = {
     engineVersion: ENGINE_VERSION,
-    version: '2026.07.04.2',
+    version: '2026.07.04.3',
     agents: {
         claude: [
             {
@@ -78,6 +78,16 @@ export const DEFAULT_MANIFEST: DetectionManifest = {
                 state: 'working',
                 priority: 780,
                 regex: ['…\\s*\\((?:\\d+m )?\\d+s ·'],
+            },
+            {
+                // Compact pass ("✱ Compacting conversation… (51s)")
+                // renders neither the interrupt hint nor a token
+                // counter, but the session is busy and can't take
+                // input — without this it reads as idle.
+                id: 'claude-working-compacting',
+                state: 'working',
+                priority: 770,
+                contains: ['compacting conversation'],
             },
             {
                 // Idle prompt: `❯` at line start in the tail, with no
