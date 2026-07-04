@@ -155,6 +155,54 @@ describe('loadManifestFromCache', () => {
     });
 });
 
+describe('version precedence (bundled vs OTA)', () => {
+    // npm publishes land minutes after merge; the server manifest waits
+    // for a full deploy. In that window the endpoint serves OLDER rules
+    // than the bundled ones — they must not shadow the fresh build.
+    const STALE_MANIFEST = { ...VALID_MANIFEST, version: '2020.01.01.1' };
+
+    it('compareManifestVersions orders numerically per segment', async () => {
+        const m = await importModule();
+        expect(m.compareManifestVersions('2026.07.04.3', '2026.07.04.2')).toBe(1);
+        expect(m.compareManifestVersions('2026.07.04.9', '2026.07.04.10')).toBe(-1);
+        expect(m.compareManifestVersions('2026.07.04', '2026.07.04.1')).toBe(-1);
+        expect(m.compareManifestVersions('2026.07.04.3', '2026.07.04.3')).toBe(0);
+        expect(m.compareManifestVersions('abc', 'def')).toBe(0); // malformed → equal, never throws
+    });
+
+    it('refreshManifest ignores a remote manifest older than bundled (still caches for ETag)', async () => {
+        const m = await importModule();
+        const bundled = m.getActiveManifest().version;
+        const r = await m.refreshManifest(vi.fn(async () => okResponse(STALE_MANIFEST, 'W/"old"')) as unknown as typeof fetch);
+        expect(r.outcome).toBe('stale-ignored');
+        expect(r.version).toBe('2020.01.01.1');
+        expect(m.getActiveManifest().version).toBe(bundled);
+        expect(m.getActiveManifestSource()).toBe('bundled');
+        const cached = JSON.parse(readFileSync(join(TMP, '.zeph', 'agent-rules.json'), 'utf-8'));
+        expect(cached.etag).toBe('W/"old"'); // 304s stop refetch churn
+    });
+
+    it('loadManifestFromCache keeps bundled over an older cached manifest', async () => {
+        mkdirSync(join(TMP, '.zeph'), { recursive: true });
+        writeFileSync(join(TMP, '.zeph', 'agent-rules.json'),
+            JSON.stringify({ manifest: STALE_MANIFEST }));
+        const m = await importModule();
+        expect(m.loadManifestFromCache()).toBe('bundled');
+        expect(m.getActiveManifest().version).not.toBe('2020.01.01.1');
+    });
+
+    it('equal versions still promote the cache (server may kill-switch without content change)', async () => {
+        const m0 = await importModule();
+        const sameVersion = { ...VALID_MANIFEST, version: m0.getActiveManifest().version };
+        mkdirSync(join(TMP, '.zeph'), { recursive: true });
+        writeFileSync(join(TMP, '.zeph', 'agent-rules.json'),
+            JSON.stringify({ manifest: sameVersion }));
+        vi.resetModules();
+        const m = await importModule();
+        expect(m.loadManifestFromCache()).toBe('cache');
+    });
+});
+
 describe('rulesUrl stage derivation', () => {
     it('derives the manifest path from the configured base URL (dev /d1)', async () => {
         mkdirSync(join(TMP, '.zeph'), { recursive: true });

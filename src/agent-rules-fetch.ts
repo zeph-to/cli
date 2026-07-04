@@ -9,6 +9,14 @@
  * hostile payload can never leave the listener without rules, and
  * `disabledRuleIds` in a fetched manifest acts as a same-day
  * kill-switch for a misfiring rule (no release, no restart).
+ *
+ * Version precedence: a fetched/cached manifest only activates when
+ * its version is >= the bundled one. npm publishes land in minutes
+ * while the server manifest ships with a full deploy, so a fresh cli
+ * routinely carries NEWER rules than the endpoint — without the gate,
+ * the older remote manifest would shadow every bundled rule fix until
+ * the server caught up. Server-side rollback still works: the server
+ * bumps the version even when reverting rule content.
  */
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
@@ -84,6 +92,24 @@ export const validateManifest = (value: unknown): DetectionManifest | null => {
     return value as DetectionManifest;
 };
 
+/**
+ * Segment-wise numeric compare of dotted date versions
+ * ("2026.07.04.3"). Plain string compare fails on ".10" vs ".9";
+ * non-numeric segments compare as equal so a malformed version can
+ * never crash the refresh path.
+ */
+export const compareManifestVersions = (a: string, b: string): number => {
+    const as = a.split('.').map(Number);
+    const bs = b.split('.').map(Number);
+    const len = Math.max(as.length, bs.length);
+    for (let i = 0; i < len; i++) {
+        const d = (as[i] ?? 0) - (bs[i] ?? 0);
+        if (Number.isNaN(d)) continue;
+        if (d !== 0) return d < 0 ? -1 : 1;
+    }
+    return 0;
+};
+
 // ── Active manifest ──────────────────────────────────────────────
 
 export type ManifestSource = 'remote' | 'cache' | 'bundled';
@@ -114,7 +140,7 @@ export const loadManifestFromCache = (): ManifestSource => {
     try {
         const cache = JSON.parse(readFileSync(RULES_CACHE_FILE, 'utf-8')) as RulesCache;
         const manifest = validateManifest(cache.manifest);
-        if (manifest) {
+        if (manifest && compareManifestVersions(manifest.version, DEFAULT_MANIFEST.version) >= 0) {
             activateManifest(manifest, 'cache');
         }
     } catch {
@@ -141,7 +167,7 @@ export const rulesUrl = (): string => {
 
 export interface RefreshResult {
     source: ManifestSource;
-    /** 'updated' | 'not-modified' | 'invalid' | 'error' — for verbose logs. */
+    /** 'updated' | 'not-modified' | 'stale-ignored' | 'invalid' | 'error' — for verbose logs. */
     outcome: string;
     version?: string;
 }
@@ -182,6 +208,12 @@ export const refreshManifest = async (fetchImpl: typeof fetch = fetch): Promise<
         } catch {
             // Cache write failure is non-fatal: the manifest still
             // activates for this process lifetime.
+        }
+        if (compareManifestVersions(manifest.version, DEFAULT_MANIFEST.version) < 0) {
+            // Endpoint hasn't caught up to this build's bundled rules.
+            // Cache is still written above (the ETag stops refetch churn)
+            // but startup applies the same gate, so bundled stays active.
+            return { source: activeSource, outcome: 'stale-ignored', version: manifest.version };
         }
         activateManifest(manifest, 'remote');
         return { source: 'remote', outcome: 'updated', version: manifest.version };
