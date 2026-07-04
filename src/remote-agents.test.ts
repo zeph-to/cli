@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { findAgentBySubcommand, matchAgentByPaneCommand, REMOTE_AGENTS } from './remote-agents.js';
+import { detectClaudeSessionIdByPid, findAgentBySubcommand, matchAgentByPaneCommand, REMOTE_AGENTS } from './remote-agents.js';
 
 // Top-level CLI commands the registry's subcommands must never collide
 // with — dispatch checks the registry BEFORE the switch, so a collision
@@ -114,5 +114,47 @@ describe('remote-agents.ts: detectClaudeSessionId', () => {
     it('returns null when the projects dir does not exist', async () => {
         const { detectClaudeSessionId } = await import('./remote-agents.js');
         expect(detectClaudeSessionId('/never/seen')).toBeNull();
+    });
+});
+
+describe('detectClaudeSessionIdByPid', () => {
+    const records = [
+        { pid: 100, sessionId: 'sess-tmux', cwd: '/proj' },
+        { pid: 200, sessionId: 'sess-plain', cwd: '/proj' },
+        { pid: 300, sessionId: 'sess-other', cwd: '/elsewhere' },
+    ];
+
+    it('picks the session whose pid is inside the pane process tree', () => {
+        // Pane 90 → shell 95 → claude 100. The plain-cli claude (200)
+        // shares the cwd but lives outside this pane's tree.
+        const r = detectClaudeSessionIdByPid(90, '/proj', {
+            records, descendants: new Set([90, 95, 100]),
+        });
+        expect(r).toBe('sess-tmux');
+    });
+
+    it('does not steal identity from a same-cwd session in another tree', () => {
+        const r = detectClaudeSessionIdByPid(90, '/proj', {
+            records, descendants: new Set([90, 95, 200]),
+        });
+        expect(r).toBe('sess-plain');
+    });
+
+    it('rejects a pid match with a different cwd (pid reuse guard)', () => {
+        const r = detectClaudeSessionIdByPid(90, '/proj', {
+            records, descendants: new Set([90, 300]),
+        });
+        expect(r).toBeNull();
+    });
+
+    it('returns null with no records (older CC) — caller falls back to mtime', () => {
+        expect(detectClaudeSessionIdByPid(90, '/proj', { records: [], descendants: new Set([90]) })).toBeNull();
+    });
+
+    it('matches without cwd when the pane path is unknown', () => {
+        const r = detectClaudeSessionIdByPid(90, null, {
+            records, descendants: new Set([90, 300]),
+        });
+        expect(r).toBe('sess-other');
     });
 });

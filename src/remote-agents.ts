@@ -11,9 +11,10 @@
  * which can never be driven via tmux), and the two tables carry different
  * name axes — install id vs subcommand alias vs pane binary.
  */
-import { readdirSync, statSync } from 'fs';
+import { readdirSync, readFileSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { spawnSync } from 'child_process';
 
 export interface RemoteAgent {
     /** Wire value for AgentSession.agentKind (server/phone contract). */
@@ -27,11 +28,12 @@ export interface RemoteAgent {
     /** Extra pane_command basenames accepted as this agent (beyond binary). */
     paneMatchAliases?: readonly string[];
     /**
-     * Resolve the agent's own session id from the pane's cwd.
+     * Resolve the agent's own session id from the pane's cwd (+ pane pid
+     * when the caller knows it — enables exact process-tree matching).
      * EXTENSION POINT: omitted for codex/gemini until their session-file
      * formats are confirmed — the listener then reports agentSessionId: null.
      */
-    resolveSessionId?: (paneCwd: string) => string | null;
+    resolveSessionId?: (paneCwd: string, panePid?: number) => string | null;
 }
 
 // ── Claude Code session resolver ─────────────────────────────────
@@ -100,6 +102,96 @@ export const detectClaudeSessionId = (cwd: string): string | null => {
     return sessionId;
 };
 
+// ── Claude Code pid → session resolver ───────────────────────────
+//
+// Claude Code maintains ~/.claude/sessions/<pid>.json with the exact
+// {pid, sessionId, cwd} of every live session. Matching the tmux pane's
+// process tree against these records identifies THE session running in
+// that pane — immune to the identity theft the mtime heuristic suffers
+// when a second `claude` opens in the same cwd (its transcript becomes
+// the newest file and steals the tmux session's id).
+
+const CLAUDE_SESSIONS_DIR = join(homedir(), '.claude', 'sessions');
+
+interface PidSessionRecord {
+    pid: number;
+    sessionId: string;
+    cwd: string;
+}
+
+const readPidSessionRecords = (): PidSessionRecord[] => {
+    try {
+        const out: PidSessionRecord[] = [];
+        for (const entry of readdirSync(CLAUDE_SESSIONS_DIR)) {
+            if (!/^\d+\.json$/.test(entry)) continue;
+            try {
+                const raw = JSON.parse(readFileSync(join(CLAUDE_SESSIONS_DIR, entry), 'utf-8')) as Partial<PidSessionRecord>;
+                if (typeof raw.pid === 'number' && typeof raw.sessionId === 'string' && typeof raw.cwd === 'string') {
+                    out.push({ pid: raw.pid, sessionId: raw.sessionId, cwd: raw.cwd });
+                }
+            } catch { /* partial write / corrupt — skip */ }
+        }
+        return out;
+    } catch {
+        return []; // dir absent (older CC) — caller falls back to mtime
+    }
+};
+
+/** pid set of `rootPid` + all descendants, from one `ps` snapshot. */
+const collectDescendantPids = (rootPid: number, psOutput?: string): Set<number> => {
+    let table = psOutput;
+    if (table === undefined) {
+        const r = spawnSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+        if (r.status !== 0) return new Set([rootPid]);
+        table = r.stdout ?? '';
+    }
+    const children = new Map<number, number[]>();
+    for (const line of table.split('\n')) {
+        const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+        if (!m) continue;
+        const [pid, ppid] = [Number(m[1]), Number(m[2])];
+        const list = children.get(ppid) ?? [];
+        list.push(pid);
+        children.set(ppid, list);
+    }
+    const found = new Set<number>([rootPid]);
+    const queue = [rootPid];
+    while (queue.length > 0) {
+        for (const child of children.get(queue.shift()!) ?? []) {
+            if (!found.has(child)) {
+                found.add(child);
+                queue.push(child);
+            }
+        }
+    }
+    return found;
+};
+
+/** Test seam for the pid-based resolver. */
+export interface PidResolveDeps {
+    records?: PidSessionRecord[];
+    descendants?: Set<number>;
+}
+
+/**
+ * Exact resolution: the session record whose pid lives in the pane's
+ * process tree AND whose cwd matches (guards against OS pid reuse
+ * leaving a stale record pointing elsewhere). Null → caller falls back
+ * to the mtime heuristic.
+ */
+export const detectClaudeSessionIdByPid = (
+    panePid: number,
+    paneCwd: string | null,
+    deps: PidResolveDeps = {},
+): string | null => {
+    const records = deps.records ?? readPidSessionRecords();
+    if (records.length === 0) return null;
+    const descendants = deps.descendants ?? collectDescendantPids(panePid);
+    const match = records.find((r) =>
+        descendants.has(r.pid) && (paneCwd === null || r.cwd === paneCwd));
+    return match?.sessionId ?? null;
+};
+
 // ── The registry ─────────────────────────────────────────────────
 
 const REMOTE_AGENT_TABLE = [
@@ -108,7 +200,11 @@ const REMOTE_AGENT_TABLE = [
         displayName: 'Claude Code',
         binary: 'claude',
         subcommands: ['cc', 'claude'],
-        resolveSessionId: detectClaudeSessionId,
+        // Exact pid-tree match first; mtime heuristic only as fallback
+        // (older CC without ~/.claude/sessions, or ps failure).
+        resolveSessionId: (paneCwd, panePid) =>
+            (panePid !== undefined ? detectClaudeSessionIdByPid(panePid, paneCwd) : null)
+            ?? detectClaudeSessionId(paneCwd),
     },
     {
         kind: 'codex',

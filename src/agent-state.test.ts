@@ -208,6 +208,22 @@ describe('working detection on hint-less CC skins (2026.07.04.2 rules)', () => {
         expect(evaluateState(pane, 'claude', DEFAULT_MANIFEST).state).toBe('working');
     });
 
+    it('compact pass reads as working despite lacking every spinner signal', () => {
+        // Real capture: /compact renders "(51s)" with no "·" suffix, no
+        // token counter, no interrupt hint — previously classified idle.
+        const pane = [
+            '❯ /compact',
+            '',
+            '✱ Compacting conversation… (51s)',
+            '▰▰▰▰▰▰▰▰▱▱▱▱ 44%',
+            '─────────────',
+            '❯',
+        ].join('\n');
+        const r = evaluateState(pane, 'claude', DEFAULT_MANIFEST);
+        expect(r.state).toBe('working');
+        expect(r.ruleId).toBe('claude-working-compacting');
+    });
+
     it('still idle when spinner line is gone', () => {
         const pane = [
             '⏺ Done.',
