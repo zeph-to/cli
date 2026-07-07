@@ -6,6 +6,7 @@ import {
     parseSessionName,
     checkRateLimit,
     handlePush,
+    resolveKeys,
     gcAttachments,
     computeBackoff,
     AUTH_FAILURE_CODES,
@@ -236,6 +237,101 @@ describe('handlePush', () => {
         );
         expect(ok).toBe(false);
         expect(injected).toBe(false);
+    });
+});
+
+describe('resolveKeys', () => {
+    it('maps whitelisted names (case/space-insensitive) to tmux tokens', () => {
+        expect(resolveKeys(['Escape', 'up', ' Down ', 'LEFT', 'right', 'enter'])).toEqual([
+            'Escape', 'Up', 'Down', 'Left', 'Right', 'Enter',
+        ]);
+    });
+
+    it('rejects the whole batch if any key is unknown', () => {
+        expect(resolveKeys(['escape', 'C-c'])).toBeNull();
+        expect(resolveKeys(['pageup'])).toBeNull();
+    });
+
+    it('rejects an empty list', () => {
+        expect(resolveKeys([])).toBeNull();
+    });
+});
+
+describe('handlePush key events', () => {
+    const keysDeps = (override: Parameters<typeof handlePush>[1] = {}) => ({
+        paneCommand: () => 'claude',
+        sendKeys: () => true,
+        rateLimit: () => true,
+        ...override,
+    });
+
+    const keyCmd = (keys: string[]) => ({
+        pushId: '1',
+        type: 'agent.command' as const,
+        agentSessionName: 'zeph-myapp',
+        keys,
+    });
+
+    it('sends resolved key tokens (Esc escapes a /usage modal)', async () => {
+        let calledWith: { session: string; tokens: string[] } | null = null;
+        const ok = await handlePush(
+            keyCmd(['escape']),
+            keysDeps({ sendKeys: (session, tokens) => { calledWith = { session, tokens }; return true; } }),
+        );
+        expect(ok).toBe(true);
+        expect(calledWith).toEqual({ session: 'zeph-myapp', tokens: ['Escape'] });
+    });
+
+    it('sends an arrow + Enter sequence in order', async () => {
+        let tokens: string[] | null = null;
+        const ok = await handlePush(
+            keyCmd(['down', 'enter']),
+            keysDeps({ sendKeys: (_s, t) => { tokens = t; return true; } }),
+        );
+        expect(ok).toBe(true);
+        expect(tokens).toEqual(['Down', 'Enter']);
+    });
+
+    it('drops (no send) when any key is unknown', async () => {
+        let sent = false;
+        const ok = await handlePush(
+            keyCmd(['escape', 'C-c']),
+            keysDeps({ sendKeys: () => { sent = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(sent).toBe(false);
+    });
+
+    it('honours the shell-pane RCE guard for keys too', async () => {
+        let sent = false;
+        const ok = await handlePush(
+            keyCmd(['enter']),
+            keysDeps({ paneCommand: () => 'bash', sendKeys: () => { sent = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(sent).toBe(false);
+    });
+
+    it('honours rate-limit for keys too', async () => {
+        let sent = false;
+        const ok = await handlePush(
+            keyCmd(['escape']),
+            keysDeps({ rateLimit: () => false, sendKeys: () => { sent = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(sent).toBe(false);
+    });
+
+    it('prefers keys over body when both are present', async () => {
+        let injectedText = false;
+        let sentKeys = false;
+        const ok = await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-myapp', keys: ['escape'], body: 'ignored' },
+            keysDeps({ inject: () => { injectedText = true; return true; }, sendKeys: () => { sentKeys = true; return true; } }),
+        );
+        expect(ok).toBe(true);
+        expect(sentKeys).toBe(true);
+        expect(injectedText).toBe(false);
     });
 });
 

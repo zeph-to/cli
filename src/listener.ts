@@ -147,6 +147,46 @@ const injectKeys = (session: string, text: string): boolean => {
     return b.status === 0;
 };
 
+// Named keys the phone may inject to drive a full-screen Claude Code pane
+// (a `/usage` modal captures text input — only a real Escape/arrow gets out).
+// Maps a lowercase wire name to the exact tmux key token. Whitelist-ONLY:
+// anything outside this map is refused so a compromised sender can't smuggle
+// `C-c`, `M-x`, or a shell command through send-keys' key-name syntax.
+const ALLOWED_KEYS: Record<string, string> = {
+    escape: 'Escape',
+    up: 'Up',
+    down: 'Down',
+    left: 'Left',
+    right: 'Right',
+    enter: 'Enter',
+};
+
+/**
+ * Translate a phone-supplied key list to tmux tokens. Returns null if ANY
+ * key is unknown — a partial injection (some keys land, one is dropped)
+ * leaves the pane in a worse mid-state than none, so the whole batch is
+ * rejected.
+ */
+export const resolveKeys = (keys: string[]): string[] | null => {
+    const out: string[] = [];
+    for (const k of keys) {
+        const token = ALLOWED_KEYS[k.toLowerCase().trim()];
+        if (!token) return null;
+        out.push(token);
+    }
+    return out.length ? out : null;
+};
+
+/**
+ * Send named keys as keys (NOT `-l`), so tmux interprets Escape/Up/Enter as
+ * key presses rather than literal text. One send-keys call carries the
+ * whole sequence in order.
+ */
+const injectNamedKeys = (session: string, tokens: string[]): boolean => {
+    const r = spawnSync('tmux', tmuxArgs(['send-keys', '-t', session, ...tokens]), { stdio: ['ignore', 'ignore', 'pipe'] });
+    return r.status === 0;
+};
+
 const stamp = (): string => new Date().toISOString().slice(11, 19);
 const log = (msg: string): void => console.log(`[${stamp()}] ${msg}`);
 
@@ -822,6 +862,9 @@ interface PushItem {
     isEncrypted?: boolean;
     /** Set when type='agent.command' — tmux session name to inject into. */
     agentSessionName?: string;
+    /** Named keys (Esc/arrows/Enter) to inject instead of body text —
+     *  drives full-screen modals the phone can't escape with text. */
+    keys?: string[];
     /** Optional image/file attachments (agent.command only, plaintext). */
     files?: PushFileAttachment[];
 }
@@ -829,6 +872,7 @@ interface PushItem {
 interface HandlePushDeps {
     paneCommand?: (session: string) => string | null;
     inject?: (session: string, text: string) => boolean;
+    sendKeys?: (session: string, tokens: string[]) => boolean;
     rateLimit?: (session: string) => boolean;
     now?: () => number;
     /** Injectable for tests; defaults to the REST-backed downloader. */
@@ -840,11 +884,7 @@ interface HandlePushDeps {
  * the structured `agent.command` push type and the legacy `@<session>`
  * prefix path route through here so the defense layers can't diverge.
  */
-const tryInject = (session: string, text: string, deps: HandlePushDeps): boolean => {
-    if (!text) {
-        log(`! ${session}: empty text — drop`);
-        return false;
-    }
+const passesInjectGuards = (session: string, deps: HandlePushDeps): boolean => {
     const cmd = (deps.paneCommand ?? paneCurrentCommand)(session);
     if (cmd === null) {
         log(`! ${session}: no such tmux session — drop`);
@@ -854,14 +894,31 @@ const tryInject = (session: string, text: string, deps: HandlePushDeps): boolean
         log(`! ${session}: pane is at shell (${cmd}) — refusing (would be RCE)`);
         return false;
     }
-    const allowed = (deps.rateLimit ?? checkRateLimit)(session);
-    if (!allowed) {
+    if (!(deps.rateLimit ?? checkRateLimit)(session)) {
         log(`! ${session}: rate-limited — drop`);
         return false;
     }
+    return true;
+};
+
+const tryInject = (session: string, text: string, deps: HandlePushDeps): boolean => {
+    if (!text) {
+        log(`! ${session}: empty text — drop`);
+        return false;
+    }
+    if (!passesInjectGuards(session, deps)) return false;
     const ok = (deps.inject ?? injectKeys)(session, text);
     const preview = text.length > 60 ? text.slice(0, 60) + '…' : text;
     log(`${ok ? '→' : '✗'} ${session}: ${preview}`);
+    return ok;
+};
+
+/** Key-event sibling of tryInject: same pane/shell/rate guards, but sends
+ *  named keys instead of literal text + Enter. */
+const tryInjectKeys = (session: string, tokens: string[], deps: HandlePushDeps): boolean => {
+    if (!passesInjectGuards(session, deps)) return false;
+    const ok = (deps.sendKeys ?? injectNamedKeys)(session, tokens);
+    log(`${ok ? '⌨' : '✗'} ${session}: [${tokens.join(' ')}]`);
     return ok;
 };
 
@@ -1012,6 +1069,18 @@ export const handlePush = async (
         return false;
     }
     if (push.type !== 'agent.command' || !push.agentSessionName) return false;
+
+    // Key event (Esc / arrows / Enter) — no body, no attachments. Lets the
+    // phone escape a full-screen modal (e.g. after `/usage`) that swallows
+    // text input.
+    if (push.keys?.length) {
+        const tokens = resolveKeys(push.keys);
+        if (!tokens) {
+            log(`! ${push.agentSessionName}: unknown key(s) [${push.keys.join(' ')}] — drop`);
+            return false;
+        }
+        return tryInjectKeys(push.agentSessionName, tokens, deps);
+    }
 
     // Download any attachments BEFORE injecting so the agent can read the
     // local paths immediately. A download-phase failure is isolated: the
