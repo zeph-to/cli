@@ -1,3 +1,6 @@
+import { createHash } from 'node:crypto';
+import { hostname } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import type { ZephOptions, NotifyPayload, NotifyResult, ListParams, ListResult, PushItem, DismissOneResult, DismissAllResult, ApiErrorResponse, UploadRequestResult } from './types.js';
 import { ZephError, AuthenticationError, QuotaExceededError } from './errors.js';
 import { initCrypto, getKeyPair, encryptPushBodyForSelf, encryptFileForSelf } from './crypto.js';
@@ -6,6 +9,25 @@ const DEFAULT_BASE_URL = 'https://api.zeph.to/v1';
 const DEFAULT_TIMEOUT_MS = 30_000;
 const BODY_FILE_THRESHOLD = 512;
 const PREVIEW_LENGTH = 200;
+
+/**
+ * Stable agent-session grouping when running inside a tmux agent session, so a
+ * hook/notify (e.g. the Stop-hook recap) files under the same session key as
+ * the listener's pushes — surviving Claude session-UUID rotation. The device id
+ * MUST match cli `computeListenerDeviceId` (`dev_listener_<sha8(hostname)>`).
+ */
+const agentSessionContext = (): { agentDeviceId: string; agentSessionName: string } | null => {
+  if (!process.env.TMUX) return null;
+  let name: string;
+  try {
+    name = execFileSync('tmux', ['display-message', '-p', '#S'], { encoding: 'utf-8' }).trim();
+  } catch {
+    return null;
+  }
+  if (!name) return null;
+  const h = createHash('sha256').update(hostname()).digest('hex').slice(0, 8);
+  return { agentDeviceId: `dev_listener_${h}`, agentSessionName: name };
+};
 
 const inferMimeType = (fileName: string): string => {
   const ext = fileName.split('.').pop()?.toLowerCase();
@@ -42,6 +64,12 @@ export class ZephHook {
   }
 
   async notify(payload: NotifyPayload): Promise<NotifyResult> {
+    // Attach the stable session key when in a tmux agent session so the push
+    // joins the agent chat. Merged into `payload` here so both the inline and
+    // file-upload (notifyWithFile) paths — which each spread `...payload` —
+    // carry it. Explicit caller values win.
+    const agentCtx = agentSessionContext();
+    if (agentCtx) payload = { ...agentCtx, ...payload };
     const canEncrypt = await this.ensureCrypto();
     const body = payload.body;
     const bodyBytes = body ? new TextEncoder().encode(body).byteLength : 0;
