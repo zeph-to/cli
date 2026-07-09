@@ -12,6 +12,11 @@ export interface NotifyPayload {
   priority?: 'low' | 'normal' | 'high' | 'urgent';
   targetDeviceId?: string;
   sessionId?: string;
+  /** Stable agent-session grouping so a hook/notify joins the agent chat:
+   *  the listener device (per-host) + tmux session name. Auto-filled by
+   *  ZephHook.notify when running inside a tmux agent session. */
+  agentDeviceId?: string;
+  agentSessionName?: string;
 }
 
 export interface NotifyResult {
