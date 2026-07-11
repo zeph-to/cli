@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 
@@ -42,8 +42,11 @@ export const loadConfig = (): ZephConfig => {
 };
 
 export const saveConfig = (config: ZephConfig): void => {
-  mkdirSync(CONFIG_DIR, { recursive: true });
-  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2) + '\n');
+  mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  // `mode` only applies on creation — tighten pre-existing installs too,
+  // since this file holds the API key.
+  chmodSync(CONFIG_FILE, 0o600);
 };
 
 export const VERSION = (() => {
