@@ -409,4 +409,10 @@ const main = async (): Promise<number> => {
   }
 };
 
-main().then((code) => process.exit(code));
+main().then(
+  (code) => process.exit(code),
+  (err) => {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  },
+);

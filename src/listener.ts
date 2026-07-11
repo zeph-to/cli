@@ -1121,6 +1121,8 @@ interface SessionResult {
     closeCode: number | null;
     /** Resolved with reason text for logging. */
     reason: string;
+    /** True if the socket ever reached `open` — resets reconnect backoff. */
+    connected: boolean;
 }
 
 /**
@@ -1148,6 +1150,7 @@ interface StreamHandle {
  */
 const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
     let ws: WebSocket | null = null;
+    let opened = false;
     const done = new Promise<SessionResult>((resolve) => {
         // deviceId + listenerNickname let the backend attach the connection
         // to a DeviceRecord (auto-created on first connect for apiKey auth).
@@ -1241,6 +1244,7 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
 
         sock.on('open', () => {
             if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
+            opened = true;
             lastRoundTripAt = Date.now();
             log('connected');
             // Initial inventory so the phone's picker has something to
@@ -1323,7 +1327,7 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
 
         sock.on('close', (code, reasonBuf) => {
             cleanup();
-            resolve({ closeCode: code, reason: reasonBuf?.toString('utf-8') ?? '' });
+            resolve({ closeCode: code, reason: reasonBuf?.toString('utf-8') ?? '', connected: opened });
         });
     });
 
@@ -1488,6 +1492,11 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
         }
 
         if (shuttingDown) break;
+
+        // A session that actually connected resets the backoff — otherwise a
+        // long-lived daemon on a flaky link ratchets up to the 30s ceiling
+        // permanently, even when every reconnect succeeds instantly.
+        if (result.connected) attempt = 0;
 
         const delay = computeBackoff(attempt);
         log(`disconnected (code=${result.closeCode}) — reconnect in ${Math.round(delay / 1000)}s`);

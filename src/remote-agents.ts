@@ -137,13 +137,39 @@ const readPidSessionRecords = (): PidSessionRecord[] => {
     }
 };
 
+// One `ps` spawn and one ~/.claude/sessions scan per report cycle, not per
+// tmux session: the resolver runs for every session every 5s, and each call
+// paid a full process-table spawn plus a directory scan on the daemon's hot
+// path. A TTL just under the report interval lets all sessions in one cycle
+// share a single snapshot while still refreshing every cycle.
+const SNAPSHOT_TTL_MS = 4_000;
+let psSnapshot: { table: string | null; expiresAt: number } | null = null;
+let recordsSnapshot: { records: PidSessionRecord[]; expiresAt: number } | null = null;
+
+const readPsTable = (): string | null => {
+    const now = Date.now();
+    if (psSnapshot && psSnapshot.expiresAt > now) return psSnapshot.table;
+    const r = spawnSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const table = r.status === 0 ? (r.stdout ?? '') : null;
+    psSnapshot = { table, expiresAt: now + SNAPSHOT_TTL_MS };
+    return table;
+};
+
+const cachedPidSessionRecords = (): PidSessionRecord[] => {
+    const now = Date.now();
+    if (recordsSnapshot && recordsSnapshot.expiresAt > now) return recordsSnapshot.records;
+    const records = readPidSessionRecords();
+    recordsSnapshot = { records, expiresAt: now + SNAPSHOT_TTL_MS };
+    return records;
+};
+
 /** pid set of `rootPid` + all descendants, from one `ps` snapshot. */
 const collectDescendantPids = (rootPid: number, psOutput?: string): Set<number> => {
     let table = psOutput;
     if (table === undefined) {
-        const r = spawnSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
-        if (r.status !== 0) return new Set([rootPid]);
-        table = r.stdout ?? '';
+        const snapshot = readPsTable();
+        if (snapshot === null) return new Set([rootPid]);
+        table = snapshot;
     }
     const children = new Map<number, number[]>();
     for (const line of table.split('\n')) {
@@ -184,7 +210,7 @@ export const detectClaudeSessionIdByPid = (
     paneCwd: string | null,
     deps: PidResolveDeps = {},
 ): string | null => {
-    const records = deps.records ?? readPidSessionRecords();
+    const records = deps.records ?? cachedPidSessionRecords();
     if (records.length === 0) return null;
     const descendants = deps.descendants ?? collectDescendantPids(panePid);
     const match = records.find((r) =>
