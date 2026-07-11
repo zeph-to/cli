@@ -308,7 +308,7 @@ zeph notify --title "Hello" --json
 | Command | Description |
 |---------|-------------|
 | `login` | Browser sign-in: auto-fetch API key + hook into `~/.zeph/config.json` over a localhost loopback (`--web-url`, `--timeout`). No copy-paste |
-| `install` | One-command setup: detect agents, save config, install rules + hooks + MCP. No saved config → opens browser login automatically. `--only claude,cursor,…` skips the picker |
+| `install` (alias: `setup`) | One-command setup: detect agents, save config, install rules + hooks + MCP. No saved config → opens browser login automatically. `--only claude,cursor,…` skips the picker |
 | `uninstall` | Remove Zeph from all detected agents (`--dry-run`, `--purge`) |
 | `verify` | Check installation health across detected agents (`--ping` for a live API call) |
 | `check-update` | Check whether a newer Zeph version is on npm |
@@ -345,6 +345,7 @@ which project + branch finished without writing per-IDE wrappers. Pass
 |------|-------------|
 | `--ws-url <url>` | WebSocket endpoint (or set `ZEPH_WS_URL` env, or `wsUrl` in `~/.zeph/config.json`) |
 | `--key <api-key>` | API key (or set `ZEPH_API_KEY` env) |
+| `--base-url <url>` | REST API base URL (or set `ZEPH_BASE_URL` env, or `baseUrl` in `~/.zeph/config.json`) |
 
 The listener reconnects with exponential backoff + jitter (1 s → 30 s
 cap). Heartbeat is ping every 25 s with a 10 s pong timeout. On an
@@ -473,10 +474,10 @@ try {
 |-------|-------------------|
 | Claude Code | Plugin (hooks + MCP server) |
 | Cursor | MCP server + stop hook + rules |
-| Windsurf | MCP server + response hook |
+| Windsurf | MCP server + response hook + rules |
 | Gemini CLI | MCP server + AfterAgent hook |
-| Codex CLI | Stop hook |
-| Copilot CLI | Session end hook |
+| Codex CLI | Stop hook + rules |
+| Copilot CLI | Session end hook + rules |
 | Cline | Rules file (`~/.cline/rules/zeph.md`) |
 | Aider | Conventions file + `read:` directive in `~/.aider.conf.yml` |
 

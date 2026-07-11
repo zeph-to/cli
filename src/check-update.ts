@@ -49,7 +49,7 @@ export const handleCheckUpdate = async (args: Record<string, string | boolean>):
 
     if (isJson) {
         console.log(JSON.stringify({ results }, null, 2));
-        return results.some((r) => r.outdated) ? 0 : 0;
+        return 0;
     }
 
     console.log('\n  Zeph — update check\n');

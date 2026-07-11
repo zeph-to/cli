@@ -247,7 +247,10 @@ const handleList = async (args: Record<string, string | boolean>): Promise<numbe
   if (!hook) return 3;
 
   try {
-    const limit = args.limit ? Number(args.limit) : undefined;
+    // Clamp to the documented 1-20 range; a non-numeric value falls back to
+    // the server default instead of sending limit=NaN in the query string.
+    const rawLimit = args.limit ? Number(args.limit) : NaN;
+    const limit = Number.isFinite(rawLimit) ? Math.min(20, Math.max(1, Math.floor(rawLimit))) : undefined;
     const result = await hook.list({
       limit,
       type: args.type as 'note' | 'link' | 'file' | 'clipboard' | 'hook' | undefined,

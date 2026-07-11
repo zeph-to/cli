@@ -1156,6 +1156,10 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
         // to a DeviceRecord (auto-created on first connect for apiKey auth).
         // Without these the `listener.sessions` reports are silently dropped
         // server-side and the phone's picker stays empty.
+        // KNOWN TRADEOFF: apiKey rides the query string, so it can land in
+        // API Gateway access logs. The $connect route can't read custom
+        // headers from every WS client; moving to first-message auth needs a
+        // server-side change (tracked upstream).
         const deviceId = computeListenerDeviceId();
         const nickname = hostname() || 'listener';
         const params = new URLSearchParams({
@@ -1468,6 +1472,11 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
 
     let shuttingDown = false;
     let activeHandle: StreamHandle | null = null;
+    // Resolved by stop() so the reconnect backoff sleep below can be
+    // interrupted — otherwise a SIGINT during the (up to 30s) backoff waits
+    // out the full delay before the loop notices shuttingDown.
+    let notifyStop: () => void = () => undefined;
+    const stopped = new Promise<void>((resolve) => { notifyStop = resolve; });
     const stop = (sig: string): void => {
         if (shuttingDown) return;
         shuttingDown = true;
@@ -1475,6 +1484,7 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
         // Force-close any open WS so the streamSession promise resolves
         // immediately instead of waiting for the server to drop us.
         activeHandle?.terminate();
+        notifyStop();
     };
     process.on('SIGINT', () => stop('SIGINT'));
     process.on('SIGTERM', () => stop('SIGTERM'));
@@ -1500,7 +1510,7 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
 
         const delay = computeBackoff(attempt);
         log(`disconnected (code=${result.closeCode}) — reconnect in ${Math.round(delay / 1000)}s`);
-        await sleep(delay);
+        await Promise.race([sleep(delay), stopped]);
         attempt = Math.min(attempt + 1, 10);
     }
 
