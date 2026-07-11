@@ -1,7 +1,8 @@
 /**
  * Device-shared encryption for Hook SDK — self-contained ECDH P-256 +
  * AES-256-GCM. Mirrors @zeph/crypto API but bundled inline (no external
- * dependency). Uses Web Crypto API (globalThis.crypto.subtle) — Node.js 18+.
+ * dependency). Uses Web Crypto API via node:crypto webcrypto — Node.js 18+
+ * (the `crypto` global only exists unflagged from Node 19, so we import it).
  *
  * Threat model honesty (do not call this "E2E" without a footnote):
  *
@@ -32,6 +33,12 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { webcrypto } from 'node:crypto';
+
+// Node 18 has no `crypto` global (unflagged only from 19.0.0) — resolve the
+// Web Crypto implementation explicitly so encryption works on the declared
+// minimum runtime instead of silently falling back to plaintext.
+const crypto = webcrypto as unknown as Crypto;
 
 // ─── Base64 helpers ───
 
