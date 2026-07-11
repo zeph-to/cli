@@ -141,36 +141,22 @@ const readPidSessionRecords = (): PidSessionRecord[] => {
 // tmux session: the resolver runs for every session every 5s, and each call
 // paid a full process-table spawn plus a directory scan on the daemon's hot
 // path. A TTL just under the report interval lets all sessions in one cycle
-// share a single snapshot while still refreshing every cycle.
+// share a single snapshot while still refreshing every cycle. The parsed
+// child-adjacency map is what's cached (not the raw table) so N sessions
+// share one parse and differ only in the per-root BFS.
 const SNAPSHOT_TTL_MS = 4_000;
-let psSnapshot: { table: string | null; expiresAt: number } | null = null;
-let recordsSnapshot: { records: PidSessionRecord[]; expiresAt: number } | null = null;
 
-const readPsTable = (): string | null => {
-    const now = Date.now();
-    if (psSnapshot && psSnapshot.expiresAt > now) return psSnapshot.table;
-    const r = spawnSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
-    const table = r.status === 0 ? (r.stdout ?? '') : null;
-    psSnapshot = { table, expiresAt: now + SNAPSHOT_TTL_MS };
-    return table;
+const ttlMemo = <T,>(ttlMs: number, compute: () => T): (() => T) => {
+    let snap: { value: T; expiresAt: number } | null = null;
+    return () => {
+        const now = Date.now();
+        if (snap && snap.expiresAt > now) return snap.value;
+        snap = { value: compute(), expiresAt: now + ttlMs };
+        return snap.value;
+    };
 };
 
-const cachedPidSessionRecords = (): PidSessionRecord[] => {
-    const now = Date.now();
-    if (recordsSnapshot && recordsSnapshot.expiresAt > now) return recordsSnapshot.records;
-    const records = readPidSessionRecords();
-    recordsSnapshot = { records, expiresAt: now + SNAPSHOT_TTL_MS };
-    return records;
-};
-
-/** pid set of `rootPid` + all descendants, from one `ps` snapshot. */
-const collectDescendantPids = (rootPid: number, psOutput?: string): Set<number> => {
-    let table = psOutput;
-    if (table === undefined) {
-        const snapshot = readPsTable();
-        if (snapshot === null) return new Set([rootPid]);
-        table = snapshot;
-    }
+const parseChildren = (table: string): Map<number, number[]> => {
     const children = new Map<number, number[]>();
     for (const line of table.split('\n')) {
         const m = line.trim().match(/^(\d+)\s+(\d+)$/);
@@ -180,6 +166,20 @@ const collectDescendantPids = (rootPid: number, psOutput?: string): Set<number> 
         list.push(pid);
         children.set(ppid, list);
     }
+    return children;
+};
+
+const readPsChildren = ttlMemo(SNAPSHOT_TTL_MS, (): Map<number, number[]> | null => {
+    const r = spawnSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+    return r.status === 0 ? parseChildren(r.stdout ?? '') : null;
+});
+
+const cachedPidSessionRecords = ttlMemo(SNAPSHOT_TTL_MS, readPidSessionRecords);
+
+/** pid set of `rootPid` + all descendants, from one `ps` snapshot. */
+const collectDescendantPids = (rootPid: number, psOutput?: string): Set<number> => {
+    const children = psOutput !== undefined ? parseChildren(psOutput) : readPsChildren();
+    if (children === null) return new Set([rootPid]);
     const found = new Set<number>([rootPid]);
     const queue = [rootPid];
     while (queue.length > 0) {
