@@ -101,7 +101,7 @@ describe('templates.ts: NOTIFY_CMD shape', () => {
 
     it('CODEX_HOOKS uses Stop event', async () => {
         const { CODEX_HOOKS } = await import('./templates.js');
-        expect(JSON.parse(CODEX_HOOKS)).toHaveProperty('hooks.Stop');
+        expect(CODEX_HOOKS).toHaveProperty('hooks.Stop');
     });
 
     // Codex parses hooks.json with serde deny_unknown_fields at the top level
@@ -111,10 +111,9 @@ describe('templates.ts: NOTIFY_CMD shape', () => {
     // whole file.
     it('CODEX_HOOKS matches the strict codex schema (matcher groups, no version/bash)', async () => {
         const { CODEX_HOOKS } = await import('./templates.js');
-        const parsed = JSON.parse(CODEX_HOOKS);
-        expect(Object.keys(parsed)).toEqual(['hooks']);
-        for (const event of ['UserPromptSubmit', 'Stop']) {
-            for (const group of parsed.hooks[event]) {
+        expect(Object.keys(CODEX_HOOKS)).toEqual(['hooks']);
+        for (const event of ['UserPromptSubmit', 'Stop'] as const) {
+            for (const group of CODEX_HOOKS.hooks[event]) {
                 for (const handler of group.hooks) {
                     expect(handler.type).toBe('command');
                     expect(typeof handler.command).toBe('string');
@@ -122,7 +121,18 @@ describe('templates.ts: NOTIFY_CMD shape', () => {
                 }
             }
         }
-        expect(parsed.hooks.UserPromptSubmit[0].hooks[0].command).toContain('remote-hook codex');
+        expect(CODEX_HOOKS.hooks.UserPromptSubmit[0].hooks[0].command).toContain('remote-hook codex');
+    });
+
+    it('every zeph hook command is recognizable by isZephHookGroup (uninstall contract)', async () => {
+        const { CODEX_HOOKS, GEMINI_HOOKS, isZephHookGroup } = await import('./templates.js');
+        for (const groups of [
+            ...Object.values(CODEX_HOOKS.hooks),
+            ...Object.values(GEMINI_HOOKS.hooks),
+        ]) {
+            for (const group of groups) expect(isZephHookGroup(group)).toBe(true);
+        }
+        expect(isZephHookGroup({ hooks: [{ type: 'command', command: 'echo mine' }] })).toBe(false);
     });
 
     it('GEMINI_HOOKS registers BeforeAgent remote detection alongside AfterAgent notify', async () => {
@@ -134,14 +144,19 @@ describe('templates.ts: NOTIFY_CMD shape', () => {
 });
 
 describe('mergeJsonFile — hooks-level merge', () => {
-    it('preserves user-owned hook events while updating zeph entries', async () => {
+    it('preserves user hooks at both levels while replacing zeph entries', async () => {
         const file = join(TMP, '.gemini', 'settings.json');
         mkdirSync(join(TMP, '.gemini'), { recursive: true });
         writeFileSync(file, JSON.stringify({
             security: { auth: { selectedType: 'gemini-api-key' } },
             hooks: {
+                // user-owned event zeph never touches
                 BeforeTool: [{ matcher: 'grep', hooks: [{ type: 'command', command: 'echo mine' }] }],
-                AfterAgent: [{ hooks: [{ name: 'stale-zeph', type: 'command', command: 'old' }] }],
+                // event zeph also writes: one stale zeph entry + one user group
+                AfterAgent: [
+                    { hooks: [{ name: 'zeph-notify', type: 'command', command: 'old zeph cmd' }] },
+                    { hooks: [{ name: 'my-own', type: 'command', command: 'echo user' }] },
+                ],
             },
         }));
         const { mergeJsonFile } = await import('./installer.js');
@@ -152,7 +167,25 @@ describe('mergeJsonFile — hooks-level merge', () => {
         expect(out.security.auth.selectedType).toBe('gemini-api-key');
         expect(out.hooks).toHaveProperty('BeforeTool');
         expect(out.hooks.BeforeAgent[0].hooks[0].name).toBe('zeph-remote');
-        expect(out.hooks.AfterAgent[0].hooks[0].name).toBe('zeph-notify');
+        // user group inside the shared event survives; zeph's is replaced, not duplicated
+        const afterAgentNames = out.hooks.AfterAgent.flatMap(
+            (g: { hooks: Array<{ name?: string; command?: string }> }) => g.hooks.map((h) => h.name),
+        );
+        expect(afterAgentNames.sort()).toEqual(['my-own', 'zeph-notify']);
+        expect(JSON.stringify(out)).not.toContain('old zeph cmd');
+    });
+
+    it('re-run is idempotent (no duplicate zeph groups)', async () => {
+        const file = join(TMP, '.gemini', 'settings.json');
+        mkdirSync(join(TMP, '.gemini'), { recursive: true });
+        const { mergeJsonFile } = await import('./installer.js');
+        const { GEMINI_HOOKS } = await import('./templates.js');
+        mergeJsonFile(file, GEMINI_HOOKS as unknown as Record<string, unknown>);
+        mergeJsonFile(file, GEMINI_HOOKS as unknown as Record<string, unknown>);
+
+        const out = JSON.parse(readFileSync(file, 'utf-8'));
+        expect(out.hooks.BeforeAgent).toHaveLength(1);
+        expect(out.hooks.AfterAgent).toHaveLength(1);
     });
 });
 

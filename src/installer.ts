@@ -17,6 +17,7 @@ import {
   COPILOT_HOOKS, COPILOT_RULE,
   CLINE_RULE,
   AIDER_RULE,
+  isZephHookGroup,
   upsertManagedBlock,
 } from './templates.js';
 
@@ -68,12 +69,19 @@ export const mergeJsonFile = (filePath: string, patch: Record<string, unknown>):
     data = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
   } catch { /* new file */ }
   const merged = { ...data, ...patch };
-  // `hooks` maps event names the user may own (their own BeforeTool etc.
-  // in Gemini's settings.json) — merge that level instead of clobbering
-  // the whole object. Same-named events still take the patch's value,
-  // which keeps re-runs idempotent for zeph's own entries.
+  // `hooks` maps event names to matcher-group arrays, and the user may own
+  // entries at BOTH levels (their own events, and their own groups inside
+  // an event zeph also uses) — so instead of clobbering the whole object,
+  // merge events, and inside each event zeph writes keep the user's groups
+  // and replace only zeph's own (re-runs stay idempotent).
   if (isPlainObject(data.hooks) && isPlainObject(patch.hooks)) {
-    merged.hooks = { ...data.hooks, ...patch.hooks };
+    const hooks: Record<string, unknown> = { ...data.hooks };
+    for (const [event, patchGroups] of Object.entries(patch.hooks)) {
+      const prev = hooks[event];
+      const userGroups = Array.isArray(prev) ? prev.filter((g) => !isZephHookGroup(g)) : [];
+      hooks[event] = [...userGroups, ...(Array.isArray(patchGroups) ? patchGroups : [])];
+    }
+    merged.hooks = hooks;
   }
   writeFile(filePath, JSON.stringify(merged, null, 2));
 };
@@ -198,7 +206,7 @@ const installGemini = (): void => {
   }
   try {
     mergeJsonFile(join(HOME, '.gemini', 'settings.json'), GEMINI_HOOKS);
-    ok('AfterAgent hook added');
+    ok('BeforeAgent + AfterAgent hooks added');
   } catch {
     fail('Hook install failed');
   }
@@ -213,8 +221,8 @@ const installGemini = (): void => {
 
 const installCodex = (): void => {
   try {
-    writeFile(join(HOME, '.codex', 'hooks.json'), CODEX_HOOKS);
-    ok('Stop hook added');
+    mergeJsonFile(join(HOME, '.codex', 'hooks.json'), CODEX_HOOKS);
+    ok('UserPromptSubmit + Stop hooks added');
   } catch {
     fail('Hook install failed. Manual: add zeph to ~/.codex/hooks.json');
   }

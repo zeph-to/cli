@@ -164,8 +164,11 @@ export const GEMINI_HOOKS = {
 // `{version, hooks: {Stop: [{type, bash}]}}` shape predates that schema
 // and made codex reject the entire file, so the Stop hook is migrated to
 // the schema-correct form here alongside the new UserPromptSubmit entry.
-// Timeouts are in seconds.
-export const CODEX_HOOKS = JSON.stringify({
+// An object (not a JSON string) so the installer can merge it into a
+// user-owned hooks.json instead of overwriting. Timeouts are in seconds;
+// codex's handler schema has no `name` field, so zeph ownership is
+// recognizable only by the `@zeph-to/cli` command substring.
+export const CODEX_HOOKS = {
   hooks: {
     UserPromptSubmit: [{
       hooks: [{ type: 'command', command: remoteHookCmd('codex'), timeout: 5 }],
@@ -174,7 +177,27 @@ export const CODEX_HOOKS = JSON.stringify({
       hooks: [{ type: 'command', command: NOTIFY_CMD }],
     }],
   },
-}, null, 2);
+};
+
+/**
+ * True when a matcher group was written by zeph — by handler `name`
+ * (`zeph-*`, Gemini) or by the `@zeph-to/cli` command substring (Codex,
+ * whose handler schema has no name field; every zeph command carries the
+ * substring via the `command -v zeph || npx -y @zeph-to/cli` fallback).
+ * Shared by the installer (replace ours, keep the user's groups on
+ * re-install) and the uninstaller (remove exactly ours).
+ */
+export const isZephHookGroup = (group: unknown): boolean => {
+  const hooks = (group as { hooks?: unknown })?.hooks;
+  if (!Array.isArray(hooks)) return false;
+  return hooks.some((h) => {
+    const { name, command } = (h ?? {}) as { name?: unknown; command?: unknown };
+    return (
+      (typeof name === 'string' && name.startsWith('zeph-')) ||
+      (typeof command === 'string' && command.includes('@zeph-to/cli'))
+    );
+  });
+};
 
 export const COPILOT_HOOKS = JSON.stringify({
   version: 1,
