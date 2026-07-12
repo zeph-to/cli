@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
     decidePush, GATE_DEFAULTS, isMuted, normalizeMarker, normalizePushMode,
-    projectHash, readPushMode,
+    projectHash, readPushMode, stateDir,
 } from './gate.js';
 
 // ── Cross-repo parity vectors ────────────────────────────────────
@@ -73,13 +73,20 @@ describe('gate.ts: normalizers', () => {
 // ── Per-project state files (hash parity with the bash hooks) ────
 
 let TMP: string;
+let savedXdgStateHome: string | undefined;
 
 beforeEach(() => {
     TMP = mkdtempSync(join(tmpdir(), 'zeph-gate-test-'));
+    // Isolate state reads/writes from the machine's real ~/.local/state.
+    savedXdgStateHome = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = join(TMP, 'state');
+    mkdirSync(stateDir(), { recursive: true });
 });
 
 afterEach(() => {
     const hash = projectHash(TMP);
+    if (savedXdgStateHome === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = savedXdgStateHome;
     rmSync(TMP, { recursive: true, force: true });
     if (hash) {
         rmSync(`/tmp/zeph-muted-${hash}`, { force: true });
@@ -93,19 +100,32 @@ describe('gate.ts: project state helpers', () => {
         expect(projectHash(TMP)).toBe(expected);
     });
 
-    it('isMuted reflects /tmp/zeph-muted-<hash>', () => {
+    it('isMuted reflects <stateDir>/muted-<hash>', () => {
+        const dir = join(TMP, 'state', 'zeph');
+        expect(isMuted(TMP)).toBe(false);
+        writeFileSync(join(dir, `muted-${projectHash(TMP)}`), '');
+        expect(isMuted(TMP)).toBe(true);
+    });
+
+    it('isMuted honors a user-owned legacy /tmp mute file', () => {
         expect(isMuted(TMP)).toBe(false);
         writeFileSync(`/tmp/zeph-muted-${projectHash(TMP)}`, '');
         expect(isMuted(TMP)).toBe(true);
     });
 
     it('readPushMode reads the dial file, tolerating whitespace', () => {
+        const file = join(TMP, 'state', 'zeph', `pushmode-${projectHash(TMP)}`);
         expect(readPushMode(TMP)).toBe('normal');
+        writeFileSync(file, 'quiet\n');
+        expect(readPushMode(TMP)).toBe('quiet');
+        writeFileSync(file, ' loud ');
+        expect(readPushMode(TMP)).toBe('loud');
+        writeFileSync(file, 'banana');
+        expect(readPushMode(TMP)).toBe('normal');
+    });
+
+    it('readPushMode falls back to a user-owned legacy /tmp dial file', () => {
         writeFileSync(`/tmp/zeph-pushmode-${projectHash(TMP)}`, 'quiet\n');
         expect(readPushMode(TMP)).toBe('quiet');
-        writeFileSync(`/tmp/zeph-pushmode-${projectHash(TMP)}`, ' loud ');
-        expect(readPushMode(TMP)).toBe('loud');
-        writeFileSync(`/tmp/zeph-pushmode-${projectHash(TMP)}`, 'banana');
-        expect(readPushMode(TMP)).toBe('normal');
     });
 });

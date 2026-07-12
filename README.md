@@ -5,13 +5,23 @@
 [![node](https://img.shields.io/node/v/@zeph-to/cli.svg)](https://nodejs.org)
 [![license](https://img.shields.io/npm/l/@zeph-to/cli.svg)](./LICENSE)
 
-Push notification SDK + CLI for [Zeph](https://zeph.to), with an optional
-resident listener that **drives Claude Code / Codex / Gemini sessions
-from your phone** by injecting messages into named tmux sessions.
+Push notification SDK + CLI for [Zeph](https://zeph.to) — the terminal
+side of the round trip: your agent works, hits a decision, and asks your
+phone; you tap a button (or type a reply), and the answer lands back in
+the live session so the agent keeps going.
 
 - `ZephHook` SDK — native `fetch`, no runtime deps. Send/list/dismiss pushes.
-- `zeph` CLI — install Zeph plugins, send pushes, run agents under tmux,
-  and listen for inbound messages from your phone.
+- `zeph` CLI — one-command setup for 8 AI agents, push sending, and an
+  optional resident listener that **drives Claude Code / Codex / Gemini
+  sessions from your phone** by injecting messages into named tmux
+  sessions.
+
+Part of the Zeph toolchain:
+[`@zeph-to/mcp-server`](https://github.com/zeph-to/mcp-server) (the MCP
+tools your agent calls, e.g. `zeph_ask`) ·
+[`zeph-to/plugin`](https://github.com/zeph-to/plugin) (Claude Code plugin
+bundling hooks + MCP + rules) · the [Zeph app](https://zeph.to) on your
+phone.
 
 ## Installation
 
@@ -49,6 +59,11 @@ npx @zeph-to/cli install --key ak_... --hook hook_...
 Either way it saves to `~/.zeph/config.json`. All Zeph tools (CLI, MCP
 server, plugin hooks, listener) read this file.
 
+On a fresh machine `install` alone is enough: with no `--key` and no
+saved config it opens the same browser login automatically (headless
+boxes fall back to manual key entry). Pass `--only claude,cursor,…` to
+skip the interactive agent picker.
+
 To **send** notifications:
 
 ```bash
@@ -63,8 +78,8 @@ To **drive a Claude Code / Codex / Gemini session from your phone**, see
 > Send messages from your phone *into* a live Claude Code / Codex /
 > Gemini session — even after a `zeph_ask` polling window has expired.
 
-The MCP tools `zeph_ask` / `zeph_prompt` / `zeph_input` open a polling
-loop on a fixed timeout (120–600 s). Once that window closes the
+The MCP tools `zeph_ask` / `zeph_prompt` / `zeph_input` wait on a fixed
+timeout (120–600 s). Once that window closes the
 session becomes unaddressable from the phone, even though it's still
 running. The `zeph listener` daemon fixes this by keeping a persistent
 WebSocket open to Zeph and injecting matching messages into a *named*
@@ -293,7 +308,7 @@ zeph notify --title "Hello" --json
 | Command | Description |
 |---------|-------------|
 | `login` | Browser sign-in: auto-fetch API key + hook into `~/.zeph/config.json` over a localhost loopback (`--web-url`, `--timeout`). No copy-paste |
-| `install` | One-command setup: detect agents, save config, install rules + hooks + MCP |
+| `install` (alias: `setup`) | One-command setup: detect agents, save config, install rules + hooks + MCP. No saved config → opens browser login automatically. `--only claude,cursor,…` skips the picker |
 | `uninstall` | Remove Zeph from all detected agents (`--dry-run`, `--purge`) |
 | `verify` | Check installation health across detected agents (`--ping` for a live API call) |
 | `check-update` | Check whether a newer Zeph version is on npm |
@@ -314,6 +329,10 @@ zeph notify --title "Hello" --json
 | `--type <type>` | Push type: `note`, `link`, `file`, `hook` |
 | `--priority <p>` | Priority: `low`, `normal`, `high`, `urgent` |
 | `--device <id>` | Target device ID |
+| `--session <id>` | AI session ID so the push threads into that session's chat (or `ZEPH_SESSION_ID` env) |
+| `--auto` | Apply the push gate before sending — honors the `/zeph-quiet` / `/zeph-loud` push-mode dial; gated-out exits silently with code 0 |
+| `--marker <m>` | Push Signal marker for `--auto`: `skip`, `push`, `high` |
+| `--tools <n>`, `--nonreadonly <n>` | Turn tool counts feeding `--auto`'s heuristic (defaults assume real work) |
 
 The defaults are tuned for hook-driven invocations (e.g. Stop hooks
 calling `zeph notify --title "Task done"` without a body) — you'll see
@@ -326,6 +345,7 @@ which project + branch finished without writing per-IDE wrappers. Pass
 |------|-------------|
 | `--ws-url <url>` | WebSocket endpoint (or set `ZEPH_WS_URL` env, or `wsUrl` in `~/.zeph/config.json`) |
 | `--key <api-key>` | API key (or set `ZEPH_API_KEY` env) |
+| `--base-url <url>` | REST API base URL (or set `ZEPH_BASE_URL` env, or `baseUrl` in `~/.zeph/config.json`) |
 
 The listener reconnects with exponential backoff + jitter (1 s → 30 s
 cap). Heartbeat is ping every 25 s with a 10 s pong timeout. On an
@@ -454,11 +474,12 @@ try {
 |-------|-------------------|
 | Claude Code | Plugin (hooks + MCP server) |
 | Cursor | MCP server + stop hook + rules |
-| Windsurf | MCP server + response hook |
+| Windsurf | MCP server + response hook + rules |
 | Gemini CLI | MCP server + AfterAgent hook |
-| Codex CLI | Stop hook |
-| Copilot CLI | Session end hook |
-| Cline | Rules file |
+| Codex CLI | Stop hook + rules |
+| Copilot CLI | Session end hook + rules |
+| Cline | Rules file (`~/.cline/rules/zeph.md`) |
+| Aider | Conventions file + `read:` directive in `~/.aider.conf.yml` |
 
 For remote-control via `zeph listener` the per-agent setup is the same
 across CC/Codex/Gemini — the wrapper just spawns them in a named tmux

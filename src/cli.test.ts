@@ -6,7 +6,7 @@ import { join } from 'node:path';
 
 // CLI tests focus on the pure-logic pieces:
 //   - parseArgs: flag handling
-//   - isMuted: project-dir hash → /tmp/zeph-muted-<hash>
+//   - isMuted: project-dir hash → <stateDir>/muted-<hash> (legacy /tmp honored)
 //   - detectBranchAndProject: cwd basename + git branch (when in a git repo)
 //   - handleNotify auto-fill body when --body is omitted
 
@@ -101,7 +101,7 @@ describe('config.ts: load/save round-trip', () => {
 });
 
 describe('mute scope', () => {
-    it('mute file at /tmp/zeph-muted-<cksum(projectDir)> matches CLI expectations', async () => {
+    it('mute file keyed by cksum(projectDir) matches CLI expectations', async () => {
         // Pre-compute the cksum the CLI's isMuted helper would compute, and
         // create the corresponding mute file. Then spawn the CLI's `notify`
         // command — it should exit 0 without making any API call.

@@ -18,7 +18,9 @@
  *      (the B1 read-only floor).
  */
 import { execFileSync } from 'child_process';
-import { existsSync, readFileSync } from 'fs';
+import { existsSync, readFileSync, statSync } from 'fs';
+import { homedir } from 'os';
+import { join } from 'path';
 
 export type GateMarker = 'skip' | 'push' | 'high' | 'none';
 export type GatePushMode = 'quiet' | 'loud' | 'normal';
@@ -72,9 +74,36 @@ export const decidePush = (input: GateInput): GateVerdict => {
 
 // ── Per-project gate state (mute + push-mode dial) ───────────────
 //
-// The plugin's bash hooks key these tmp files off `cksum` of the project
-// dir; shelling out to the same `cksum` here (instead of a pure-TS CRC)
+// State lives under ${XDG_STATE_HOME:-~/.local/state}/zeph — a per-user
+// directory. It used to live at predictable names in world-writable /tmp,
+// where any local user could pre-create a victim's mute file (and sticky
+// /tmp makes that file un-deletable by the victim). Legacy /tmp files are
+// still honored during the migration window, but only when owned by the
+// current user, which neutralizes planted files.
+//
+// The plugin's bash hooks key these files off `cksum` of the project dir;
+// shelling out to the same `cksum` here (instead of a pure-TS CRC)
 // guarantees hash parity with every already-written file.
+
+export const stateDir = (): string =>
+  join(process.env.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'zeph');
+
+const ownedByCurrentUser = (path: string): boolean => {
+  try {
+    const st = statSync(path);
+    return typeof process.getuid !== 'function' || st.uid === process.getuid();
+  } catch {
+    return false;
+  }
+};
+
+/** Resolve a state file: current location first, then user-owned legacy /tmp. */
+const findStateFile = (kind: 'muted' | 'pushmode', hash: string): string | null => {
+  const current = join(stateDir(), `${kind}-${hash}`);
+  if (existsSync(current)) return current;
+  const legacy = `/tmp/zeph-${kind}-${hash}`;
+  return ownedByCurrentUser(legacy) ? legacy : null;
+};
 
 export const projectHash = (dir: string): string | null => {
   try {
@@ -88,15 +117,17 @@ export const projectHash = (dir: string): string | null => {
 /** True when the user ran /zeph-mute for this project. */
 export const isMuted = (dir: string): boolean => {
   const hash = projectHash(dir);
-  return hash !== null && existsSync(`/tmp/zeph-muted-${hash}`);
+  return hash !== null && findStateFile('muted', hash) !== null;
 };
 
 /** The user's session push-mode dial (/zeph-quiet | /zeph-loud), default normal. */
 export const readPushMode = (dir: string): GatePushMode => {
   const hash = projectHash(dir);
   if (!hash) return 'normal';
+  const file = findStateFile('pushmode', hash);
+  if (!file) return 'normal';
   try {
-    return normalizePushMode(readFileSync(`/tmp/zeph-pushmode-${hash}`, 'utf-8').replace(/\s+/g, ''));
+    return normalizePushMode(readFileSync(file, 'utf-8').replace(/\s+/g, ''));
   } catch {
     return 'normal';
   }
