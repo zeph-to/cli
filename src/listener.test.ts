@@ -671,6 +671,12 @@ describe('writeRemoteMarker (ADR-0002)', () => {
         expect(readFileSync(markerPath('/some/project'), 'utf-8')).toBe(`2000 ${digest}\n`);
     });
 
+    it('trims ASCII whitespace only — a trailing NBSP stays in the digest (bash parity)', () => {
+        writeRemoteMarker('/some/project', 'hello  \n', () => 1_000_000);
+        const digest = createHash('sha256').update('hello ').digest('hex');
+        expect(readFileSync(markerPath('/some/project'), 'utf-8')).toBe(`1000 ${digest}\n`);
+    });
+
     it('is written by handlePush after a successful text inject', async () => {
         const ok = await handlePush(
             { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-app', body: 'hello' },

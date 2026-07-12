@@ -920,9 +920,12 @@ export const writeRemoteMarker = (
     if (!hash) return false;
     try {
         mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
-        // trim() must mirror the hook's prompt trim — the terminal may
-        // normalize trailing whitespace between send-keys and the prompt.
-        const digest = createHash('sha256').update(text.trim()).digest('hex');
+        // Explicit ASCII-only trim, NOT String.trim() — trim() also strips
+        // Unicode whitespace (U+00A0 etc.) that the hook's bash-side trim
+        // keeps. Both sides must strip the exact same bytes: the hook
+        // (zeph-remote.sh) trims $' \t\r\n\f\v' and nothing else.
+        const trimmed = text.replace(/^[ \t\r\n\f\v]+|[ \t\r\n\f\v]+$/g, '');
+        const digest = createHash('sha256').update(trimmed).digest('hex');
         writeFileSync(join(stateDir(), `remote-${hash}`), `${Math.floor(now() / 1000)} ${digest}\n`);
         return true;
     } catch {
