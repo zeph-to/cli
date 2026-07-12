@@ -28,6 +28,7 @@ import { homedir, hostname, userInfo } from 'os';
 import { join, basename } from 'path';
 import WebSocket from 'ws';
 import { loadConfig, resolvedEnv } from './config.js';
+import { projectHash, stateDir } from './gate.js';
 import { matchAgentByPaneCommand, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 import { advanceState, evaluateState, findPatternMatch, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
@@ -877,6 +878,8 @@ interface HandlePushDeps {
     now?: () => number;
     /** Injectable for tests; defaults to the REST-backed downloader. */
     downloadAttachments?: (pushId: string, files: PushFileAttachment[]) => Promise<string[]>;
+    /** Pane cwd lookup for the remote-origin marker (ADR-0002). */
+    paneCwd?: (session: string) => string | null;
 }
 
 /**
@@ -901,6 +904,34 @@ const passesInjectGuards = (session: string, deps: HandlePushDeps): boolean => {
     return true;
 };
 
+/**
+ * Record a successful phone→pane text injection so the plugin's
+ * UserPromptSubmit hook can flag the matching prompt as remote-originated
+ * and enter sticky REMOTE mode (ADR-0002). One file per project dir,
+ * overwritten on every inject; the hook consumes it on an exact-text match.
+ * Best-effort: a write failure must never fail the injection itself.
+ */
+export const writeRemoteMarker = (
+    paneCwd: string,
+    text: string,
+    now: () => number = Date.now,
+): boolean => {
+    const hash = projectHash(paneCwd);
+    if (!hash) return false;
+    try {
+        mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+        // trim() must mirror the hook's prompt trim — the terminal may
+        // normalize trailing whitespace between send-keys and the prompt.
+        const digest = createHash('sha256').update(text.trim()).digest('hex');
+        writeFileSync(join(stateDir(), `remote-${hash}`), `${Math.floor(now() / 1000)} ${digest}\n`);
+        return true;
+    } catch {
+        return false;
+    }
+};
+
+const defaultPaneCwd = (session: string): string | null => readPaneInfo(session).currentPath;
+
 const tryInject = (session: string, text: string, deps: HandlePushDeps): boolean => {
     if (!text) {
         log(`! ${session}: empty text — drop`);
@@ -910,6 +941,10 @@ const tryInject = (session: string, text: string, deps: HandlePushDeps): boolean
     const ok = (deps.inject ?? injectKeys)(session, text);
     const preview = text.length > 60 ? text.slice(0, 60) + '…' : text;
     log(`${ok ? '→' : '✗'} ${session}: ${preview}`);
+    if (ok) {
+        const cwd = (deps.paneCwd ?? defaultPaneCwd)(session);
+        if (cwd) writeRemoteMarker(cwd, text);
+    }
     return ok;
 };
 

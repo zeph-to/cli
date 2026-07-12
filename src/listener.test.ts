@@ -1,9 +1,12 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, existsSync, utimesSync } from 'fs';
+import { createHash } from 'crypto';
+import { mkdirSync, mkdtempSync, existsSync, readFileSync, rmSync, utimesSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { projectHash } from './gate.js';
 import {
     parseSessionName,
+    writeRemoteMarker,
     checkRateLimit,
     handlePush,
     resolveKeys,
@@ -64,6 +67,9 @@ describe('handlePush', () => {
         paneCommand: () => 'claude',
         inject: () => true,
         rateLimit: () => true,
+        // null cwd keeps the remote-marker write (and its tmux lookup) out
+        // of tests that don't assert on it.
+        paneCwd: () => null,
         ...override,
     });
 
@@ -629,5 +635,73 @@ describe('pattern watches (§S5 v2)', () => {
     it('handles unreadable panes gracefully', () => {
         setPatternWatches([{ sessionName: 'zeph-a', pattern: 'x' }]);
         expect(collectWatchHits(new Set(['zeph-a']), () => null)).toEqual([]);
+    });
+});
+
+describe('writeRemoteMarker (ADR-0002)', () => {
+    let stateHome: string;
+    let savedXdg: string | undefined;
+
+    beforeEach(() => {
+        stateHome = mkdtempSync(join(tmpdir(), 'zeph-remote-'));
+        savedXdg = process.env.XDG_STATE_HOME;
+        process.env.XDG_STATE_HOME = stateHome;
+    });
+
+    afterEach(() => {
+        if (savedXdg === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = savedXdg;
+        rmSync(stateHome, { recursive: true, force: true });
+    });
+
+    const markerPath = (cwd: string): string =>
+        join(stateHome, 'zeph', `remote-${projectHash(cwd)!}`);
+
+    it('writes "<epochSec> <sha256(trimmed text)>\\n" keyed by cksum of the cwd', () => {
+        const ok = writeRemoteMarker('/some/project', 'fix the bug\n', () => 1_700_000_000_000);
+        expect(ok).toBe(true);
+        const expected = createHash('sha256').update('fix the bug').digest('hex');
+        expect(readFileSync(markerPath('/some/project'), 'utf-8')).toBe(`1700000000 ${expected}\n`);
+    });
+
+    it('overwrites the previous marker for the same cwd', () => {
+        writeRemoteMarker('/some/project', 'first', () => 1_000_000);
+        writeRemoteMarker('/some/project', 'second', () => 2_000_000);
+        const digest = createHash('sha256').update('second').digest('hex');
+        expect(readFileSync(markerPath('/some/project'), 'utf-8')).toBe(`2000 ${digest}\n`);
+    });
+
+    it('is written by handlePush after a successful text inject', async () => {
+        const ok = await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-app', body: 'hello' },
+            { paneCommand: () => 'claude', inject: () => true, rateLimit: () => true, paneCwd: () => '/proj/app' },
+        );
+        expect(ok).toBe(true);
+        expect(existsSync(markerPath('/proj/app'))).toBe(true);
+    });
+
+    it('is NOT written when the inject fails', async () => {
+        await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-app', body: 'hello' },
+            { paneCommand: () => 'claude', inject: () => false, rateLimit: () => true, paneCwd: () => '/proj/failed' },
+        );
+        expect(existsSync(markerPath('/proj/failed'))).toBe(false);
+    });
+
+    it('is NOT written for key-event injections (no prompt to match)', async () => {
+        const ok = await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-app', keys: ['Enter'] },
+            { paneCommand: () => 'claude', sendKeys: () => true, rateLimit: () => true, paneCwd: () => '/proj/keys' },
+        );
+        expect(ok).toBe(true);
+        expect(existsSync(markerPath('/proj/keys'))).toBe(false);
+    });
+
+    it('skips silently when the pane cwd is unknown', async () => {
+        const ok = await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-app', body: 'hello' },
+            { paneCommand: () => 'claude', inject: () => true, rateLimit: () => true, paneCwd: () => null },
+        );
+        expect(ok).toBe(true);
     });
 });
