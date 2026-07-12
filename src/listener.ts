@@ -28,7 +28,7 @@ import { homedir, hostname, userInfo } from 'os';
 import { join, basename } from 'path';
 import WebSocket from 'ws';
 import { loadConfig, resolvedEnv } from './config.js';
-import { projectHash, stateDir } from './gate.js';
+import { projectHash, remoteDigest, remoteMarkerPath, stateDir } from './gate.js';
 import { matchAgentByPaneCommand, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 import { advanceState, evaluateState, findPatternMatch, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
@@ -905,9 +905,10 @@ const passesInjectGuards = (session: string, deps: HandlePushDeps): boolean => {
 };
 
 /**
- * Record a successful phone→pane text injection so the plugin's
- * UserPromptSubmit hook can flag the matching prompt as remote-originated
- * and enter sticky REMOTE mode (ADR-0002). One file per project dir,
+ * Record a successful phone→pane text injection so a prompt-submit hook
+ * (Claude Code plugin's zeph-remote.sh, or `zeph remote-hook` for
+ * Gemini/Codex) can flag the matching prompt as remote-originated and
+ * enter sticky REMOTE mode (ADR-0002). One file per project dir,
  * overwritten on every inject; the hook consumes it on an exact-text match.
  * Best-effort: a write failure must never fail the injection itself.
  */
@@ -920,13 +921,7 @@ export const writeRemoteMarker = (
     if (!hash) return false;
     try {
         mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
-        // Explicit ASCII-only trim, NOT String.trim() — trim() also strips
-        // Unicode whitespace (U+00A0 etc.) that the hook's bash-side trim
-        // keeps. Both sides must strip the exact same bytes: the hook
-        // (zeph-remote.sh) trims $' \t\r\n\f\v' and nothing else.
-        const trimmed = text.replace(/^[ \t\r\n\f\v]+|[ \t\r\n\f\v]+$/g, '');
-        const digest = createHash('sha256').update(trimmed).digest('hex');
-        writeFileSync(join(stateDir(), `remote-${hash}`), `${Math.floor(now() / 1000)} ${digest}\n`);
+        writeFileSync(remoteMarkerPath(hash), `${Math.floor(now() / 1000)} ${remoteDigest(text)}\n`);
         return true;
     } catch {
         return false;

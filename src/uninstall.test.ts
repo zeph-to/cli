@@ -159,3 +159,51 @@ describe('handleUninstall — Aider conf.yml', () => {
         expect(result).not.toContain('read:');
     });
 });
+
+describe('rmGeminiHook — zeph-* entries only', () => {
+    it('removes zeph-remote (BeforeAgent) and zeph-notify (AfterAgent), keeps user hooks', async () => {
+        const settings = write('.gemini/settings.json', JSON.stringify({
+            hooks: {
+                BeforeAgent: [
+                    { matcher: '*', hooks: [{ name: 'zeph-remote', type: 'command', command: 'zeph remote-hook gemini' }] },
+                ],
+                AfterAgent: [
+                    { matcher: '*', hooks: [{ name: 'zeph-notify', type: 'command', command: 'zeph notify' }] },
+                    { matcher: '*', hooks: [{ name: 'my-own', type: 'command', command: 'echo mine' }] },
+                ],
+                BeforeTool: [
+                    { matcher: 'grep', hooks: [{ type: 'command', command: 'echo reminder' }] },
+                ],
+            },
+        }));
+        const { rmGeminiHook } = await import('./uninstall.js');
+        expect(rmGeminiHook(settings, false)).toBeTruthy();
+
+        const data = JSON.parse(readFileSync(settings, 'utf-8'));
+        expect(data.hooks).not.toHaveProperty('BeforeAgent');
+        expect(data.hooks.AfterAgent).toHaveLength(1);
+        expect(data.hooks.AfterAgent[0].hooks[0].name).toBe('my-own');
+        expect(data.hooks).toHaveProperty('BeforeTool');
+    });
+
+    it('dry-run reports but changes nothing', async () => {
+        const settings = write('.gemini/settings.json', JSON.stringify({
+            hooks: {
+                BeforeAgent: [{ hooks: [{ name: 'zeph-remote', type: 'command', command: 'x' }] }],
+            },
+        }));
+        const { rmGeminiHook } = await import('./uninstall.js');
+        expect(rmGeminiHook(settings, true)).toBeTruthy();
+        expect(JSON.parse(readFileSync(settings, 'utf-8')).hooks).toHaveProperty('BeforeAgent');
+    });
+
+    it('nothing of ours → null, file untouched', async () => {
+        const original = JSON.stringify({
+            hooks: { BeforeTool: [{ hooks: [{ type: 'command', command: 'echo hi' }] }] },
+        });
+        const settings = write('.gemini/settings.json', original);
+        const { rmGeminiHook } = await import('./uninstall.js');
+        expect(rmGeminiHook(settings, false)).toBeNull();
+        expect(readFileSync(settings, 'utf-8')).toBe(original);
+    });
+});

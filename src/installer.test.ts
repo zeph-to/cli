@@ -103,6 +103,57 @@ describe('templates.ts: NOTIFY_CMD shape', () => {
         const { CODEX_HOOKS } = await import('./templates.js');
         expect(JSON.parse(CODEX_HOOKS)).toHaveProperty('hooks.Stop');
     });
+
+    // Codex parses hooks.json with serde deny_unknown_fields at the top level
+    // and a `type`-tagged handler enum inside matcher groups
+    // (codex-rs/config/src/hook_config.rs) — the old flat
+    // `{version, hooks: {Stop: [{type, bash}]}}` shape made codex reject the
+    // whole file.
+    it('CODEX_HOOKS matches the strict codex schema (matcher groups, no version/bash)', async () => {
+        const { CODEX_HOOKS } = await import('./templates.js');
+        const parsed = JSON.parse(CODEX_HOOKS);
+        expect(Object.keys(parsed)).toEqual(['hooks']);
+        for (const event of ['UserPromptSubmit', 'Stop']) {
+            for (const group of parsed.hooks[event]) {
+                for (const handler of group.hooks) {
+                    expect(handler.type).toBe('command');
+                    expect(typeof handler.command).toBe('string');
+                    expect(handler).not.toHaveProperty('bash');
+                }
+            }
+        }
+        expect(parsed.hooks.UserPromptSubmit[0].hooks[0].command).toContain('remote-hook codex');
+    });
+
+    it('GEMINI_HOOKS registers BeforeAgent remote detection alongside AfterAgent notify', async () => {
+        const { GEMINI_HOOKS } = await import('./templates.js');
+        expect(GEMINI_HOOKS.hooks.BeforeAgent[0].hooks[0].name).toBe('zeph-remote');
+        expect(GEMINI_HOOKS.hooks.BeforeAgent[0].hooks[0].command).toContain('remote-hook gemini');
+        expect(GEMINI_HOOKS.hooks.AfterAgent[0].hooks[0].name).toBe('zeph-notify');
+    });
+});
+
+describe('mergeJsonFile — hooks-level merge', () => {
+    it('preserves user-owned hook events while updating zeph entries', async () => {
+        const file = join(TMP, '.gemini', 'settings.json');
+        mkdirSync(join(TMP, '.gemini'), { recursive: true });
+        writeFileSync(file, JSON.stringify({
+            security: { auth: { selectedType: 'gemini-api-key' } },
+            hooks: {
+                BeforeTool: [{ matcher: 'grep', hooks: [{ type: 'command', command: 'echo mine' }] }],
+                AfterAgent: [{ hooks: [{ name: 'stale-zeph', type: 'command', command: 'old' }] }],
+            },
+        }));
+        const { mergeJsonFile } = await import('./installer.js');
+        const { GEMINI_HOOKS } = await import('./templates.js');
+        mergeJsonFile(file, GEMINI_HOOKS as unknown as Record<string, unknown>);
+
+        const out = JSON.parse(readFileSync(file, 'utf-8'));
+        expect(out.security.auth.selectedType).toBe('gemini-api-key');
+        expect(out.hooks).toHaveProperty('BeforeTool');
+        expect(out.hooks.BeforeAgent[0].hooks[0].name).toBe('zeph-remote');
+        expect(out.hooks.AfterAgent[0].hooks[0].name).toBe('zeph-notify');
+    });
 });
 
 describe('plugin/.mcp.json consistency', () => {

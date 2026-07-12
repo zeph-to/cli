@@ -106,6 +106,25 @@ The listener also reports its tmux session inventory back to the server
 every 5 seconds, so the phone picker stays in sync — no manual
 configuration needed once a session is running.
 
+### Remote-origin detection (sticky REMOTE mode)
+
+A message injected via `send-keys` is indistinguishable from typing — so
+the listener also records each injection as a one-shot marker (epoch +
+sha256 of the text, keyed by the pane's project dir). A prompt-submit
+hook on the agent side matches the submitted prompt against that marker
+and, on an exact match, tells the model the user is driving the session
+from their phone — entering sticky REMOTE mode (every response ends with
+an answerable `zeph_ask`).
+
+| Agent | Hook | Installed by |
+|-------|------|--------------|
+| Claude Code | `UserPromptSubmit` → plugin's `zeph-remote.sh` | Zeph plugin |
+| Gemini CLI | `BeforeAgent` → `zeph remote-hook gemini` | `zeph setup` |
+| Codex CLI | `UserPromptSubmit` → `zeph remote-hook codex` | `zeph setup` |
+
+Detection is exact-match: a terminal keystroke racing a phone message
+can never false-flag. Muted projects are never flagged.
+
 ### Setup
 
 1. **Install tmux.** The listener uses `send-keys`; the wrapper spawns

@@ -78,8 +78,10 @@ const rmAiderReadDirective = (confPath: string, dry: boolean): string | null => 
     return `${verb(dry)} Zeph read: directive from ${confPath}`;
 };
 
-/** Remove just the zeph-notify entry from Gemini's settings.json. */
-const rmGeminiHook = (filePath: string, dry: boolean): string | null => {
+/** Remove just the zeph-* entries (zeph-notify, zeph-remote) from Gemini's
+ *  settings.json. Exported for tests (gemini is PATH-detected, so the
+ *  full-uninstall suite can't reach this deterministically). */
+export const rmGeminiHook = (filePath: string, dry: boolean): string | null => {
     if (!existsSync(filePath)) return null;
     let data: Record<string, unknown>;
     try {
@@ -88,21 +90,24 @@ const rmGeminiHook = (filePath: string, dry: boolean): string | null => {
         return null;
     }
     const hooks = data.hooks as Record<string, unknown> | undefined;
-    const afterAgent = hooks?.AfterAgent as Array<{ hooks?: Array<{ name?: string }> }> | undefined;
-    if (!Array.isArray(afterAgent)) return null;
-    const kept = afterAgent.filter(
-        (entry) => !(entry.hooks ?? []).some((h) => h.name === 'zeph-notify'),
-    );
-    if (kept.length === afterAgent.length) return null; // nothing of ours
-    if (!dry) {
-        if (kept.length === 0) {
-            delete (hooks as Record<string, unknown>).AfterAgent;
-        } else {
-            (hooks as Record<string, unknown>).AfterAgent = kept;
+    if (!hooks) return null;
+    let removed = false;
+    for (const event of ['AfterAgent', 'BeforeAgent']) {
+        const groups = hooks[event] as Array<{ hooks?: Array<{ name?: string }> }> | undefined;
+        if (!Array.isArray(groups)) continue;
+        const kept = groups.filter(
+            (entry) => !(entry.hooks ?? []).some((h) => h.name?.startsWith('zeph-')),
+        );
+        if (kept.length === groups.length) continue; // nothing of ours
+        removed = true;
+        if (!dry) {
+            if (kept.length === 0) delete hooks[event];
+            else hooks[event] = kept;
         }
-        writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n');
     }
-    return `${verb(dry)} zeph-notify hook from ${filePath}`;
+    if (!removed) return null;
+    if (!dry) writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n');
+    return `${verb(dry)} zeph hooks from ${filePath}`;
 };
 
 // ── Per-agent uninstallers ───────────────────────────────────────

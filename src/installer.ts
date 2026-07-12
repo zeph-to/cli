@@ -57,12 +57,24 @@ const writeFile = (filePath: string, content: string): void => {
   writeFileSync(filePath, content + '\n');
 };
 
-const mergeJsonFile = (filePath: string, patch: Record<string, unknown>): void => {
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/** Exported for tests (installGemini shells out to the real `gemini` binary,
+ *  so the merge semantics can't be covered through it deterministically). */
+export const mergeJsonFile = (filePath: string, patch: Record<string, unknown>): void => {
   let data: Record<string, unknown> = {};
   try {
     data = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
   } catch { /* new file */ }
   const merged = { ...data, ...patch };
+  // `hooks` maps event names the user may own (their own BeforeTool etc.
+  // in Gemini's settings.json) — merge that level instead of clobbering
+  // the whole object. Same-named events still take the patch's value,
+  // which keeps re-runs idempotent for zeph's own entries.
+  if (isPlainObject(data.hooks) && isPlainObject(patch.hooks)) {
+    merged.hooks = { ...data.hooks, ...patch.hooks };
+  }
   writeFile(filePath, JSON.stringify(merged, null, 2));
 };
 
