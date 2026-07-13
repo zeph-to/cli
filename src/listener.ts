@@ -51,12 +51,22 @@ const WS_CONNECT_TIMEOUT_MS = 20_000;
 // surface this way. Force-terminate so the reconnect loop runs.
 const WS_STALL_TIMEOUT_MS = 90_000;
 
-// How often the listener reports its tmux session inventory to the
-// backend (in addition to immediately on $connect). Cheap — tmux runs
-// locally, the payload is small, and the user expects the phone picker
-// to reflect new `zeph cc` sessions within a few seconds, not half a
-// minute.
+// How often the listener POLLS its local tmux session inventory (and
+// immediately on $connect). Cheap — tmux runs locally, so a change is
+// still detected (and sent) within a few seconds.
 const SESSION_REPORT_INTERVAL_MS = 5_000;
+
+// How often an UNCHANGED inventory is re-sent. Every send costs the
+// backend a Lambda invocation + several DynamoDB reads + a WS round
+// trip, and an idle listener's reports are ~95% no-ops — the dominant
+// per-user variable cost. A changed inventory still goes out on the
+// next 5 s poll (no latency loss); this only throttles the no-ops.
+// Kept above the server's 20 s write-through window
+// (AGENT_SESSIONS_REFRESH_MS) so each heartbeat also refreshes
+// agentSessionsUpdatedAt. Side effect: the ack (which carries pattern
+// watches) arrives at this cadence while idle, so a newly-created
+// watch can take up to 30 s to reach an idle listener.
+export const SESSION_REPORT_HEARTBEAT_MS = 30_000;
 
 interface AgentSession {
     name: string;
@@ -77,6 +87,35 @@ interface AgentSession {
     stateChangedAt?: string;
     stateRuleId?: string;
 }
+
+/**
+ * Change-fingerprint for the report gate. Mirrors the server's
+ * REPORTED_SESSION_FIELDS comparison (zeph ws.ts sameReportedSessions):
+ * same fields, order-independent, undefined/null collapsed — so the
+ * client-side skip can never suppress a report the server would have
+ * treated as a change. Keep the field list in sync with the server.
+ */
+export const sessionsFingerprint = (sessions: AgentSession[]): string =>
+    sessions
+        .map((s) => JSON.stringify([
+            s.name, s.attached, s.agentKind, s.agentSessionId ?? null,
+            s.project, s.label ?? null, s.createdAt ?? null,
+            s.lastActivityAt ?? null, s.state ?? null,
+            s.stateChangedAt ?? null, s.stateRuleId ?? null,
+        ]))
+        .sort()
+        .join('|');
+
+/** True when this cycle's inventory must be sent: it changed, or the
+ *  idle heartbeat is due. */
+export const sessionsReportDue = (
+    fingerprint: string,
+    lastSentFingerprint: string | null,
+    lastSentAtMs: number,
+    nowMs: number,
+): boolean =>
+    fingerprint !== lastSentFingerprint ||
+    nowMs - lastSentAtMs >= SESSION_REPORT_HEARTBEAT_MS;
 
 // Per-session token bucket — caps a runaway/compromised sender. 30/min
 // is generous for human-driven phone use, tight enough to block flooding.
@@ -1233,21 +1272,37 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             }
         }, WS_CONNECT_TIMEOUT_MS);
 
+        // Report gate state — per connection on purpose: a fresh socket
+        // must always send its first inventory (the server may have
+        // nothing, or another listener's stale data, for this device).
+        let lastSentFingerprint: string | null = null;
+        let lastSentAtMs = 0;
+
         const reportSessions = (): void => {
             if (sock.readyState !== WebSocket.OPEN) return;
             const { sessions, rejected } = collectSessionsVerbose();
-            sock.send(JSON.stringify({ type: 'listener.sessions', data: { sessions } }));
-            // Output-match watches (§S5 v2): probe watched panes and
-            // report hits. One-shot per watch; the server consumes the
-            // record and the next ack prunes it locally.
+            // Watch hits are one-shot events — they go out on every poll,
+            // independent of the sessions-report gate below.
+            // (§S5 v2): probe watched panes and report hits; the server
+            // consumes the record and the next ack prunes it locally.
             for (const hit of collectWatchHits(new Set(sessions.map((s) => s.name)))) {
                 sock.send(JSON.stringify({ type: 'listener.watch.hit', data: hit }));
                 log(`🔔 watch hit: ${hit.sessionName} ~ /${hit.pattern}/`);
             }
-            // One line per cycle gives the user immediate feedback on
+            // Unchanged inventory + heartbeat not due → skip the send.
+            // The 5 s local poll above still ran, so a change is never
+            // delayed; only the no-op reports (idle listener) are culled.
+            const fingerprint = sessionsFingerprint(sessions);
+            if (!sessionsReportDue(fingerprint, lastSentFingerprint, lastSentAtMs, Date.now())) {
+                return;
+            }
+            sock.send(JSON.stringify({ type: 'listener.sessions', data: { sessions } }));
+            lastSentFingerprint = fingerprint;
+            lastSentAtMs = Date.now();
+            // One line per send gives the user immediate feedback on
             // what the phone picker will see — particularly important
             // during setup, when an empty picker has no other observable
-            // cause.
+            // cause. (Skipped cycles stay quiet — same signal, less noise.)
             const names = sessions
                 .map((s) => (s.state ? `${s.name}[${s.state}]` : s.name))
                 .join(', ') || '∅';
