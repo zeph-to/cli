@@ -102,9 +102,12 @@ tmux session via `tmux send-keys`.
 [tmux session "zeph-myapp" running claude / codex / gemini]
 ```
 
-The listener also reports its tmux session inventory back to the server
-every 5 seconds, so the phone picker stays in sync — no manual
-configuration needed once a session is running.
+The listener polls its tmux session inventory every 5 seconds and
+reports it to the server whenever something changed (new session, agent
+state transition, activity) — an unchanged inventory is re-sent only as
+a 30-second idle heartbeat. The phone picker stays in sync with no
+manual configuration, and an idle listener costs the backend a fraction
+of what a fixed 5-second report cycle would.
 
 ### Remote-origin detection (sticky REMOTE mode)
 

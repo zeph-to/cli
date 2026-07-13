@@ -10,6 +10,9 @@ import {
     checkRateLimit,
     handlePush,
     resolveKeys,
+    sessionsFingerprint,
+    sessionsReportDue,
+    SESSION_REPORT_HEARTBEAT_MS,
     gcAttachments,
     computeBackoff,
     AUTH_FAILURE_CODES,
@@ -709,5 +712,48 @@ describe('writeRemoteMarker (ADR-0002)', () => {
             { paneCommand: () => 'claude', inject: () => true, rateLimit: () => true, paneCwd: () => null },
         );
         expect(ok).toBe(true);
+    });
+});
+
+describe('sessions report gate (idle-cost throttle)', () => {
+    const base = {
+        name: 'zeph-app',
+        attached: false,
+        agentKind: 'claude',
+        project: 'app',
+    };
+
+    it('order-independent, undefined/null collapsed — mirrors server sameReportedSessions', () => {
+        const a = sessionsFingerprint([
+            { ...base, label: undefined } as never,
+            { ...base, name: 'zeph-api' } as never,
+        ]);
+        const b = sessionsFingerprint([
+            { ...base, name: 'zeph-api' } as never,
+            { ...base, label: null } as never,
+        ]);
+        expect(a).toBe(b);
+    });
+
+    it('state transition changes the fingerprint', () => {
+        const idle = sessionsFingerprint([{ ...base, state: 'idle' } as never]);
+        const working = sessionsFingerprint([{ ...base, state: 'working' } as never]);
+        expect(idle).not.toBe(working);
+    });
+
+    it('changed inventory is due immediately', () => {
+        expect(sessionsReportDue('fp-new', 'fp-old', 1_000, 2_000)).toBe(true);
+    });
+
+    it('unchanged inventory inside the heartbeat window is skipped', () => {
+        expect(sessionsReportDue('fp', 'fp', 0, SESSION_REPORT_HEARTBEAT_MS - 1)).toBe(false);
+    });
+
+    it('unchanged inventory is re-sent once the heartbeat is due', () => {
+        expect(sessionsReportDue('fp', 'fp', 0, SESSION_REPORT_HEARTBEAT_MS)).toBe(true);
+    });
+
+    it('first report of a connection (no fingerprint yet) always sends', () => {
+        expect(sessionsReportDue('fp', null, 0, 1)).toBe(true);
     });
 });
