@@ -18,6 +18,7 @@
  *      (the B1 read-only floor).
  */
 import { execFileSync } from 'child_process';
+import { createHash } from 'crypto';
 import { existsSync, readFileSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
@@ -113,6 +114,29 @@ export const projectHash = (dir: string): string | null => {
     return null;
   }
 };
+
+// ── Remote-origin marker (ADR-0002) ──────────────────────────────
+//
+// The listener records every phone→pane text injection as a one-shot
+// marker file; a prompt-submit hook (Claude Code plugin's zeph-remote.sh,
+// or `zeph remote-hook` for Gemini/Codex) consumes it on an exact-text
+// match and flags the prompt as remote-originated. Writer and TS reader
+// share these two helpers so their bytes can never diverge; the bash
+// reader is held to the same semantics by the plugin's test suite.
+
+/** Marker path for a project hash: `<stateDir>/remote-<cksum(projectDir)>`. */
+export const remoteMarkerPath = (hash: string): string => join(stateDir(), `remote-${hash}`);
+
+/**
+ * sha256 over the ASCII-only-trimmed text — recorded at inject time,
+ * recomputed at prompt submit. Trim strips ONLY ' \t\r\n\f\v', NOT
+ * String.trim(): trim() also eats Unicode whitespace (U+00A0 etc.) that
+ * the bash reader keeps, and both sides must hash identical bytes.
+ */
+export const remoteDigest = (text: string): string =>
+  createHash('sha256')
+    .update(text.replace(/^[ \t\r\n\f\v]+|[ \t\r\n\f\v]+$/g, ''))
+    .digest('hex');
 
 /** True when the user ran /zeph-mute for this project. */
 export const isMuted = (dir: string): boolean => {

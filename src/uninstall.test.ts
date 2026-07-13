@@ -159,3 +159,96 @@ describe('handleUninstall — Aider conf.yml', () => {
         expect(result).not.toContain('read:');
     });
 });
+
+describe('rmGeminiHook — zeph-* entries only', () => {
+    it('removes zeph-remote (BeforeAgent) and zeph-notify (AfterAgent), keeps user hooks', async () => {
+        const settings = write('.gemini/settings.json', JSON.stringify({
+            hooks: {
+                BeforeAgent: [
+                    { matcher: '*', hooks: [{ name: 'zeph-remote', type: 'command', command: 'zeph remote-hook gemini' }] },
+                ],
+                AfterAgent: [
+                    { matcher: '*', hooks: [{ name: 'zeph-notify', type: 'command', command: 'zeph notify' }] },
+                    { matcher: '*', hooks: [{ name: 'my-own', type: 'command', command: 'echo mine' }] },
+                ],
+                BeforeTool: [
+                    { matcher: 'grep', hooks: [{ type: 'command', command: 'echo reminder' }] },
+                ],
+            },
+        }));
+        const { rmGeminiHook } = await import('./uninstall.js');
+        expect(rmGeminiHook(settings, false)).toBeTruthy();
+
+        const data = JSON.parse(readFileSync(settings, 'utf-8'));
+        expect(data.hooks).not.toHaveProperty('BeforeAgent');
+        expect(data.hooks.AfterAgent).toHaveLength(1);
+        expect(data.hooks.AfterAgent[0].hooks[0].name).toBe('my-own');
+        expect(data.hooks).toHaveProperty('BeforeTool');
+    });
+
+    it('dry-run reports but changes nothing', async () => {
+        const settings = write('.gemini/settings.json', JSON.stringify({
+            hooks: {
+                BeforeAgent: [{ hooks: [{ name: 'zeph-remote', type: 'command', command: 'x' }] }],
+            },
+        }));
+        const { rmGeminiHook } = await import('./uninstall.js');
+        expect(rmGeminiHook(settings, true)).toBeTruthy();
+        expect(JSON.parse(readFileSync(settings, 'utf-8')).hooks).toHaveProperty('BeforeAgent');
+    });
+
+    it('nothing of ours → null, file untouched', async () => {
+        const original = JSON.stringify({
+            hooks: { BeforeTool: [{ hooks: [{ type: 'command', command: 'echo hi' }] }] },
+        });
+        const settings = write('.gemini/settings.json', original);
+        const { rmGeminiHook } = await import('./uninstall.js');
+        expect(rmGeminiHook(settings, false)).toBeNull();
+        expect(readFileSync(settings, 'utf-8')).toBe(original);
+    });
+});
+
+describe('rmCodexHook — command-substring ownership (codex handlers have no name field)', () => {
+    it('removes zeph groups, keeps user events, keeps the file when user content remains', async () => {
+        const hooks = write('.codex/hooks.json', JSON.stringify({
+            hooks: {
+                UserPromptSubmit: [
+                    { hooks: [{ type: 'command', command: '$(command -v zeph || echo "npx -y @zeph-to/cli") remote-hook codex 2>/dev/null || true', timeout: 5 }] },
+                ],
+                Stop: [
+                    { hooks: [{ type: 'command', command: '$(command -v zeph || echo "npx -y @zeph-to/cli") notify --title "Task done" --auto 2>/dev/null || true' }] },
+                    { hooks: [{ type: 'command', command: 'echo my own stop hook' }] },
+                ],
+            },
+        }));
+        const { rmCodexHook } = await import('./uninstall.js');
+        expect(rmCodexHook(hooks, false)).toBeTruthy();
+
+        const data = JSON.parse(readFileSync(hooks, 'utf-8'));
+        expect(data.hooks).not.toHaveProperty('UserPromptSubmit');
+        expect(data.hooks.Stop).toHaveLength(1);
+        expect(data.hooks.Stop[0].hooks[0].command).toBe('echo my own stop hook');
+    });
+
+    it('deletes the file outright when nothing but zeph entries existed', async () => {
+        const hooks = write('.codex/hooks.json', JSON.stringify({
+            hooks: {
+                Stop: [{ hooks: [{ type: 'command', command: 'npx -y @zeph-to/cli notify' }] }],
+            },
+        }));
+        const { rmCodexHook } = await import('./uninstall.js');
+        expect(rmCodexHook(hooks, false)).toBeTruthy();
+        expect(existsSync(hooks)).toBe(false);
+    });
+
+    it('dry-run changes nothing', async () => {
+        const hooks = write('.codex/hooks.json', JSON.stringify({
+            hooks: {
+                Stop: [{ hooks: [{ type: 'command', command: 'npx -y @zeph-to/cli notify' }] }],
+            },
+        }));
+        const { rmCodexHook } = await import('./uninstall.js');
+        expect(rmCodexHook(hooks, true)).toBeTruthy();
+        expect(JSON.parse(readFileSync(hooks, 'utf-8')).hooks).toHaveProperty('Stop');
+    });
+});

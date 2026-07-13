@@ -13,6 +13,7 @@ import { handleListener } from './listener.js';
 import { detectProjectDir, loadConfig, resolvedEnv, VERSION } from './config.js';
 import { decidePush, GATE_DEFAULTS, isMuted, normalizeMarker, readPushMode } from './gate.js';
 import { findAgentBySubcommand, REMOTE_AGENTS } from './remote-agents.js';
+import { isRemoteHookAgent, runRemoteHook } from './remote-hook.js';
 
 const detectBranchAndProject = (): { branch?: string; project: string } => {
   const dir = detectProjectDir();
@@ -180,6 +181,27 @@ const createHook = (args: Record<string, string | boolean>): ZephHook | null => 
 const gateCount = (raw: string | boolean | undefined, fallback: number): number => {
   const n = typeof raw === 'string' ? Number(raw) : NaN;
   return Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+
+/**
+ * Internal — invoked by the Gemini/Codex prompt-submit hooks that
+ * `zeph setup` registers, never typed by users (hence absent from help).
+ * Reads the hook JSON on stdin; prints additionalContext JSON on a match
+ * (remote-origin detection, ADR-0002). Always exits 0: the hook only adds
+ * context and must never block a prompt.
+ */
+const handleRemoteHook = async (args: Record<string, string | boolean>): Promise<number> => {
+  const agent = args._arg1 as string;
+  if (!isRemoteHookAgent(agent)) return 0;
+  try {
+    let stdin = '';
+    for await (const chunk of process.stdin) stdin += chunk;
+    const out = runRemoteHook(agent, stdin);
+    if (out) console.log(out);
+  } catch {
+    /* never block a prompt */
+  }
+  return 0;
 };
 
 const handleNotify = async (args: Record<string, string | boolean>): Promise<number> => {
@@ -405,6 +427,8 @@ const main = async (): Promise<number> => {
       return handleTest(args);
     case 'listener':
       return handleListener(args);
+    case 'remote-hook':
+      return handleRemoteHook(args);
     default:
       printError(`Unknown command: ${command}`, args.json === true);
       printUsage();

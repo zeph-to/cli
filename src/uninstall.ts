@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { detectAgents } from './agents.js';
-import { removeManagedBlock } from './templates.js';
+import { isZephHookGroup, removeManagedBlock } from './templates.js';
 import { CONFIG_FILE, VERSION } from './config.js';
 
 const HOME = homedir();
@@ -78,8 +78,33 @@ const rmAiderReadDirective = (confPath: string, dry: boolean): string | null => 
     return `${verb(dry)} Zeph read: directive from ${confPath}`;
 };
 
-/** Remove just the zeph-notify entry from Gemini's settings.json. */
-const rmGeminiHook = (filePath: string, dry: boolean): string | null => {
+/**
+ * Filter zeph-written matcher groups out of `data.hooks` (all events).
+ * Mutates `data` unless dry; returns true when anything of ours was found.
+ * Empty events are deleted so a clean file stays clean.
+ */
+const stripZephHookGroups = (data: Record<string, unknown>, dry: boolean): boolean => {
+    const hooks = data.hooks as Record<string, unknown> | undefined;
+    if (!hooks) return false;
+    let removed = false;
+    for (const event of Object.keys(hooks)) {
+        const groups = hooks[event];
+        if (!Array.isArray(groups)) continue;
+        const kept = groups.filter((g) => !isZephHookGroup(g));
+        if (kept.length === groups.length) continue; // nothing of ours
+        removed = true;
+        if (!dry) {
+            if (kept.length === 0) delete hooks[event];
+            else hooks[event] = kept;
+        }
+    }
+    return removed;
+};
+
+/** Remove just the zeph-written entries from Gemini's settings.json.
+ *  Exported for tests (gemini is PATH-detected, so the full-uninstall
+ *  suite can't reach this deterministically). */
+export const rmGeminiHook = (filePath: string, dry: boolean): string | null => {
     if (!existsSync(filePath)) return null;
     let data: Record<string, unknown>;
     try {
@@ -87,22 +112,30 @@ const rmGeminiHook = (filePath: string, dry: boolean): string | null => {
     } catch {
         return null;
     }
-    const hooks = data.hooks as Record<string, unknown> | undefined;
-    const afterAgent = hooks?.AfterAgent as Array<{ hooks?: Array<{ name?: string }> }> | undefined;
-    if (!Array.isArray(afterAgent)) return null;
-    const kept = afterAgent.filter(
-        (entry) => !(entry.hooks ?? []).some((h) => h.name === 'zeph-notify'),
-    );
-    if (kept.length === afterAgent.length) return null; // nothing of ours
-    if (!dry) {
-        if (kept.length === 0) {
-            delete (hooks as Record<string, unknown>).AfterAgent;
-        } else {
-            (hooks as Record<string, unknown>).AfterAgent = kept;
-        }
-        writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n');
+    if (!stripZephHookGroups(data, dry)) return null;
+    if (!dry) writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n');
+    return `${verb(dry)} zeph hooks from ${filePath}`;
+};
+
+/** Remove the zeph-written entries from Codex's hooks.json. The file is
+ *  usually zeph-born, so it is deleted outright when nothing else remains —
+ *  but events the user added since install survive. Exported for tests
+ *  (codex is PATH-detected, same as gemini). */
+export const rmCodexHook = (filePath: string, dry: boolean): string | null => {
+    if (!existsSync(filePath)) return null;
+    let data: Record<string, unknown>;
+    try {
+        data = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+    } catch {
+        return null;
     }
-    return `${verb(dry)} zeph-notify hook from ${filePath}`;
+    if (!stripZephHookGroups(data, dry)) return null;
+    if (!dry) {
+        const hooks = data.hooks as Record<string, unknown>;
+        if (Object.keys(hooks).length === 0) rmSync(filePath, { force: true });
+        else writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n');
+    }
+    return `${verb(dry)} zeph hooks from ${filePath}`;
 };
 
 // ── Per-agent uninstallers ───────────────────────────────────────
@@ -151,7 +184,7 @@ const AGENT_UNINSTALLERS: Record<string, (dry: boolean) => void> = {
         ]);
     },
     codex: (dry) => runSteps([
-        () => rmFile(join(HOME, '.codex', 'hooks.json'), dry),
+        () => rmCodexHook(join(HOME, '.codex', 'hooks.json'), dry),
         () => stripManagedRule(join(HOME, '.codex', 'AGENTS.md'), dry),
     ]),
     copilot: (dry) => runSteps([

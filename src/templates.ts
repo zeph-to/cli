@@ -33,6 +33,14 @@ import { ZEPH_CORE_HOOK_DRIVEN, ZEPH_CORE_RULE_ONLY } from './zeph-core.generate
 const NOTIFY_CMD =
   '$(command -v zeph || echo "npx -y @zeph-to/cli") notify --title "Task done" --auto 2>/dev/null || true';
 
+// Prompt-submit hook command — remote-origin detection (ADR-0002). Reads
+// the hook JSON on stdin and prints additionalContext JSON on a marker
+// match (see src/remote-hook.ts). stdout IS the hook response, so only
+// stderr is discarded; `|| true` keeps a broken install from ever blocking
+// a prompt.
+const remoteHookCmd = (agent: 'gemini' | 'codex'): string =>
+  `$(command -v zeph || echo "npx -y @zeph-to/cli") remote-hook ${agent} 2>/dev/null || true`;
+
 // ── Shared behavioral core ───────────────────────────────────────
 //
 // GENERATED from plugin/docs/CORE_RULES.md — see src/zeph-core.generated.ts
@@ -107,7 +115,7 @@ export const CLINE_RULE = buildRule({ notify: MANUAL_NOTIFY, core: ZEPH_CORE_RUL
 /** Aider — written to a standalone conventions file, loaded via .aider.conf.yml `read:`. */
 export const AIDER_RULE = buildRule({ notify: MANUAL_NOTIFY, core: ZEPH_CORE_RULE_ONLY });
 
-// ── Hook configs (notification side, unchanged) ──────────────────
+// ── Hook configs ─────────────────────────────────────────────────
 
 export const CURSOR_HOOKS = JSON.stringify({
   version: 1,
@@ -127,6 +135,17 @@ export const WINDSURF_HOOKS = JSON.stringify({
 
 export const GEMINI_HOOKS = {
   hooks: {
+    // Fires after the user submits a prompt, before planning — Gemini's
+    // UserPromptSubmit equivalent (same additionalContext contract).
+    BeforeAgent: [{
+      matcher: '*',
+      hooks: [{
+        name: 'zeph-remote',
+        type: 'command',
+        command: remoteHookCmd('gemini'),
+        timeout: 5000,
+      }],
+    }],
     AfterAgent: [{
       matcher: '*',
       hooks: [{
@@ -139,15 +158,46 @@ export const GEMINI_HOOKS = {
   hooksConfig: { enabled: true },
 };
 
-export const CODEX_HOOKS = JSON.stringify({
-  version: 1,
+// Codex validates hooks.json strictly (serde deny_unknown_fields at the
+// top level; handlers are a `type`-tagged enum inside matcher groups —
+// codex-rs/config/src/hook_config.rs). The previous flat
+// `{version, hooks: {Stop: [{type, bash}]}}` shape predates that schema
+// and made codex reject the entire file, so the Stop hook is migrated to
+// the schema-correct form here alongside the new UserPromptSubmit entry.
+// An object (not a JSON string) so the installer can merge it into a
+// user-owned hooks.json instead of overwriting. Timeouts are in seconds;
+// codex's handler schema has no `name` field, so zeph ownership is
+// recognizable only by the `@zeph-to/cli` command substring.
+export const CODEX_HOOKS = {
   hooks: {
+    UserPromptSubmit: [{
+      hooks: [{ type: 'command', command: remoteHookCmd('codex'), timeout: 5 }],
+    }],
     Stop: [{
-      type: 'command',
-      bash: NOTIFY_CMD,
+      hooks: [{ type: 'command', command: NOTIFY_CMD }],
     }],
   },
-}, null, 2);
+};
+
+/**
+ * True when a matcher group was written by zeph — by handler `name`
+ * (`zeph-*`, Gemini) or by the `@zeph-to/cli` command substring (Codex,
+ * whose handler schema has no name field; every zeph command carries the
+ * substring via the `command -v zeph || npx -y @zeph-to/cli` fallback).
+ * Shared by the installer (replace ours, keep the user's groups on
+ * re-install) and the uninstaller (remove exactly ours).
+ */
+export const isZephHookGroup = (group: unknown): boolean => {
+  const hooks = (group as { hooks?: unknown })?.hooks;
+  if (!Array.isArray(hooks)) return false;
+  return hooks.some((h) => {
+    const { name, command } = (h ?? {}) as { name?: unknown; command?: unknown };
+    return (
+      (typeof name === 'string' && name.startsWith('zeph-')) ||
+      (typeof command === 'string' && command.includes('@zeph-to/cli'))
+    );
+  });
+};
 
 export const COPILOT_HOOKS = JSON.stringify({
   version: 1,

@@ -17,6 +17,7 @@ import {
   COPILOT_HOOKS, COPILOT_RULE,
   CLINE_RULE,
   AIDER_RULE,
+  isZephHookGroup,
   upsertManagedBlock,
 } from './templates.js';
 
@@ -57,12 +58,31 @@ const writeFile = (filePath: string, content: string): void => {
   writeFileSync(filePath, content + '\n');
 };
 
-const mergeJsonFile = (filePath: string, patch: Record<string, unknown>): void => {
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/** Exported for tests (installGemini shells out to the real `gemini` binary,
+ *  so the merge semantics can't be covered through it deterministically). */
+export const mergeJsonFile = (filePath: string, patch: Record<string, unknown>): void => {
   let data: Record<string, unknown> = {};
   try {
     data = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
   } catch { /* new file */ }
   const merged = { ...data, ...patch };
+  // `hooks` maps event names to matcher-group arrays, and the user may own
+  // entries at BOTH levels (their own events, and their own groups inside
+  // an event zeph also uses) — so instead of clobbering the whole object,
+  // merge events, and inside each event zeph writes keep the user's groups
+  // and replace only zeph's own (re-runs stay idempotent).
+  if (isPlainObject(data.hooks) && isPlainObject(patch.hooks)) {
+    const hooks: Record<string, unknown> = { ...data.hooks };
+    for (const [event, patchGroups] of Object.entries(patch.hooks)) {
+      const prev = hooks[event];
+      const userGroups = Array.isArray(prev) ? prev.filter((g) => !isZephHookGroup(g)) : [];
+      hooks[event] = [...userGroups, ...(Array.isArray(patchGroups) ? patchGroups : [])];
+    }
+    merged.hooks = hooks;
+  }
   writeFile(filePath, JSON.stringify(merged, null, 2));
 };
 
@@ -186,7 +206,7 @@ const installGemini = (): void => {
   }
   try {
     mergeJsonFile(join(HOME, '.gemini', 'settings.json'), GEMINI_HOOKS);
-    ok('AfterAgent hook added');
+    ok('BeforeAgent + AfterAgent hooks added');
   } catch {
     fail('Hook install failed');
   }
@@ -201,8 +221,8 @@ const installGemini = (): void => {
 
 const installCodex = (): void => {
   try {
-    writeFile(join(HOME, '.codex', 'hooks.json'), CODEX_HOOKS);
-    ok('Stop hook added');
+    mergeJsonFile(join(HOME, '.codex', 'hooks.json'), CODEX_HOOKS);
+    ok('UserPromptSubmit + Stop hooks added');
   } catch {
     fail('Hook install failed. Manual: add zeph to ~/.codex/hooks.json');
   }
