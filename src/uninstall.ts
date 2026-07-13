@@ -173,10 +173,15 @@ const AGENT_UNINSTALLERS: Record<string, (dry: boolean) => void> = {
     ]),
     gemini: (dry) => {
         if (!dry) {
-            try { execSync('gemini mcp remove zeph', { stdio: 'pipe' }); ok('MCP server removed'); }
-            catch { skip('gemini MCP entry not found'); }
+            // user scope first (where the ≥0.26 installer adds it), then the
+            // legacy scope-less form for entries created by older installs.
+            try { execSync('gemini mcp remove -s user zeph', { stdio: 'pipe' }); ok('MCP server removed'); }
+            catch {
+                try { execSync('gemini mcp remove zeph', { stdio: 'pipe' }); ok('MCP server removed'); }
+                catch { skip('gemini MCP entry not found'); }
+            }
         } else {
-            skip('would run: gemini mcp remove zeph');
+            skip('would run: gemini mcp remove -s user zeph');
         }
         runSteps([
             () => rmGeminiHook(join(HOME, '.gemini', 'settings.json'), dry),

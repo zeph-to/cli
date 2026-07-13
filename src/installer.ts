@@ -199,10 +199,19 @@ const installWindsurf = (): void => {
 
 const installGemini = (): void => {
   try {
-    execSync('gemini mcp add zeph -- npx -y @zeph-to/mcp-server', { stdio: 'pipe' });
+    // gemini ≥0.26 syntax: `mcp add [-s scope] <name> <command> [args…]` —
+    // the default scope is "project" (cwd-local .gemini/), so pin user
+    // scope for a machine-wide install. Older gemini CLIs only accept the
+    // legacy `mcp add zeph -- npx …` form; fall back for those.
+    execSync('gemini mcp add -s user zeph npx -- -y @zeph-to/mcp-server', { stdio: 'pipe' });
     ok('MCP server added');
   } catch {
-    fail('MCP add failed. Manual: gemini mcp add zeph -- npx -y @zeph-to/mcp-server');
+    try {
+      execSync('gemini mcp add zeph -- npx -y @zeph-to/mcp-server', { stdio: 'pipe' });
+      ok('MCP server added (legacy gemini CLI)');
+    } catch {
+      fail('MCP add failed. Manual: gemini mcp add -s user zeph npx -- -y @zeph-to/mcp-server');
+    }
   }
   try {
     mergeJsonFile(join(HOME, '.gemini', 'settings.json'), GEMINI_HOOKS);
