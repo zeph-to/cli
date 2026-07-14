@@ -1257,25 +1257,60 @@ interface SessionResult {
  * time `zeph listener` rebinds). `dev_listener_<sha8(hostname)>` keeps it
  * human-recognisable in dev logs without leaking the raw hostname.
  *
- * The no-arg result is sticky across runs, not just the process lifetime:
- * macOS rewrites the hostname on network changes (observed flip-flopping
- * between 'Mac' and '<name>.local' within hours), so a purely
- * hostname-derived id splits one machine into several device rows —
- * duplicated session lists on the phone, and screen-peek requests addressed
- * to an id no live process answers for. The first computed id is persisted
- * to ~/.zeph/listener-device-id and every later run reuses it.
+ * The no-arg result must identify the MACHINE, stably:
+ * - NOT the hostname: macOS rewrites it on network changes (observed
+ *   flip-flopping between 'Mac' and '<name>.local' within hours), which
+ *   split one machine into several device rows — duplicated session lists
+ *   on the phone, and screen-peek requests addressed to an id no live
+ *   process answers for.
+ * - NOT a file under ~/.zeph alone: users copy ~/.zeph to a new machine
+ *   to carry their API key, and a copied id makes two machines answer for
+ *   each other.
+ * So: hash the platform machine id (IOPlatformUUID / /etc/machine-id) —
+ * deterministic per machine, immune to both. The sticky file is only the
+ * fallback for platforms where no machine id is readable.
  */
 let processListenerDeviceId: string | undefined;
 
 const LISTENER_ID_FILE = join(homedir(), '.zeph', 'listener-device-id');
 
-const hashListenerId = (host: string): string =>
-    `dev_listener_${createHash('sha256').update(host).digest('hex').slice(0, 8)}`;
+const hashListenerId = (seed: string): string =>
+    `dev_listener_${createHash('sha256').update(seed).digest('hex').slice(0, 8)}`;
+
+const readMachineId = (): string | null => {
+    try {
+        if (process.platform === 'darwin') {
+            const r = spawnSync('ioreg', ['-rd1', '-c', 'IOPlatformExpertDevice'], {
+                encoding: 'utf-8',
+                stdio: ['ignore', 'pipe', 'ignore'],
+            });
+            const m = r.stdout?.match(/"IOPlatformUUID"\s*=\s*"([^"]+)"/);
+            if (m) return m[1];
+        }
+        if (process.platform === 'linux') {
+            for (const p of ['/etc/machine-id', '/var/lib/dbus/machine-id']) {
+                try {
+                    const v = readFileSync(p, 'utf-8').trim();
+                    if (v) return v;
+                } catch { /* try next */ }
+            }
+        }
+    } catch { /* fall through to the sticky-file fallback */ }
+    return null;
+};
 
 export const computeListenerDeviceId = (host?: string): string => {
     if (host !== undefined) return hashListenerId(host);
     if (processListenerDeviceId) return processListenerDeviceId;
 
+    const machineId = readMachineId();
+    if (machineId) {
+        processListenerDeviceId = hashListenerId(machineId);
+        return processListenerDeviceId;
+    }
+
+    // No readable machine id — pin the first hostname-derived id to a file
+    // so at least hostname drift can't split this machine.
     try {
         const saved = readFileSync(LISTENER_ID_FILE, 'utf-8').trim();
         if (/^dev_listener_[0-9a-f]{8}$/.test(saved)) {
