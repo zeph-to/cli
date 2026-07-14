@@ -1257,24 +1257,40 @@ interface SessionResult {
  * time `zeph listener` rebinds). `dev_listener_<sha8(hostname)>` keeps it
  * human-recognisable in dev logs without leaking the raw hostname.
  *
- * The no-arg result is pinned for the process lifetime: macOS renames the
- * hostname with network changes, and a mid-run drift made the screen-peek
- * check (fresh recompute) reject requests addressed to the id we CONNECTED
- * with — the phone targets the id the sessions were reported under, so
- * every caller in one process must see the same value.
+ * The no-arg result is sticky across runs, not just the process lifetime:
+ * macOS rewrites the hostname on network changes (observed flip-flopping
+ * between 'Mac' and '<name>.local' within hours), so a purely
+ * hostname-derived id splits one machine into several device rows —
+ * duplicated session lists on the phone, and screen-peek requests addressed
+ * to an id no live process answers for. The first computed id is persisted
+ * to ~/.zeph/listener-device-id and every later run reuses it.
  */
 let processListenerDeviceId: string | undefined;
 
+const LISTENER_ID_FILE = join(homedir(), '.zeph', 'listener-device-id');
+
+const hashListenerId = (host: string): string =>
+    `dev_listener_${createHash('sha256').update(host).digest('hex').slice(0, 8)}`;
+
 export const computeListenerDeviceId = (host?: string): string => {
-    if (host !== undefined) {
-        const h = createHash('sha256').update(host).digest('hex').slice(0, 8);
-        return `dev_listener_${h}`;
-    }
-    if (!processListenerDeviceId) {
-        const h = createHash('sha256').update(hostname()).digest('hex').slice(0, 8);
-        processListenerDeviceId = `dev_listener_${h}`;
-    }
-    return processListenerDeviceId;
+    if (host !== undefined) return hashListenerId(host);
+    if (processListenerDeviceId) return processListenerDeviceId;
+
+    try {
+        const saved = readFileSync(LISTENER_ID_FILE, 'utf-8').trim();
+        if (/^dev_listener_[0-9a-f]{8}$/.test(saved)) {
+            processListenerDeviceId = saved;
+            return saved;
+        }
+    } catch { /* first run — fall through to compute + persist */ }
+
+    const fresh = hashListenerId(hostname());
+    try {
+        mkdirSync(join(homedir(), '.zeph'), { recursive: true });
+        writeFileSync(LISTENER_ID_FILE, fresh);
+    } catch { /* persistence is best-effort; in-memory pin still holds */ }
+    processListenerDeviceId = fresh;
+    return fresh;
 };
 
 interface StreamHandle {
