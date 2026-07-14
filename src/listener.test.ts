@@ -301,6 +301,26 @@ describe('handlePush key events', () => {
         expect(tokens).toEqual(['Down', 'Enter']);
     });
 
+    it('fires onKeysInjected after a successful key injection', async () => {
+        let snapshotSession: string | null = null;
+        const ok = await handlePush(
+            keyCmd(['down']),
+            keysDeps({ onKeysInjected: (session) => { snapshotSession = session; } }),
+        );
+        expect(ok).toBe(true);
+        expect(snapshotSession).toBe('zeph-myapp');
+    });
+
+    it('does NOT fire onKeysInjected when injection is refused', async () => {
+        let fired = false;
+        const ok = await handlePush(
+            keyCmd(['down']),
+            keysDeps({ sendKeys: () => false, onKeysInjected: () => { fired = true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(fired).toBe(false);
+    });
+
     it('drops (no send) when any key is unknown', async () => {
         let sent = false;
         const ok = await handlePush(
