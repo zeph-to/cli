@@ -17,6 +17,7 @@ import {
     computeBackoff,
     AUTH_FAILURE_CODES,
     computeListenerDeviceId,
+    resolveWsUrl,
     deriveSessionState,
     handleScreenRequest,
     resetSessionStates,
@@ -520,6 +521,26 @@ describe('computeListenerDeviceId', () => {
         // connect and the id checked on screen requests must never diverge.
         expect(computeListenerDeviceId()).toBe(computeListenerDeviceId());
         expect(computeListenerDeviceId()).toMatch(/^dev_listener_[0-9a-f]{8}$/);
+    });
+});
+
+describe('resolveWsUrl', () => {
+    const PROD_BASE = 'https://api.zeph.to/v1';
+
+    it('defaults to the prod socket when nothing is configured and base URL is prod', () => {
+        expect(resolveWsUrl({}, {}, PROD_BASE)).toBe('wss://ws.zeph.to');
+    });
+
+    it('refuses to default when a custom base URL is set (env-split guard)', () => {
+        expect(resolveWsUrl({}, {}, 'https://api.zeph.to/d1')).toBeNull();
+    });
+
+    it('explicit config wins over the default', () => {
+        expect(resolveWsUrl({}, { wsUrl: 'wss://ws-dev.zeph.to' }, PROD_BASE)).toBe('wss://ws-dev.zeph.to');
+    });
+
+    it('--ws-url arg wins over everything', () => {
+        expect(resolveWsUrl({ 'ws-url': 'wss://custom' }, { wsUrl: 'wss://cfg' }, PROD_BASE)).toBe('wss://custom');
     });
 });
 
