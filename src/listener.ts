@@ -768,13 +768,21 @@ export const handleScreenRequest = (req: ScreenRequest): ScreenSnapshot | null =
     if (!collectSessions().some((s) => s.name === req.sessionName)) {
         return { ...base, error: 'unknown_session' };
     }
-    const r = spawnSync('tmux', tmuxArgs(['capture-pane', '-p', '-t', req.sessionName, '-S', `-${SCREEN_PEEK_LINES}`]), {
+    const captured = capturePane(req.sessionName);
+    if (!captured) {
+        return { ...base, error: 'capture_failed' };
+    }
+    return { ...base, ...captured };
+};
+
+/** Raw pane capture + size cap. Shared by the request path and the
+ *  post-injection auto-snapshot. */
+const capturePane = (sessionName: string): { content: string; truncated: boolean } | null => {
+    const r = spawnSync('tmux', tmuxArgs(['capture-pane', '-p', '-t', sessionName, '-S', `-${SCREEN_PEEK_LINES}`]), {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],
     });
-    if (r.status !== 0) {
-        return { ...base, error: 'capture_failed' };
-    }
+    if (r.status !== 0) return null;
     let content = r.stdout ?? '';
     let truncated = false;
     while (Buffer.byteLength(content, 'utf-8') > SCREEN_PEEK_MAX_BYTES) {
@@ -783,7 +791,47 @@ export const handleScreenRequest = (req: ScreenRequest): ScreenSnapshot | null =
         content = cut > 0 ? content.slice(cut + 1) : content.slice(-SCREEN_PEEK_MAX_BYTES);
         truncated = true;
     }
-    return { ...base, content, truncated };
+    return { content, truncated };
+};
+
+/** Delays after a key injection at which the pane is re-captured and pushed
+ *  to the phone unsolicited. The first frame lands right after most TUI
+ *  redraws; the second catches slow animations and is skipped when nothing
+ *  changed since the first. */
+const INJECT_SNAPSHOT_DELAYS_MS = [250, 900];
+
+const pendingInjectSnapshots = new Map<string, ReturnType<typeof setTimeout>[]>();
+
+/**
+ * After the phone injects keys, push fresh frames instead of waiting for its
+ * next screen request — the phone's post-tap re-pull raced the key landing
+ * (its timer starts at tap time, the key lands a REST+WS hop later), so it
+ * often re-captured the pre-keypress screen and the next update was a full
+ * auto-refresh period away. Unsolicited frames carry no requestId; the phone
+ * matches them by deviceId + sessionName. A newer tap cancels pending
+ * captures so a burst of arrow presses yields frames after the LAST press.
+ */
+export const scheduleInjectSnapshots = (
+    sessionName: string,
+    send: (data: Record<string, unknown>) => void,
+    delays: number[] = INJECT_SNAPSHOT_DELAYS_MS,
+): void => {
+    for (const t of pendingInjectSnapshots.get(sessionName) ?? []) clearTimeout(t);
+    let lastContent: string | null = null;
+    const timers = delays.map((delay) =>
+        setTimeout(() => {
+            const captured = capturePane(sessionName);
+            if (!captured || captured.content === lastContent) return;
+            lastContent = captured.content;
+            send({
+                subtype: 'agent.screen.snapshot',
+                sessionName,
+                capturedAt: new Date().toISOString(),
+                ...captured,
+            });
+        }, delay),
+    );
+    pendingInjectSnapshots.set(sessionName, timers);
 };
 
 export interface CollectResult {
@@ -919,6 +967,9 @@ interface HandlePushDeps {
     downloadAttachments?: (pushId: string, files: PushFileAttachment[]) => Promise<string[]>;
     /** Pane cwd lookup for the remote-origin marker (ADR-0002). */
     paneCwd?: (session: string) => string | null;
+    /** Fired after a successful named-key injection so the WS loop can push
+     *  fresh screen frames to the phone (scheduleInjectSnapshots). */
+    onKeysInjected?: (session: string) => void;
 }
 
 /**
@@ -1151,7 +1202,9 @@ export const handlePush = async (
             log(`! ${push.agentSessionName}: unknown key(s) [${push.keys.join(' ')}] — drop`);
             return false;
         }
-        return tryInjectKeys(push.agentSessionName, tokens, deps);
+        const injected = tryInjectKeys(push.agentSessionName, tokens, deps);
+        if (injected) deps.onKeysInjected?.(push.agentSessionName);
+        return injected;
     }
 
     // Download any attachments BEFORE injecting so the agent can read the
@@ -1400,7 +1453,14 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                 // Fire-and-forget: handlePush is async (attachment download)
                 // but the WS read loop must stay responsive. Errors are
                 // logged, never thrown into the socket handler.
-                void handlePush(m.data as PushItem).catch((err) =>
+                void handlePush(m.data as PushItem, {
+                    onKeysInjected: (session) =>
+                        scheduleInjectSnapshots(session, (data) => {
+                            if (sock.readyState === WebSocket.OPEN) {
+                                sock.send(JSON.stringify({ type: 'ephemeral', data }));
+                            }
+                        }),
+                }).catch((err) =>
                     log(`! handlePush: ${(err as Error).message}`));
             }
             if (m.type === 'ephemeral' && m.data) {
