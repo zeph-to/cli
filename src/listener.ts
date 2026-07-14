@@ -1203,10 +1203,25 @@ interface SessionResult {
  * (otherwise the phone's session inventory grows a new ghost device every
  * time `zeph listener` rebinds). `dev_listener_<sha8(hostname)>` keeps it
  * human-recognisable in dev logs without leaking the raw hostname.
+ *
+ * The no-arg result is pinned for the process lifetime: macOS renames the
+ * hostname with network changes, and a mid-run drift made the screen-peek
+ * check (fresh recompute) reject requests addressed to the id we CONNECTED
+ * with — the phone targets the id the sessions were reported under, so
+ * every caller in one process must see the same value.
  */
-export const computeListenerDeviceId = (host: string = hostname()): string => {
-    const h = createHash('sha256').update(host).digest('hex').slice(0, 8);
-    return `dev_listener_${h}`;
+let processListenerDeviceId: string | undefined;
+
+export const computeListenerDeviceId = (host?: string): string => {
+    if (host !== undefined) {
+        const h = createHash('sha256').update(host).digest('hex').slice(0, 8);
+        return `dev_listener_${h}`;
+    }
+    if (!processListenerDeviceId) {
+        const h = createHash('sha256').update(hostname()).digest('hex').slice(0, 8);
+        processListenerDeviceId = `dev_listener_${h}`;
+    }
+    return processListenerDeviceId;
 };
 
 interface StreamHandle {

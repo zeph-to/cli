@@ -494,6 +494,13 @@ describe('computeListenerDeviceId', () => {
     it('emits the dev_listener_<sha8> shape (8 lowercase hex chars)', () => {
         expect(computeListenerDeviceId('my-host')).toMatch(/^dev_listener_[0-9a-f]{8}$/);
     });
+
+    it('pins the no-arg id for the process lifetime (hostname drift immunity)', () => {
+        // macOS renames the hostname with network changes; the id used to
+        // connect and the id checked on screen requests must never diverge.
+        expect(computeListenerDeviceId()).toBe(computeListenerDeviceId());
+        expect(computeListenerDeviceId()).toMatch(/^dev_listener_[0-9a-f]{8}$/);
+    });
 });
 
 describe('deriveSessionState', () => {
