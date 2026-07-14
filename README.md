@@ -33,36 +33,37 @@ npx @zeph-to/cli notify --title "Hello"
 
 ## Quick Start
 
-```bash
-# Sign in via browser — auto-fetches your API key + hook into
-# ~/.zeph/config.json (no copy-paste)
-npx @zeph-to/cli login
+One command does everything:
 
-# Install for your AI agents (rules + hooks + MCP). Reuses the saved
-# config; detects Claude Code / Cursor / Windsurf / Gemini / Codex / …
+```bash
 npx @zeph-to/cli install
 ```
 
-`login` opens a browser to the Zeph web app, asks you to confirm "connect
-this computer", then issues a fresh API key (labelled with your hostname)
-and reuses or creates a hook — writing both back to `~/.zeph/config.json`
-over a localhost loopback. No credential ever gets pasted into the
-terminal.
+On a fresh machine it opens a browser sign-in — the web app issues an API
+key + hook as a matched pair and the CLI writes them to
+`~/.zeph/config.json` (no copy-paste). Then it installs rules + hooks +
+MCP for every detected agent (Claude Code / Cursor / Windsurf / Gemini /
+Codex / …). Safe to re-run: with saved credentials it skips the sign-in
+and just refreshes the agent integrations.
 
-Prefer to paste credentials yourself (or on a headless box with no
-browser)? Skip `login` and pass them to `install` directly:
+`~/.zeph/config.json` is the single source of truth — the CLI, the MCP
+server, the plugin hooks, and the listener all read it. You never need
+`ZEPH_API_KEY`-style env vars for a normal setup; they exist as overrides
+(second account, CI).
+
+Variants:
 
 ```bash
+# Headless box (no browser): paste credentials from another machine's
+# ~/.zeph/config.json
 npx @zeph-to/cli install --key ak_... --hook hook_...
+
+# Skip the interactive agent picker
+npx @zeph-to/cli install --only claude,cursor
+
+# Refresh credentials only (no agent re-install)
+npx @zeph-to/cli login
 ```
-
-Either way it saves to `~/.zeph/config.json`. All Zeph tools (CLI, MCP
-server, plugin hooks, listener) read this file.
-
-On a fresh machine `install` alone is enough: with no `--key` and no
-saved config it opens the same browser login automatically (headless
-boxes fall back to manual key entry). Pass `--only claude,cursor,…` to
-skip the interactive agent picker.
 
 To **send** notifications:
 
