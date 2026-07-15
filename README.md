@@ -44,8 +44,9 @@ zeph install
 issues an API key + hook as a matched pair and the CLI writes them to
 `~/.zeph/config.json` (no copy-paste). Then it installs rules + hooks +
 MCP for every detected agent (Claude Code / Cursor / Windsurf / Gemini /
-Codex / …). Safe to re-run: with saved credentials it skips the sign-in
-and just refreshes the agent integrations.
+Codex / …). Safe to re-run: a saved login is reused untouched (no
+prompts), so a re-run just refreshes the agent integrations. To switch
+account, `zeph install --relogin` forces a fresh sign-in.
 
 **Why global, not `npx`?** `zeph cc` (drive a session from your phone)
 needs `zeph` on your `PATH`, and the agent hooks this installs are
@@ -68,6 +69,9 @@ zeph install --key ak_... --hook hook_...
 
 # Skip the interactive agent picker
 zeph install --only claude,cursor
+
+# Switch account — force a fresh browser sign-in over a saved login
+zeph install --relogin
 
 # Refresh credentials only (no agent re-install) — assumes you already
 # ran `zeph install` once; on its own it does NOT wire MCP into agents
