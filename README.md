@@ -5,31 +5,19 @@
 [![node](https://img.shields.io/node/v/@zeph-to/cli.svg)](https://nodejs.org)
 [![license](https://img.shields.io/npm/l/@zeph-to/cli.svg)](./LICENSE)
 
-Push notification SDK + CLI for [Zeph](https://zeph.to) — the terminal
-side of the round trip: your agent works, hits a decision, and asks your
-phone; you tap a button (or type a reply), and the answer lands back in
-the live session so the agent keeps going.
+**Your agent works, hits a decision, and asks your phone. You tap a button (or type a reply), and the answer lands back in the live session — so the agent keeps going.**
 
-- `ZephHook` SDK — native `fetch`, no runtime deps. Send/list/dismiss pushes.
-- `zeph` CLI — one-command setup for 8 AI agents, push sending, and an
-  optional resident listener that **drives Claude Code / Codex / Gemini
-  sessions from your phone** by injecting messages into named tmux
-  sessions.
+`@zeph-to/cli` is the terminal side of that round trip: a zero-dependency push SDK, a `zeph` CLI that wires up 8 AI agents in one command, and a resident listener that lets your phone **drive Claude Code / Codex / Gemini sessions** by typing straight into named tmux sessions.
 
-Part of the Zeph toolchain:
-[`@zeph-to/mcp-server`](https://github.com/zeph-to/mcp-server) (the MCP
-tools your agent calls, e.g. `zeph_ask`) ·
-[`zeph-to/plugin`](https://github.com/zeph-to/plugin) (Claude Code plugin
-bundling hooks + MCP + rules) · the [Zeph app](https://zeph.to) on your
-phone.
+<p align="center">
+  <img src="https://zeph.to/readme/demo.gif" alt="Agent asks 'Deploy to prod?' on your phone; you tap Deploy; the session ships" width="560"><br>
+  <sub><em>Your agent asks on your phone → you tap <b>Deploy</b> → the session ships. No terminal.</em></sub>
+</p>
 
-## Installation
+- **`ZephHook` SDK** — native `fetch`, no runtime deps. Send / list / dismiss pushes.
+- **`zeph` CLI** — one-command setup for 8 agents, push sending, and the resident listener for phone-driven remote control.
 
-```bash
-npm install -g @zeph-to/cli
-# or for one-off use
-npx @zeph-to/cli notify --title "Hello"
-```
+Part of the Zeph toolchain: [`@zeph-to/mcp-server`](https://github.com/zeph-to/mcp-server) (the MCP tools your agent calls, e.g. `zeph_ask`) · [`zeph-to/plugin`](https://github.com/zeph-to/plugin) (Claude Code plugin bundling hooks + MCP + rules) · the [Zeph app](https://zeph.to) on your phone.
 
 ## Quick Start
 
@@ -91,6 +79,10 @@ To **drive a Claude Code / Codex / Gemini session from your phone**, see
 
 > Send messages from your phone *into* a live Claude Code / Codex /
 > Gemini session — even after a `zeph_ask` polling window has expired.
+
+<p align="center">
+  <img src="https://zeph.to/readme/ask-phone.png" alt="A Zeph hook on the phone: a question with tappable answer buttons and a text field" width="300">
+</p>
 
 The MCP tools `zeph_ask` / `zeph_prompt` / `zeph_input` wait on a fixed
 timeout (120–600 s). Once that window closes the
