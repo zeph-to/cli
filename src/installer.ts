@@ -40,8 +40,13 @@ const fail = (msg: string) => console.log(`    - ${msg}`);
  * True when install should auto-open browser login (ADR 0002): interactive
  * context with no existing credential (--key/env/config all absent).
  */
-export const shouldTriggerLogin = (nonInteractive: boolean, currentKey: string | undefined): boolean =>
-  !nonInteractive && !currentKey;
+/**
+ * Interactive install, past the `--key` path: open a browser login only when
+ * there's nothing saved yet, or the user explicitly asked to re-authenticate
+ * with `--relogin`. A plain re-run keeps the saved login untouched.
+ */
+export const shouldReauth = (currentKey: string | undefined, relogin: boolean): boolean =>
+  !currentKey || relogin;
 
 const promptInput = (question: string): Promise<string> => {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -377,34 +382,12 @@ interface ResolvedCredentials {
   baseUrl?: string;
 }
 
-/** Interactive path when a credential already exists: prompt to keep/replace. */
-const promptExistingCredentials = async (
-  currentKey: string | undefined,
-  existing: ZephConfig,
-): Promise<ResolvedCredentials> => {
-  if (currentKey) console.log(`  Current API Key: ${currentKey.slice(0, 12)}...`);
-  const keyInput = await promptInput(
-    currentKey ? '  New API Key (Enter to keep): ' : '  API Key (from app > Settings > API Keys): ',
-  );
-
-  const currentHook = resolvedEnv('ZEPH_HOOK_ID') || existing.hookId;
-  if (currentHook) console.log(`  Current Hook ID: ${currentHook}`);
-  const hookInput = await promptInput(
-    currentHook ? '  New Hook ID (Enter to keep, "none" to remove): ' : '  Hook ID (optional, for prompt/input): ',
-  );
-
-  return {
-    apiKey: keyInput || currentKey,
-    hookId: hookInput === 'none' ? undefined : (hookInput || currentHook),
-    baseUrl: existing.baseUrl,
-  };
-};
-
 /**
- * Resolve API key + hook for install. Priority: --key/env/config (non-interactive
- * or "keep existing") → brand-new interactive opens browser login (ADR 0002),
- * falling back to manual paste when headless. wsUrl/deviceId from a login are
- * persisted by runLoginFlow and re-read at config-save time.
+ * Resolve API key + hook for install. Priority: --key/env/config (non-interactive)
+ * → a saved login is reused untouched on re-run → otherwise a brand-new
+ * interactive install opens browser login (ADR 0002), falling back to manual
+ * paste when headless. wsUrl/deviceId from a login are persisted by
+ * runLoginFlow and re-read at config-save time.
  */
 const collectCredentials = async (
   args: Record<string, string | boolean>,
@@ -422,8 +405,16 @@ const collectCredentials = async (
 
   console.log('');
   const currentKey = resolvedEnv('ZEPH_API_KEY') || existing.apiKey;
-  if (!shouldTriggerLogin(nonInteractive, currentKey)) {
-    return promptExistingCredentials(currentKey, existing);
+
+  // Re-run with a saved login: reuse it silently and move on to agent wiring.
+  // Switching accounts is `zeph login` or `zeph install --relogin`.
+  if (!shouldReauth(currentKey, args.relogin === true)) {
+    console.log(`  Using saved login (${currentKey!.slice(0, 12)}…). Run \`zeph install --relogin\` to switch account.`);
+    return {
+      apiKey: currentKey,
+      hookId: resolvedEnv('ZEPH_HOOK_ID') || existing.hookId,
+      baseUrl: existing.baseUrl,
+    };
   }
 
   const result = await runLoginFlow({

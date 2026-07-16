@@ -117,10 +117,13 @@ Login options:
 
 Install options:
   (no --key, no saved config → opens browser login automatically;
-   headless falls back to manual key entry)
+   a saved login is reused untouched on re-run; headless falls back
+   to manual key entry)
   --key <api-key>    API key (non-interactive; skips browser login)
   --hook <hook-id>   Hook ID (non-interactive)
   --base-url <url>   Base URL (non-interactive)
+  --relogin          Force a fresh browser sign-in even if a login is
+                     already saved (switch account)
   --web-url <url>    Login web app URL [default: https://app.zeph.to]
   --only <agents>    Comma-separated agent ids to install for
                      (claude,cursor,windsurf,gemini,codex,copilot,cline,aider).

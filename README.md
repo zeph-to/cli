@@ -33,18 +33,27 @@ npx @zeph-to/cli notify --title "Hello"
 
 ## Quick Start
 
-One command does everything:
+Install the CLI globally, then run setup:
 
 ```bash
-npx @zeph-to/cli install
+npm install -g @zeph-to/cli
+zeph install
 ```
 
-On a fresh machine it opens a browser sign-in — the web app issues an API
-key + hook as a matched pair and the CLI writes them to
+`zeph install` opens a browser sign-in on a fresh machine — the web app
+issues an API key + hook as a matched pair and the CLI writes them to
 `~/.zeph/config.json` (no copy-paste). Then it installs rules + hooks +
 MCP for every detected agent (Claude Code / Cursor / Windsurf / Gemini /
-Codex / …). Safe to re-run: with saved credentials it skips the sign-in
-and just refreshes the agent integrations.
+Codex / …). Safe to re-run: a saved login is reused untouched (no
+prompts), so a re-run just refreshes the agent integrations. To switch
+account, `zeph install --relogin` forces a fresh sign-in.
+
+**Why global, not `npx`?** `zeph cc` (drive a session from your phone)
+needs `zeph` on your `PATH`, and the agent hooks this installs are
+`$(command -v zeph || npx …)` — a global binary skips an npx cold-start
+on *every* notification. For notifications only, with no phone control,
+`npx @zeph-to/cli install` is a lighter alternative that skips the global
+binary.
 
 `~/.zeph/config.json` is the single source of truth — the CLI, the MCP
 server, the plugin hooks, and the listener all read it. You never need
@@ -56,13 +65,17 @@ Variants:
 ```bash
 # Headless box (no browser): paste credentials from another machine's
 # ~/.zeph/config.json
-npx @zeph-to/cli install --key ak_... --hook hook_...
+zeph install --key ak_... --hook hook_...
 
 # Skip the interactive agent picker
-npx @zeph-to/cli install --only claude,cursor
+zeph install --only claude,cursor
 
-# Refresh credentials only (no agent re-install)
-npx @zeph-to/cli login
+# Switch account — force a fresh browser sign-in over a saved login
+zeph install --relogin
+
+# Refresh credentials only (no agent re-install) — assumes you already
+# ran `zeph install` once; on its own it does NOT wire MCP into agents
+zeph login
 ```
 
 To **send** notifications:
