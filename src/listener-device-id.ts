@@ -1,7 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { hostname } from 'node:os';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 
@@ -17,7 +16,12 @@ const hashListenerId = (seed: string): string =>
 const readMachineId = (): string | null => {
     try {
         if (process.platform === 'darwin') {
-            const out = execFileSync('ioreg', ['-rd1', '-c', 'IOPlatformExpertDevice'], { encoding: 'utf-8' });
+            // stdio: swallow ioreg's stderr so a one-off `zeph rename` / hook
+            // never leaks ioreg warnings to the terminal (matches listener.ts).
+            const out = execFileSync('ioreg', ['-rd1', '-c', 'IOPlatformExpertDevice'], {
+                encoding: 'utf-8',
+                stdio: ['ignore', 'pipe', 'ignore'],
+            });
             const m = out.match(/"IOPlatformUUID"\s*=\s*"([^"]+)"/);
             if (m) return m[1];
         }
