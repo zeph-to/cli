@@ -207,3 +207,19 @@ describe('ZephHook.dismiss', () => {
         expect(dismissCall?.url).toContain('push_01%3Aweird%2Fid');
     });
 });
+
+describe('ZephHook.renameAgentSession', () => {
+    it('PATCHes the agent-session alias endpoint with the alias body', async () => {
+        sequenceResponses([{ ok: true, json: { data: { deviceId: 'dev_listener_abc' } } }]);
+        const { ZephHook } = await loadHookModule();
+        const hook = new ZephHook({ apiKey: 'ak', baseUrl: 'https://api.example.com/v1' });
+
+        const res = await hook.renameAgentSession('dev_listener_abc', 'zeph-proj', 'Prod deploy');
+
+        expect(res.deviceId).toBe('dev_listener_abc');
+        const call = lastCalls.find((c) => c.url.includes('/agent-sessions/'));
+        expect(call?.url).toBe('https://api.example.com/v1/devices/dev_listener_abc/agent-sessions/zeph-proj');
+        expect(call?.init?.method).toBe('PATCH');
+        expect(JSON.parse(call!.init!.body as string)).toEqual({ alias: 'Prod deploy' });
+    });
+});

@@ -200,6 +200,20 @@ export class ZephHook {
     return { dismissed: json.data?.dismissed ?? 0 };
   }
 
+  /**
+   * Set (or clear, with an empty alias) the display name for an agent session,
+   * keyed by its tmux `name` on `deviceId`. The alias overrides the app's
+   * computed session label; it survives listener re-reports (server-side).
+   */
+  async renameAgentSession(deviceId: string, name: string, alias: string): Promise<{ deviceId: string }> {
+    const res = await this.request<{ data: { deviceId: string } }>(
+      'PATCH',
+      `/devices/${encodeURIComponent(deviceId)}/agent-sessions/${encodeURIComponent(name)}`,
+      { alias },
+    );
+    return { deviceId: res.data.deviceId };
+  }
+
   private async request<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);

@@ -9,7 +9,7 @@ import { handleUninstall } from './uninstall.js';
 import { handleVerify } from './verify.js';
 import { handleCheckUpdate } from './check-update.js';
 import { handleAgentSession } from './wrapper.js';
-import { handleListener } from './listener.js';
+import { handleListener, computeListenerDeviceId } from './listener.js';
 import { detectProjectDir, loadConfig, resolvedEnv, VERSION } from './config.js';
 import { decidePush, GATE_DEFAULTS, isMuted, normalizeMarker, readPushMode } from './gate.js';
 import { findAgentBySubcommand, REMOTE_AGENTS } from './remote-agents.js';
@@ -80,6 +80,8 @@ Commands:
   notify          Send a push notification
   list            List recent push notifications
   dismiss <id>    Dismiss a push notification (or --all)
+  rename <name>   Set this agent session's display name in the app
+                  (run inside a zeph cc session; --clear resets it)
   test            Send a test notification to verify setup
 ${usageAgentLines()}
                   (auto-suffixed -2/-3/… when another zeph cc is already
@@ -178,6 +180,52 @@ const createHook = (args: Record<string, string | boolean>): ZephHook | null => 
     apiKey,
     ...(baseUrl && { baseUrl }),
   });
+};
+
+/** Current tmux session name (the rename key), or null when not inside tmux. */
+const detectCurrentTmuxSession = (): string | null => {
+  if (!process.env.TMUX) return null;
+  try {
+    const name = execFileSync('tmux', ['display-message', '-p', '#S'], { encoding: 'utf-8' }).trim();
+    return name || null;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * `zeph rename "<name>"` — set THIS agent session's display name in the app.
+ * Auto-detects the current tmux session + this machine's listener device id
+ * (`computeListenerDeviceId`, the same id the listener registers, so the
+ * rename lands on the right device). `--clear` resets to the computed label.
+ */
+const handleRename = async (args: Record<string, string | boolean>): Promise<number> => {
+  const isJson = args.json === true;
+  const clearing = args.clear === true;
+  const alias = (args._arg1 as string) || '';
+  if (!alias && !clearing) {
+    printError('Usage: zeph rename "New name"  (or --clear to reset to default)', isJson);
+    return 2;
+  }
+
+  const sessionName = (args.session as string) || detectCurrentTmuxSession();
+  if (!sessionName) {
+    printError('No tmux session detected. Run inside a `zeph cc` session, or pass --session <name>.', isJson);
+    return 2;
+  }
+  const deviceId = (args.device as string) || computeListenerDeviceId();
+
+  const hook = createHook(args);
+  if (!hook) return 3;
+
+  try {
+    await hook.renameAgentSession(deviceId, sessionName, clearing ? '' : alias);
+    if (isJson) printJson({ session: sessionName, alias: clearing ? null : alias, status: 'ok' });
+    else console.log(clearing ? `Reset name for ${sessionName}` : `Renamed ${sessionName} → ${alias}`);
+    return 0;
+  } catch (err) {
+    return handleError(err, isJson);
+  }
 };
 
 /** Parse a gate count flag; garbage input falls back to the default (never accidentally silences). */
@@ -426,6 +474,8 @@ const main = async (): Promise<number> => {
       return handleList(args);
     case 'dismiss':
       return handleDismiss(args);
+    case 'rename':
+      return handleRename(args);
     case 'test':
       return handleTest(args);
     case 'listener':
