@@ -315,6 +315,10 @@ zeph list --limit 10 --type note
 zeph dismiss push_01JXY...
 zeph dismiss --all
 
+# Rename the current agent session (shows in the app's Agents list)
+zeph rename "Prod deploy"
+zeph rename --clear                # reset to the default name
+
 # Test connection
 zeph test
 
@@ -343,6 +347,7 @@ zeph notify --title "Hello" --json
 | `notify` | Send a push notification |
 | `list` | List recent push notifications |
 | `dismiss <id>` | Dismiss a push (or `--all`) |
+| `rename <name>` | Set the current agent session's display name in the app — run inside a `zeph cc` session (`--clear` resets). Auto-detects the tmux session + this machine's listener device id, so the alias lands on the right device |
 | `test` | Verify connection and API key |
 | `cc` · `codex` · `gemini` | Run the agent in a `zeph-<project>` tmux session (auto-suffixed `-2`, `-3`, … on attached collisions). Auto-spawns the background listener on first invocation so the phone picker just works. Trailing args pass through to the agent (`zeph cc --resume "..."`) |
 | `listener` | (Usually unnecessary — `zeph cc` autospawns it.) Resident daemon: subscribes via WebSocket, reports tmux session inventory every 5 s, injects `agent.command` pushes into the matching session. Run in the foreground for SDK development; otherwise let `zeph cc` manage it |
