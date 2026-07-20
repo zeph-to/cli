@@ -516,6 +516,15 @@ describe('computeListenerDeviceId', () => {
         expect(computeListenerDeviceId('my-host')).toMatch(/^dev_listener_[0-9a-f]{8}$/);
     });
 
+    it('matches the mcp-server device-id contract for a shared seed', () => {
+        // Cross-repo lock: mcp-server config.ts `listenerDeviceId` must derive
+        // this exact id from the same machine seed, or `zeph_ask` hooks land in
+        // the feed but never thread into the agent chat. The golden constant is
+        // hardcoded in BOTH repos (mcp-server src/listener-device-id.test.ts),
+        // so any change to the hash formula breaks the test on both sides.
+        expect(computeListenerDeviceId('ZEPH-TEST-MACHINE-ID-0001')).toBe('dev_listener_a8d5d472');
+    });
+
     it('pins the no-arg id for the process lifetime (hostname drift immunity)', () => {
         // macOS renames the hostname with network changes; the id used to
         // connect and the id checked on screen requests must never diverge.

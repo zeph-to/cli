@@ -1,6 +1,5 @@
-import { createHash } from 'node:crypto';
-import { hostname } from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { listenerDeviceId } from './listener-device-id.js';
 import type { ZephOptions, NotifyPayload, NotifyResult, ListParams, ListResult, PushItem, DismissOneResult, DismissAllResult, ApiErrorResponse, UploadRequestResult } from './types.js';
 import { ZephError, AuthenticationError, QuotaExceededError } from './errors.js';
 import { initCrypto, getKeyPair, encryptPushBodyForSelf, encryptFileForSelf } from './crypto.js';
@@ -14,7 +13,10 @@ const PREVIEW_LENGTH = 200;
  * Stable agent-session grouping when running inside a tmux agent session, so a
  * hook/notify (e.g. the Stop-hook recap) files under the same session key as
  * the listener's pushes — surviving Claude session-UUID rotation. The device id
- * MUST match cli `computeListenerDeviceId` (`dev_listener_<sha8(hostname)>`).
+ * MUST equal the listener's `computeListenerDeviceId`, so it's resolved the same
+ * way (machine-id hash → sticky file → hostname) via the shared read-only
+ * helper — NOT a bare hostname hash, which drifts from the listener's id when a
+ * machine id is readable and files the push under a non-matching session key.
  */
 const agentSessionContext = (): { agentDeviceId: string; agentSessionName: string } | null => {
   if (!process.env.TMUX) return null;
@@ -25,8 +27,7 @@ const agentSessionContext = (): { agentDeviceId: string; agentSessionName: strin
     return null;
   }
   if (!name) return null;
-  const h = createHash('sha256').update(hostname()).digest('hex').slice(0, 8);
-  return { agentDeviceId: `dev_listener_${h}`, agentSessionName: name };
+  return { agentDeviceId: listenerDeviceId(), agentSessionName: name };
 };
 
 const inferMimeType = (fileName: string): string => {
@@ -198,6 +199,20 @@ export class ZephHook {
   async dismissAll(): Promise<DismissAllResult> {
     const json = await this.request<{ data: { dismissed: number } }>('POST', '/pushes/dismiss-all');
     return { dismissed: json.data?.dismissed ?? 0 };
+  }
+
+  /**
+   * Set (or clear, with an empty alias) the display name for an agent session,
+   * keyed by its tmux `name` on `deviceId`. The alias overrides the app's
+   * computed session label; it survives listener re-reports (server-side).
+   */
+  async renameAgentSession(deviceId: string, name: string, alias: string): Promise<{ deviceId: string }> {
+    const res = await this.request<{ data: { deviceId: string } }>(
+      'PATCH',
+      `/devices/${encodeURIComponent(deviceId)}/agent-sessions/${encodeURIComponent(name)}`,
+      { alias },
+    );
+    return { deviceId: res.data.deviceId };
   }
 
   private async request<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
