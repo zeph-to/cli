@@ -777,8 +777,16 @@ export const handleScreenRequest = (req: ScreenRequest): ScreenSnapshot | null =
 
 /** Raw pane capture + size cap. Shared by the request path and the
  *  post-injection auto-snapshot. */
-const capturePane = (sessionName: string): { content: string; truncated: boolean } | null => {
-    const r = spawnSync('tmux', tmuxArgs(['capture-pane', '-p', '-t', sessionName, '-S', `-${SCREEN_PEEK_LINES}`]), {
+const capturePane = (
+    sessionName: string,
+    escapes = false,
+): { content: string; truncated: boolean } | null => {
+    // `-e` keeps ANSI/color escapes for the xterm.js live stream. The
+    // screen-peek path leaves it off so its <pre> renderer stays plain text.
+    const captureArgs = escapes
+        ? ['capture-pane', '-p', '-e', '-t', sessionName, '-S', `-${SCREEN_PEEK_LINES}`]
+        : ['capture-pane', '-p', '-t', sessionName, '-S', `-${SCREEN_PEEK_LINES}`];
+    const r = spawnSync('tmux', tmuxArgs(captureArgs), {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -832,6 +840,141 @@ export const scheduleInjectSnapshots = (
         }, delay),
     );
     pendingInjectSnapshots.set(sessionName, timers);
+};
+
+// ─── Live mirror (PoC): continuous pane streaming ──────────────────
+// Extends screen-peek from pull (one snapshot per request) to a subscribed
+// stream over the same ephemeral relay, same security posture (only
+// inventory-visible sessions, addressed by deviceId, same rate-limit bucket).
+//
+// PoC CAVEAT: frames ride the relay in PLAINTEXT — the listener has no
+// per-device key yet (see the handlePush encryption gap). Do NOT stream a
+// session holding secrets until listener E2EE lands.
+export interface StreamControl {
+    subtype?: string;
+    targetDeviceId?: string;
+    sessionName?: string;
+}
+
+// ~2.5 fps ceiling. Cadence + diff-gating are the ONLY bound on API Gateway
+// WS cost (the $default route has no per-message limit), so keep it modest
+// and let unchanged frames drop.
+const STREAM_INTERVAL_MS = 400;
+// Orphan guard: a phone that dies without sending agent.stream.stop must not
+// leak an interval forever. Auto-stop after this long; the phone re-subscribes
+// on reopen.
+const STREAM_MAX_MS = 5 * 60_000;
+
+// R2 instrumentation: the daemon's outbound send() IS the API Gateway $default
+// inbound message (1 Lambda + DDB ops + N PostToConnection each), so counting
+// frames/bytes HERE measures the real cloud cost of a live stream. Rolled up to
+// the log every STREAM_LOG_INTERVAL_MS and summarized on stop — the data that
+// decides cloud-throttled (B-lite) vs direct/Tailscale (B-full).
+const STREAM_LOG_INTERVAL_MS = 5_000;
+
+interface StreamStats {
+    startedAt: number;
+    frames: number; // frames actually sent (post diff-gate)
+    bytes: number; // payload bytes sent
+    skipped: number; // ticks suppressed by the diff-gate
+    lastLogAt: number;
+    lastLogFrames: number;
+    lastLogBytes: number;
+}
+
+interface ActiveStream {
+    timer: ReturnType<typeof setInterval>;
+    stats: StreamStats;
+}
+
+const activeStreams = new Map<string, ActiveStream>();
+
+const maybeLogStreamStats = (sessionName: string, stats: StreamStats): void => {
+    const elapsed = Date.now() - stats.lastLogAt;
+    if (elapsed < STREAM_LOG_INTERVAL_MS) return;
+    const secs = elapsed / 1000;
+    const fps = (stats.frames - stats.lastLogFrames) / secs;
+    const kbps = (stats.bytes - stats.lastLogBytes) / 1024 / secs;
+    log(`⧉ stream ${sessionName}: ${fps.toFixed(1)} fps, ${kbps.toFixed(1)} KB/s (${stats.frames} sent, ${stats.skipped} diff-skipped)`);
+    stats.lastLogAt = Date.now();
+    stats.lastLogFrames = stats.frames;
+    stats.lastLogBytes = stats.bytes;
+};
+
+export const stopStream = (sessionName: string): void => {
+    const entry = activeStreams.get(sessionName);
+    if (!entry) return;
+    clearInterval(entry.timer);
+    activeStreams.delete(sessionName);
+    const { stats } = entry;
+    const secs = Math.max(0.001, (Date.now() - stats.startedAt) / 1000);
+    log(
+        `⧉ stream ${sessionName} stopped: ${stats.frames} frames / ` +
+            `${(stats.bytes / 1024).toFixed(1)} KB over ${secs.toFixed(1)}s ` +
+            `(${(stats.frames / secs).toFixed(1)} fps avg, ${stats.skipped} diff-skipped)`,
+    );
+};
+
+export const stopAllStreams = (): void => {
+    // Route through stopStream so each stream emits its summary line.
+    for (const sessionName of [...activeStreams.keys()]) stopStream(sessionName);
+};
+
+/**
+ * Handle agent.stream.start / agent.stream.stop. Returns true when the message
+ * was a stream-control message (so the caller skips the one-shot screen-peek
+ * path). start is idempotent — a repeat restarts the loop.
+ */
+export const handleStreamControl = (
+    req: StreamControl,
+    send: (data: Record<string, unknown>) => void,
+): boolean => {
+    if (req.subtype === 'agent.stream.stop') {
+        if (req.sessionName) stopStream(req.sessionName);
+        return true;
+    }
+    if (req.subtype !== 'agent.stream.start') return false;
+    // Not addressed to this machine — let other listeners answer.
+    if (req.targetDeviceId !== computeListenerDeviceId()) return false;
+    const sessionName = req.sessionName;
+    if (!sessionName) return true;
+    if (!collectSessions().some((s) => s.name === sessionName)) {
+        send({ subtype: 'agent.stream.frame', sessionName, error: 'unknown_session' });
+        return true;
+    }
+    stopStream(sessionName); // idempotent restart
+    let lastContent: string | null = null;
+    const stats: StreamStats = {
+        startedAt: Date.now(),
+        frames: 0,
+        bytes: 0,
+        skipped: 0,
+        lastLogAt: Date.now(),
+        lastLogFrames: 0,
+        lastLogBytes: 0,
+    };
+    const timer = setInterval(() => {
+        const captured = capturePane(sessionName, true);
+        if (!captured || captured.content === lastContent) {
+            stats.skipped++;
+            return; // diff-gate
+        }
+        lastContent = captured.content;
+        stats.frames++;
+        stats.bytes += Buffer.byteLength(captured.content, 'utf-8');
+        send({
+            subtype: 'agent.stream.frame',
+            sessionName,
+            capturedAt: new Date().toISOString(),
+            ...captured,
+        });
+        maybeLogStreamStats(sessionName, stats);
+    }, STREAM_INTERVAL_MS);
+    timer.unref?.();
+    activeStreams.set(sessionName, { timer, stats });
+    const expiry = setTimeout(() => stopStream(sessionName), STREAM_MAX_MS);
+    expiry.unref?.();
+    return true;
 };
 
 export interface CollectResult {
@@ -1518,9 +1661,17 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                 // Screen peek (§S4): the phone asks for this machine's live
                 // pane content over the ephemeral relay; the reply rides the
                 // same channel. Nothing is persisted server-side.
-                const reply = handleScreenRequest(m.data as ScreenRequest);
-                if (reply && sock.readyState === WebSocket.OPEN) {
-                    sock.send(JSON.stringify({ type: 'ephemeral', data: reply }));
+                const sendEphemeral = (data: object) => {
+                    if (sock.readyState === WebSocket.OPEN) {
+                        sock.send(JSON.stringify({ type: 'ephemeral', data }));
+                    }
+                };
+                // Live mirror (PoC): agent.stream.start/stop drives a
+                // continuous, diff-gated frame loop; falls through to the
+                // one-shot screen-peek when it isn't a stream-control message.
+                if (!handleStreamControl(m.data as StreamControl, sendEphemeral)) {
+                    const reply = handleScreenRequest(m.data as ScreenRequest);
+                    if (reply) sendEphemeral(reply);
                 }
             }
             // Surface server-side errors from listener.sessions reports.
@@ -1544,6 +1695,7 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
         });
 
         sock.on('close', (code, reasonBuf) => {
+            stopAllStreams();
             cleanup();
             resolve({ closeCode: code, reason: reasonBuf?.toString('utf-8') ?? '', connected: opened });
         });

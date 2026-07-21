@@ -20,6 +20,9 @@ import {
     resolveWsUrl,
     deriveSessionState,
     handleScreenRequest,
+    handleStreamControl,
+    stopStream,
+    stopAllStreams,
     resetSessionStates,
     collectWatchHits,
     setPatternWatches,
@@ -647,6 +650,45 @@ describe('handleScreenRequest', () => {
         expect(reply?.requestId).toBe('r42');
         expect(['unknown_session', 'rate_limited']).toContain(reply?.error);
         expect(reply?.content).toBeUndefined();
+    });
+});
+
+describe('handleStreamControl (live mirror PoC)', () => {
+    const myDevice = computeListenerDeviceId();
+    afterEach(() => stopAllStreams());
+
+    it('does not claim non-stream ephemeral traffic (falls through to screen-peek)', () => {
+        const sent: object[] = [];
+        expect(handleStreamControl({ subtype: 'clipboard' }, (d) => sent.push(d))).toBe(false);
+        expect(handleStreamControl({ subtype: 'agent.screen.request' }, (d) => sent.push(d))).toBe(false);
+        expect(sent).toEqual([]);
+    });
+
+    it('ignores a start addressed to another device', () => {
+        const sent: object[] = [];
+        expect(handleStreamControl(
+            { subtype: 'agent.stream.start', targetDeviceId: 'dev_someone_else', sessionName: 'zeph-proj' },
+            (d) => sent.push(d),
+        )).toBe(false);
+        expect(sent).toEqual([]);
+    });
+
+    it('claims a start for an unknown session with an error frame and starts no timer', () => {
+        // No zeph-* tmux sessions exist in the test env → inventory guard
+        // rejects before any interval is scheduled (no leak to clean up).
+        const sent: Array<Record<string, unknown>> = [];
+        expect(handleStreamControl(
+            { subtype: 'agent.stream.start', targetDeviceId: myDevice, sessionName: 'zeph-not-there' },
+            (d) => sent.push(d as Record<string, unknown>),
+        )).toBe(true);
+        expect(sent).toHaveLength(1);
+        expect(sent[0]).toMatchObject({ subtype: 'agent.stream.frame', error: 'unknown_session' });
+    });
+
+    it('claims a stop message and is a no-op for an unknown session', () => {
+        expect(handleStreamControl({ subtype: 'agent.stream.stop', sessionName: 'zeph-proj' }, () => {})).toBe(true);
+        expect(() => stopStream('zeph-proj')).not.toThrow();
+        expect(() => stopAllStreams()).not.toThrow();
     });
 });
 
