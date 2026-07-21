@@ -32,6 +32,7 @@ import { projectHash, remoteDigest, remoteMarkerPath, stateDir } from './gate.js
 import { matchAgentByPaneCommand, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 import { advanceState, evaluateState, findPatternMatch, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
+import { encryptEphemeral, getDevicePublicKey, initDeviceCrypto, type EncryptedEphemeralPayload } from './crypto.js';
 
 const PING_INTERVAL_MS = 25_000;
 const PONG_TIMEOUT_MS = 10_000;
@@ -851,18 +852,24 @@ export const scheduleInjectSnapshots = (
     pendingInjectSnapshots.set(sessionName, timers);
 };
 
-// ─── Live mirror (PoC): continuous pane streaming ──────────────────
+// ─── Live mirror: continuous pane streaming ──────────────────
 // Extends screen-peek from pull (one snapshot per request) to a subscribed
 // stream over the same ephemeral relay, same security posture (only
 // inventory-visible sessions, addressed by deviceId, same rate-limit bucket).
 //
-// PoC CAVEAT: frames ride the relay in PLAINTEXT — the listener has no
-// per-device key yet (see the handlePush encryption gap). Do NOT stream a
-// session holding secrets until listener E2EE lands.
+// E2EE: when the subscriber sends its device public key with stream.start,
+// every frame's pane content rides inside an ECDH P-256 + AES-256-GCM
+// envelope only that phone can open (see crypto.ts encryptEphemeral). The
+// relay stays pass-through. Without a key (older client / E2EE not set up)
+// frames fall back to plaintext — the web keeps its warning banner for that
+// case. Once a stream is encrypted an encrypt failure DROPS the frame; it
+// never downgrades to plaintext mid-stream.
 export interface StreamControl {
     subtype?: string;
     targetDeviceId?: string;
     sessionName?: string;
+    /** Subscriber's device public key (Base64 SPKI) — presence turns on E2EE. */
+    subscriberPublicKey?: string;
 }
 
 // ~2.5 fps ceiling. Cadence + diff-gating are the ONLY bound on API Gateway
@@ -877,6 +884,9 @@ const STREAM_INTERVAL_MS = 400;
 // leak an interval forever. Auto-stop after this long; the phone re-subscribes
 // on reopen.
 const STREAM_MAX_MS = 5 * 60_000;
+// Fail-closed guard: consecutive encrypt failures (malformed subscriber key)
+// stop the stream with an error frame instead of retrying forever.
+const STREAM_MAX_ENCRYPT_FAILURES = 3;
 
 // R2 instrumentation: the daemon's outbound send() IS the API Gateway $default
 // inbound message (1 Lambda + DDB ops + N PostToConnection each), so counting
@@ -933,6 +943,63 @@ export const stopAllStreams = (): void => {
     for (const sessionName of [...activeStreams.keys()]) stopStream(sessionName);
 };
 
+/** Wire shape of one live-mirror data frame (before the relay's ephemeral wrap). */
+export type StreamFramePayload = {
+    subtype: 'agent.stream.frame';
+    sessionName: string;
+    capturedAt: string;
+    truncated: boolean;
+    /** Capture-order stamp — attached at send time, not by buildStreamFrame. */
+    seq?: number;
+    /** Stream incarnation (stats.startedAt) — lets the receiver reset its
+     *  seq high-water mark when the daemon restarts the stream. */
+    epoch?: number;
+    /** Plaintext pane content — only on unencrypted streams. */
+    content?: string;
+    /** E2EE envelope — replaces `content` on encrypted streams. */
+    encrypted?: EncryptedEphemeralPayload;
+};
+
+/** Wire shape of a live-mirror error frame — same subtype, no pane data. */
+export type StreamErrorFrame = {
+    subtype: 'agent.stream.frame';
+    sessionName: string;
+    error: 'unknown_session' | 'e2ee_unavailable' | 'encrypt_failed';
+};
+
+const streamErrorFrame = (sessionName: string, error: StreamErrorFrame['error']): StreamErrorFrame => ({
+    subtype: 'agent.stream.frame',
+    sessionName,
+    error,
+});
+
+/**
+ * Build the wire payload for one stream frame. With a subscriber public key
+ * the pane content rides ONLY inside the E2EE envelope; an encrypt failure
+ * (bad key, crypto not ready on the first tick) returns null so the caller
+ * drops the frame — an encrypted stream never leaks a plaintext frame.
+ */
+export const buildStreamFrame = async (
+    captured: { content: string; truncated: boolean },
+    sessionName: string,
+    subscriberPublicKey?: string,
+): Promise<StreamFramePayload | null> => {
+    const base = {
+        subtype: 'agent.stream.frame' as const,
+        sessionName,
+        capturedAt: new Date().toISOString(),
+        truncated: captured.truncated,
+    };
+    if (!subscriberPublicKey) return { ...base, content: captured.content };
+    try {
+        const encrypted = await encryptEphemeral(captured.content, subscriberPublicKey);
+        return { ...base, encrypted };
+    } catch (err) {
+        log(`⧉ stream ${sessionName}: frame encrypt failed (${err instanceof Error ? err.message : err}) — frame dropped`);
+        return null;
+    }
+};
+
 /**
  * Handle agent.stream.start / agent.stream.stop. Returns true when the message
  * was a stream-control message (so the caller skips the one-shot screen-peek
@@ -952,7 +1019,7 @@ export const handleStreamControl = (
     const sessionName = req.sessionName;
     if (!sessionName) return true;
     if (!collectSessions().some((s) => s.name === sessionName)) {
-        send({ subtype: 'agent.stream.frame', sessionName, error: 'unknown_session' });
+        send(streamErrorFrame(sessionName, 'unknown_session'));
         return true;
     }
     stopStream(sessionName); // idempotent restart
@@ -966,6 +1033,24 @@ export const handleStreamControl = (
         lastLogFrames: 0,
         lastLogBytes: 0,
     };
+    // E2EE handshake: load-or-create this device's keypair up front. The
+    // subscriber asked for encryption, so key failure is FAIL-CLOSED: refuse
+    // to stream rather than downgrade to plaintext — a silent downgrade is
+    // exactly the signal a key-stripping relay would produce. The phone sees
+    // the error frame and can choose to re-subscribe without a key.
+    const subscriberPublicKey = req.subscriberPublicKey;
+    if (subscriberPublicKey) {
+        initDeviceCrypto().catch((err) => {
+            // Stream stopped or replaced while init was in flight — the
+            // failure belongs to the old incarnation, not the current one.
+            if (activeStreams.get(sessionName)?.stats !== stats) return;
+            log(`⧉ stream ${sessionName}: device crypto init failed (${err instanceof Error ? err.message : err}) — refusing to stream (fail-closed)`);
+            send(streamErrorFrame(sessionName, 'e2ee_unavailable'));
+            stopStream(sessionName);
+        });
+    }
+    let wireSeq = 0;
+    let encryptFailures = 0;
     const timer = setInterval(() => {
         const captured = capturePane(sessionName, true, STREAM_CAPTURE_LINES);
         if (!captured || captured.content === lastContent) {
@@ -973,15 +1058,48 @@ export const handleStreamControl = (
             return; // diff-gate
         }
         lastContent = captured.content;
-        stats.frames++;
-        stats.bytes += Buffer.byteLength(captured.content, 'utf-8');
-        send({
-            subtype: 'agent.stream.frame',
-            sessionName,
-            capturedAt: new Date().toISOString(),
-            ...captured,
+        // Stamp the sequence in CAPTURE order, synchronously — frame assembly
+        // is async (encryption) and fire-and-forget, so resolve order is not
+        // guaranteed under load; the receiver drops any seq it has already
+        // painted past.
+        const seq = ++wireSeq;
+        void buildStreamFrame(captured, sessionName, subscriberPublicKey).then((frame) => {
+            // Stream stopped or restarted while this frame was in flight —
+            // `stats` is unique per start, so it doubles as the identity
+            // token. Don't send into a dead/replaced stream or skew its stats.
+            if (activeStreams.get(sessionName)?.stats !== stats) return;
+            if (!frame) {
+                // Encrypt failure — frame dropped, diff-gate un-marked so the
+                // next tick retries. A key that keeps failing (malformed
+                // subscriber key) never recovers: fail closed after a few
+                // strikes instead of retrying every 400ms for 5 minutes.
+                lastContent = null;
+                // Init still in flight (or failed — its own path fail-closes):
+                // a not-yet-ready key is not a malformed key, don't strike.
+                if (getDevicePublicKey() === null) return;
+                encryptFailures++;
+                if (encryptFailures >= STREAM_MAX_ENCRYPT_FAILURES) {
+                    send(streamErrorFrame(sessionName, 'encrypt_failed'));
+                    stopStream(sessionName);
+                }
+                return;
+            }
+            encryptFailures = 0;
+            stats.frames++;
+            // Measure the actual wire payload (the encrypted envelope is
+            // ~1.4× the plaintext; base fields now count too, so plaintext
+            // streams read slightly higher than the pre-E2EE content-only
+            // metric) — this feeds the R2 cost instrumentation.
+            stats.bytes += Buffer.byteLength(JSON.stringify(frame), 'utf-8');
+            // seq = capture order; epoch = this stream incarnation, so the
+            // receiver's ordering guard resets across daemon-side restarts.
+            send({ ...frame, seq, epoch: stats.startedAt });
+            maybeLogStreamStats(sessionName, stats);
+        }).catch((err) => {
+            // A long-lived daemon must never crash on an unhandled rejection
+            // from send()/logging — report and let the next tick carry on.
+            log(`⧉ stream ${sessionName}: frame send failed (${err instanceof Error ? err.message : err})`);
         });
-        maybeLogStreamStats(sessionName, stats);
     }, STREAM_INTERVAL_MS);
     timer.unref?.();
     activeStreams.set(sessionName, { timer, stats });

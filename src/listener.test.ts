@@ -697,6 +697,79 @@ describe('handleStreamControl (live mirror PoC)', () => {
     });
 });
 
+describe('buildStreamFrame (stream E2EE)', () => {
+    // Fresh HOME per test so device-keys.json lands in a tmp dir, and fresh
+    // modules so crypto.ts re-resolves its paths against it (same pattern as
+    // crypto.test.ts).
+    let TMP: string;
+    const originalHome = process.env.HOME;
+
+    beforeEach(() => {
+        TMP = mkdtempSync(join(tmpdir(), 'listener-stream-e2ee-'));
+        process.env.HOME = TMP;
+        vi.resetModules();
+    });
+
+    afterEach(() => {
+        rmSync(TMP, { recursive: true, force: true });
+        if (originalHome === undefined) delete process.env.HOME;
+        else process.env.HOME = originalHome;
+    });
+
+    const makeRecipientKey = async (): Promise<string> => {
+        const { webcrypto } = await import('node:crypto');
+        const wc = webcrypto as unknown as Crypto;
+        const pair = await wc.subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits'],
+        ) as CryptoKeyPair;
+        const spki = new Uint8Array(await wc.subtle.exportKey('spki', pair.publicKey));
+        let bin = '';
+        for (let i = 0; i < spki.length; i++) bin += String.fromCharCode(spki[i]);
+        return btoa(bin);
+    };
+
+    it('emits plaintext content when no subscriber key is given', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const frame = await buildStreamFrame({ content: 'hello pane', truncated: false }, 'zeph-a');
+        expect(frame).toMatchObject({ subtype: 'agent.stream.frame', sessionName: 'zeph-a', content: 'hello pane' });
+        expect(frame).not.toHaveProperty('encrypted');
+    });
+
+    it('wraps content in an E2EE envelope when a subscriber key is given — no plaintext field', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const { initDeviceCrypto, getDevicePublicKey } = await import('./crypto.js');
+        await initDeviceCrypto();
+        const frame = await buildStreamFrame(
+            { content: 'secret pane', truncated: true }, 'zeph-a', await makeRecipientKey(),
+        );
+        expect(frame).not.toBeNull();
+        expect(frame).not.toHaveProperty('content');
+        expect(frame).toMatchObject({ subtype: 'agent.stream.frame', sessionName: 'zeph-a', truncated: true });
+        const encrypted = frame?.encrypted;
+        expect(encrypted?.senderPublicKey).toBe(getDevicePublicKey());
+        for (const field of ['ciphertext', 'iv', 'encryptedKey', 'keyIv'] as const) {
+            expect(encrypted?.[field]).toMatch(/^[A-Za-z0-9+/=]+$/);
+        }
+        expect(encrypted?.ciphertext).not.toContain('secret pane');
+    });
+
+    it('drops the frame (null) on a bad subscriber key — never leaks plaintext', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const { initDeviceCrypto } = await import('./crypto.js');
+        await initDeviceCrypto();
+        const frame = await buildStreamFrame({ content: 'secret pane', truncated: false }, 'zeph-a', 'not-a-key');
+        expect(frame).toBeNull();
+    });
+
+    it('drops the frame (null) when device crypto is not initialized', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const frame = await buildStreamFrame(
+            { content: 'secret pane', truncated: false }, 'zeph-a', await makeRecipientKey(),
+        );
+        expect(frame).toBeNull();
+    });
+});
+
 describe('pattern watches (§S5 v2)', () => {
     beforeEach(() => {
         resetPatternWatches();
