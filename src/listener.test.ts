@@ -260,6 +260,11 @@ describe('resolveKeys', () => {
         ]);
     });
 
+    it('maps tab, backspace, and the extended editing keys to tmux tokens', () => {
+        expect(resolveKeys(['tab', 'BackSpace'])).toEqual(['Tab', 'BSpace']);
+        expect(resolveKeys(['backtab', 'delete', 'Space'])).toEqual(['BTab', 'DC', 'Space']);
+    });
+
     it('rejects the whole batch if any key is unknown', () => {
         expect(resolveKeys(['escape', 'C-c'])).toBeNull();
         expect(resolveKeys(['pageup'])).toBeNull();

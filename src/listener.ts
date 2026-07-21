@@ -199,6 +199,11 @@ const ALLOWED_KEYS: Record<string, string> = {
     left: 'Left',
     right: 'Right',
     enter: 'Enter',
+    tab: 'Tab',
+    backtab: 'BTab',
+    backspace: 'BSpace',
+    delete: 'DC',
+    space: 'Space',
 };
 
 /**
