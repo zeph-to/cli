@@ -780,12 +780,16 @@ export const handleScreenRequest = (req: ScreenRequest): ScreenSnapshot | null =
 const capturePane = (
     sessionName: string,
     escapes = false,
+    lines: number = SCREEN_PEEK_LINES,
 ): { content: string; truncated: boolean } | null => {
     // `-e` keeps ANSI/color escapes for the xterm.js live stream. The
     // screen-peek path leaves it off so its <pre> renderer stays plain text.
+    // `lines` sets how far back the capture reaches — the live stream grabs
+    // more history so the mirror has room to scroll; SCREEN_PEEK_MAX_BYTES
+    // still caps the payload below.
     const captureArgs = escapes
-        ? ['capture-pane', '-p', '-e', '-t', sessionName, '-S', `-${SCREEN_PEEK_LINES}`]
-        : ['capture-pane', '-p', '-t', sessionName, '-S', `-${SCREEN_PEEK_LINES}`];
+        ? ['capture-pane', '-p', '-e', '-t', sessionName, '-S', `-${lines}`]
+        : ['capture-pane', '-p', '-t', sessionName, '-S', `-${lines}`];
     const r = spawnSync('tmux', tmuxArgs(captureArgs), {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -859,6 +863,10 @@ export interface StreamControl {
 // ~2.5 fps ceiling. Cadence + diff-gating are the ONLY bound on API Gateway
 // WS cost (the $default route has no per-message limit), so keep it modest
 // and let unchanged frames drop.
+// How far back the live-stream capture reaches — more than the screen-peek
+// window so the mirror has scrollback to scroll through. SCREEN_PEEK_MAX_BYTES
+// still caps the actual payload, so very wide panes get top-truncated.
+const STREAM_CAPTURE_LINES = 200;
 const STREAM_INTERVAL_MS = 400;
 // Orphan guard: a phone that dies without sending agent.stream.stop must not
 // leak an interval forever. Auto-stop after this long; the phone re-subscribes
@@ -954,7 +962,7 @@ export const handleStreamControl = (
         lastLogBytes: 0,
     };
     const timer = setInterval(() => {
-        const captured = capturePane(sessionName, true);
+        const captured = capturePane(sessionName, true, STREAM_CAPTURE_LINES);
         if (!captured || captured.content === lastContent) {
             stats.skipped++;
             return; // diff-gate
