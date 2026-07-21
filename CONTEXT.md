@@ -8,10 +8,15 @@ grill-with-docs session 2026-06-29.
 
 ### Machine Device
 A single logical device representing one host. Identified by `deviceId =
-computeListenerDeviceId()` (deterministic from hostname). All Zeph processes on that
+computeListenerDeviceId()` (deterministic from platform **machine id**, persisted —
+hostname 파생 금지: hostname drift가 한 머신을 여러 device로 분열시킴). All Zeph processes on that
 host — `zeph notify` (sender), the listener (receiver), and the MCP server (sender) —
 share **one** Machine Device identity and **one** Device Keypair. The phone sees one
 device per machine, not one per process.
+
+### Config precedence
+CLI flag > env (`ZEPH_WS_URL` 등) > config file > built-in default.
+cli/mcp-server/plugin 3패키지 공통 계약 — 우선순위 변경 시 이 절부터 갱신한다.
 
 ### Device Keypair
 The ECDH P-256 key material owned by a Machine Device. The **private** key never
