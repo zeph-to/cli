@@ -884,6 +884,12 @@ const STREAM_INTERVAL_MS = 400;
 // leak an interval forever. Auto-stop after this long; the phone re-subscribes
 // on reopen.
 const STREAM_MAX_MS = 5 * 60_000;
+// Per-listener concurrency guard: the API Gateway WS stage throttle (50 rps)
+// is SHARED across every user, so a runaway machine (many sessions, or a
+// client re-subscribe bug) streaming at 2.5 fps each can starve push delivery
+// and presence for everyone. One phone watches one session at a time; 3 leaves
+// headroom for multiple devices while capping the blast radius of one host.
+export const MAX_CONCURRENT_STREAMS = 3;
 // Fail-closed guard: consecutive encrypt failures (malformed subscriber key)
 // stop the stream with an error frame instead of retrying forever.
 const STREAM_MAX_ENCRYPT_FAILURES = 3;
@@ -964,8 +970,15 @@ export type StreamFramePayload = {
 export type StreamErrorFrame = {
     subtype: 'agent.stream.frame';
     sessionName: string;
-    error: 'unknown_session' | 'e2ee_unavailable' | 'encrypt_failed';
+    error: 'unknown_session' | 'e2ee_unavailable' | 'encrypt_failed' | 'stream_limit';
 };
+
+/**
+ * Per-listener concurrency guard, as a pure predicate so the boundary is
+ * unit-testable without touching the module-scope `activeStreams` map.
+ */
+export const isStreamCapReached = (activeCount: number): boolean =>
+    activeCount >= MAX_CONCURRENT_STREAMS;
 
 const streamErrorFrame = (sessionName: string, error: StreamErrorFrame['error']): StreamErrorFrame => ({
     subtype: 'agent.stream.frame',
@@ -1022,7 +1035,15 @@ export const handleStreamControl = (
         send(streamErrorFrame(sessionName, 'unknown_session'));
         return true;
     }
-    stopStream(sessionName); // idempotent restart
+    stopStream(sessionName); // idempotent restart (frees this session's slot first)
+    // Concurrency guard AFTER the restart-stop: re-subscribing to an already
+    // active session doesn't count against the cap, only a genuinely new one
+    // does. Refuse the new stream instead of adding to the shared-throttle load.
+    if (isStreamCapReached(activeStreams.size)) {
+        log(`⧉ stream ${sessionName}: refused — ${activeStreams.size}/${MAX_CONCURRENT_STREAMS} streams already active on this listener`);
+        send(streamErrorFrame(sessionName, 'stream_limit'));
+        return true;
+    }
     let lastContent: string | null = null;
     const stats: StreamStats = {
         startedAt: Date.now(),

@@ -21,6 +21,8 @@ import {
     deriveSessionState,
     handleScreenRequest,
     handleStreamControl,
+    isStreamCapReached,
+    MAX_CONCURRENT_STREAMS,
     stopStream,
     stopAllStreams,
     resetSessionStates,
@@ -694,6 +696,15 @@ describe('handleStreamControl (live mirror PoC)', () => {
         expect(handleStreamControl({ subtype: 'agent.stream.stop', sessionName: 'zeph-proj' }, () => {})).toBe(true);
         expect(() => stopStream('zeph-proj')).not.toThrow();
         expect(() => stopAllStreams()).not.toThrow();
+    });
+});
+
+describe('isStreamCapReached (per-listener concurrency guard)', () => {
+    it('allows counts below the cap and refuses at or above it', () => {
+        expect(isStreamCapReached(0)).toBe(false);
+        expect(isStreamCapReached(MAX_CONCURRENT_STREAMS - 1)).toBe(false);
+        expect(isStreamCapReached(MAX_CONCURRENT_STREAMS)).toBe(true);
+        expect(isStreamCapReached(MAX_CONCURRENT_STREAMS + 1)).toBe(true);
     });
 });
 
