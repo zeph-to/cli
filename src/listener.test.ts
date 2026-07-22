@@ -20,6 +20,11 @@ import {
     resolveWsUrl,
     deriveSessionState,
     handleScreenRequest,
+    handleStreamControl,
+    isStreamCapReached,
+    MAX_CONCURRENT_STREAMS,
+    stopStream,
+    stopAllStreams,
     resetSessionStates,
     collectWatchHits,
     setPatternWatches,
@@ -255,6 +260,11 @@ describe('resolveKeys', () => {
         expect(resolveKeys(['Escape', 'up', ' Down ', 'LEFT', 'right', 'enter'])).toEqual([
             'Escape', 'Up', 'Down', 'Left', 'Right', 'Enter',
         ]);
+    });
+
+    it('maps tab, backspace, and the extended editing keys to tmux tokens', () => {
+        expect(resolveKeys(['tab', 'BackSpace'])).toEqual(['Tab', 'BSpace']);
+        expect(resolveKeys(['backtab', 'delete', 'Space'])).toEqual(['BTab', 'DC', 'Space']);
     });
 
     it('rejects the whole batch if any key is unknown', () => {
@@ -647,6 +657,127 @@ describe('handleScreenRequest', () => {
         expect(reply?.requestId).toBe('r42');
         expect(['unknown_session', 'rate_limited']).toContain(reply?.error);
         expect(reply?.content).toBeUndefined();
+    });
+});
+
+describe('handleStreamControl (live mirror PoC)', () => {
+    const myDevice = computeListenerDeviceId();
+    afterEach(() => stopAllStreams());
+
+    it('does not claim non-stream ephemeral traffic (falls through to screen-peek)', () => {
+        const sent: object[] = [];
+        expect(handleStreamControl({ subtype: 'clipboard' }, (d) => sent.push(d))).toBe(false);
+        expect(handleStreamControl({ subtype: 'agent.screen.request' }, (d) => sent.push(d))).toBe(false);
+        expect(sent).toEqual([]);
+    });
+
+    it('ignores a start addressed to another device', () => {
+        const sent: object[] = [];
+        expect(handleStreamControl(
+            { subtype: 'agent.stream.start', targetDeviceId: 'dev_someone_else', sessionName: 'zeph-proj' },
+            (d) => sent.push(d),
+        )).toBe(false);
+        expect(sent).toEqual([]);
+    });
+
+    it('claims a start for an unknown session with an error frame and starts no timer', () => {
+        // No zeph-* tmux sessions exist in the test env → inventory guard
+        // rejects before any interval is scheduled (no leak to clean up).
+        const sent: Array<Record<string, unknown>> = [];
+        expect(handleStreamControl(
+            { subtype: 'agent.stream.start', targetDeviceId: myDevice, sessionName: 'zeph-not-there' },
+            (d) => sent.push(d as Record<string, unknown>),
+        )).toBe(true);
+        expect(sent).toHaveLength(1);
+        expect(sent[0]).toMatchObject({ subtype: 'agent.stream.frame', error: 'unknown_session' });
+    });
+
+    it('claims a stop message and is a no-op for an unknown session', () => {
+        expect(handleStreamControl({ subtype: 'agent.stream.stop', sessionName: 'zeph-proj' }, () => {})).toBe(true);
+        expect(() => stopStream('zeph-proj')).not.toThrow();
+        expect(() => stopAllStreams()).not.toThrow();
+    });
+});
+
+describe('isStreamCapReached (per-listener concurrency guard)', () => {
+    it('allows counts below the cap and refuses at or above it', () => {
+        expect(isStreamCapReached(0)).toBe(false);
+        expect(isStreamCapReached(MAX_CONCURRENT_STREAMS - 1)).toBe(false);
+        expect(isStreamCapReached(MAX_CONCURRENT_STREAMS)).toBe(true);
+        expect(isStreamCapReached(MAX_CONCURRENT_STREAMS + 1)).toBe(true);
+    });
+});
+
+describe('buildStreamFrame (stream E2EE)', () => {
+    // Fresh HOME per test so device-keys.json lands in a tmp dir, and fresh
+    // modules so crypto.ts re-resolves its paths against it (same pattern as
+    // crypto.test.ts).
+    let TMP: string;
+    const originalHome = process.env.HOME;
+
+    beforeEach(() => {
+        TMP = mkdtempSync(join(tmpdir(), 'listener-stream-e2ee-'));
+        process.env.HOME = TMP;
+        vi.resetModules();
+    });
+
+    afterEach(() => {
+        rmSync(TMP, { recursive: true, force: true });
+        if (originalHome === undefined) delete process.env.HOME;
+        else process.env.HOME = originalHome;
+    });
+
+    const makeRecipientKey = async (): Promise<string> => {
+        const { webcrypto } = await import('node:crypto');
+        const wc = webcrypto as unknown as Crypto;
+        const pair = await wc.subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits'],
+        ) as CryptoKeyPair;
+        const spki = new Uint8Array(await wc.subtle.exportKey('spki', pair.publicKey));
+        let bin = '';
+        for (let i = 0; i < spki.length; i++) bin += String.fromCharCode(spki[i]);
+        return btoa(bin);
+    };
+
+    it('emits plaintext content when no subscriber key is given', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const frame = await buildStreamFrame({ content: 'hello pane', truncated: false }, 'zeph-a');
+        expect(frame).toMatchObject({ subtype: 'agent.stream.frame', sessionName: 'zeph-a', content: 'hello pane' });
+        expect(frame).not.toHaveProperty('encrypted');
+    });
+
+    it('wraps content in an E2EE envelope when a subscriber key is given — no plaintext field', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const { initDeviceCrypto, getDevicePublicKey } = await import('./crypto.js');
+        await initDeviceCrypto();
+        const frame = await buildStreamFrame(
+            { content: 'secret pane', truncated: true }, 'zeph-a', await makeRecipientKey(),
+        );
+        expect(frame).not.toBeNull();
+        expect(frame).not.toHaveProperty('content');
+        expect(frame).toMatchObject({ subtype: 'agent.stream.frame', sessionName: 'zeph-a', truncated: true });
+        const encrypted = frame?.encrypted;
+        expect(encrypted?.senderPublicKey).toBe(getDevicePublicKey());
+        for (const field of ['ciphertext', 'iv', 'encryptedKey', 'keyIv'] as const) {
+            expect(encrypted?.[field]).toMatch(/^[A-Za-z0-9+/=]+$/);
+        }
+        expect(encrypted?.ciphertext).not.toContain('secret pane');
+    });
+
+    it('drops the frame (null) on a bad subscriber key — never leaks plaintext', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const { initDeviceCrypto } = await import('./crypto.js');
+        await initDeviceCrypto();
+        const frame = await buildStreamFrame({ content: 'secret pane', truncated: false }, 'zeph-a', 'not-a-key');
+        expect(frame).toBeNull();
+    });
+
+    it('drops the frame (null) when device crypto is not initialized', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const frame = await buildStreamFrame(
+            { content: 'secret pane', truncated: false }, 'zeph-a', await makeRecipientKey(),
+        );
+        expect(frame).toBeNull();
     });
 });
 

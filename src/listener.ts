@@ -32,6 +32,7 @@ import { projectHash, remoteDigest, remoteMarkerPath, stateDir } from './gate.js
 import { matchAgentByPaneCommand, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 import { advanceState, evaluateState, findPatternMatch, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
+import { encryptEphemeral, getDevicePublicKey, initDeviceCrypto, type EncryptedEphemeralPayload } from './crypto.js';
 
 const PING_INTERVAL_MS = 25_000;
 const PONG_TIMEOUT_MS = 10_000;
@@ -199,6 +200,11 @@ const ALLOWED_KEYS: Record<string, string> = {
     left: 'Left',
     right: 'Right',
     enter: 'Enter',
+    tab: 'Tab',
+    backtab: 'BTab',
+    backspace: 'BSpace',
+    delete: 'DC',
+    space: 'Space',
 };
 
 /**
@@ -777,8 +783,20 @@ export const handleScreenRequest = (req: ScreenRequest): ScreenSnapshot | null =
 
 /** Raw pane capture + size cap. Shared by the request path and the
  *  post-injection auto-snapshot. */
-const capturePane = (sessionName: string): { content: string; truncated: boolean } | null => {
-    const r = spawnSync('tmux', tmuxArgs(['capture-pane', '-p', '-t', sessionName, '-S', `-${SCREEN_PEEK_LINES}`]), {
+const capturePane = (
+    sessionName: string,
+    escapes = false,
+    lines: number = SCREEN_PEEK_LINES,
+): { content: string; truncated: boolean } | null => {
+    // `-e` keeps ANSI/color escapes for the xterm.js live stream. The
+    // screen-peek path leaves it off so its <pre> renderer stays plain text.
+    // `lines` sets how far back the capture reaches — the live stream grabs
+    // more history so the mirror has room to scroll; SCREEN_PEEK_MAX_BYTES
+    // still caps the payload below.
+    const captureArgs = escapes
+        ? ['capture-pane', '-p', '-e', '-t', sessionName, '-S', `-${lines}`]
+        : ['capture-pane', '-p', '-t', sessionName, '-S', `-${lines}`];
+    const r = spawnSync('tmux', tmuxArgs(captureArgs), {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -832,6 +850,283 @@ export const scheduleInjectSnapshots = (
         }, delay),
     );
     pendingInjectSnapshots.set(sessionName, timers);
+};
+
+// ─── Live mirror: continuous pane streaming ──────────────────
+// Extends screen-peek from pull (one snapshot per request) to a subscribed
+// stream over the same ephemeral relay, same security posture (only
+// inventory-visible sessions, addressed by deviceId, same rate-limit bucket).
+//
+// E2EE: when the subscriber sends its device public key with stream.start,
+// every frame's pane content rides inside an ECDH P-256 + AES-256-GCM
+// envelope only that phone can open (see crypto.ts encryptEphemeral). The
+// relay stays pass-through. Without a key (older client / E2EE not set up)
+// frames fall back to plaintext — the web keeps its warning banner for that
+// case. Once a stream is encrypted an encrypt failure DROPS the frame; it
+// never downgrades to plaintext mid-stream.
+export interface StreamControl {
+    subtype?: string;
+    targetDeviceId?: string;
+    sessionName?: string;
+    /** Subscriber's device public key (Base64 SPKI) — presence turns on E2EE. */
+    subscriberPublicKey?: string;
+}
+
+// ~2.5 fps ceiling. Cadence + diff-gating are the ONLY bound on API Gateway
+// WS cost (the $default route has no per-message limit), so keep it modest
+// and let unchanged frames drop.
+// How far back the live-stream capture reaches — more than the screen-peek
+// window so the mirror has scrollback to scroll through. SCREEN_PEEK_MAX_BYTES
+// still caps the actual payload, so very wide panes get top-truncated.
+const STREAM_CAPTURE_LINES = 200;
+const STREAM_INTERVAL_MS = 400;
+// Orphan guard: a phone that dies without sending agent.stream.stop must not
+// leak an interval forever. Auto-stop after this long; the phone re-subscribes
+// on reopen.
+const STREAM_MAX_MS = 5 * 60_000;
+// Per-listener concurrency guard: the API Gateway WS stage throttle (50 rps)
+// is SHARED across every user, so a runaway machine (many sessions, or a
+// client re-subscribe bug) streaming at 2.5 fps each can starve push delivery
+// and presence for everyone. One phone watches one session at a time; 3 leaves
+// headroom for multiple devices while capping the blast radius of one host.
+export const MAX_CONCURRENT_STREAMS = 3;
+// Fail-closed guard: consecutive encrypt failures (malformed subscriber key)
+// stop the stream with an error frame instead of retrying forever.
+const STREAM_MAX_ENCRYPT_FAILURES = 3;
+
+// R2 instrumentation: the daemon's outbound send() IS the API Gateway $default
+// inbound message (1 Lambda + DDB ops + N PostToConnection each), so counting
+// frames/bytes HERE measures the real cloud cost of a live stream. Rolled up to
+// the log every STREAM_LOG_INTERVAL_MS and summarized on stop — the data that
+// decides cloud-throttled (B-lite) vs direct/Tailscale (B-full).
+const STREAM_LOG_INTERVAL_MS = 5_000;
+
+interface StreamStats {
+    startedAt: number;
+    frames: number; // frames actually sent (post diff-gate)
+    bytes: number; // payload bytes sent
+    skipped: number; // ticks suppressed by the diff-gate
+    lastLogAt: number;
+    lastLogFrames: number;
+    lastLogBytes: number;
+}
+
+interface ActiveStream {
+    timer: ReturnType<typeof setInterval>;
+    stats: StreamStats;
+}
+
+const activeStreams = new Map<string, ActiveStream>();
+
+const maybeLogStreamStats = (sessionName: string, stats: StreamStats): void => {
+    const elapsed = Date.now() - stats.lastLogAt;
+    if (elapsed < STREAM_LOG_INTERVAL_MS) return;
+    const secs = elapsed / 1000;
+    const fps = (stats.frames - stats.lastLogFrames) / secs;
+    const kbps = (stats.bytes - stats.lastLogBytes) / 1024 / secs;
+    log(`⧉ stream ${sessionName}: ${fps.toFixed(1)} fps, ${kbps.toFixed(1)} KB/s (${stats.frames} sent, ${stats.skipped} diff-skipped)`);
+    stats.lastLogAt = Date.now();
+    stats.lastLogFrames = stats.frames;
+    stats.lastLogBytes = stats.bytes;
+};
+
+export const stopStream = (sessionName: string): void => {
+    const entry = activeStreams.get(sessionName);
+    if (!entry) return;
+    clearInterval(entry.timer);
+    activeStreams.delete(sessionName);
+    const { stats } = entry;
+    const secs = Math.max(0.001, (Date.now() - stats.startedAt) / 1000);
+    log(
+        `⧉ stream ${sessionName} stopped: ${stats.frames} frames / ` +
+            `${(stats.bytes / 1024).toFixed(1)} KB over ${secs.toFixed(1)}s ` +
+            `(${(stats.frames / secs).toFixed(1)} fps avg, ${stats.skipped} diff-skipped)`,
+    );
+};
+
+export const stopAllStreams = (): void => {
+    // Route through stopStream so each stream emits its summary line.
+    for (const sessionName of [...activeStreams.keys()]) stopStream(sessionName);
+};
+
+/** Wire shape of one live-mirror data frame (before the relay's ephemeral wrap). */
+export type StreamFramePayload = {
+    subtype: 'agent.stream.frame';
+    sessionName: string;
+    capturedAt: string;
+    truncated: boolean;
+    /** Capture-order stamp — attached at send time, not by buildStreamFrame. */
+    seq?: number;
+    /** Stream incarnation (stats.startedAt) — lets the receiver reset its
+     *  seq high-water mark when the daemon restarts the stream. */
+    epoch?: number;
+    /** Plaintext pane content — only on unencrypted streams. */
+    content?: string;
+    /** E2EE envelope — replaces `content` on encrypted streams. */
+    encrypted?: EncryptedEphemeralPayload;
+};
+
+/** Wire shape of a live-mirror error frame — same subtype, no pane data. */
+export type StreamErrorFrame = {
+    subtype: 'agent.stream.frame';
+    sessionName: string;
+    error: 'unknown_session' | 'e2ee_unavailable' | 'encrypt_failed' | 'stream_limit';
+};
+
+/**
+ * Per-listener concurrency guard, as a pure predicate so the boundary is
+ * unit-testable without touching the module-scope `activeStreams` map.
+ */
+export const isStreamCapReached = (activeCount: number): boolean =>
+    activeCount >= MAX_CONCURRENT_STREAMS;
+
+const streamErrorFrame = (sessionName: string, error: StreamErrorFrame['error']): StreamErrorFrame => ({
+    subtype: 'agent.stream.frame',
+    sessionName,
+    error,
+});
+
+/**
+ * Build the wire payload for one stream frame. With a subscriber public key
+ * the pane content rides ONLY inside the E2EE envelope; an encrypt failure
+ * (bad key, crypto not ready on the first tick) returns null so the caller
+ * drops the frame — an encrypted stream never leaks a plaintext frame.
+ */
+export const buildStreamFrame = async (
+    captured: { content: string; truncated: boolean },
+    sessionName: string,
+    subscriberPublicKey?: string,
+): Promise<StreamFramePayload | null> => {
+    const base = {
+        subtype: 'agent.stream.frame' as const,
+        sessionName,
+        capturedAt: new Date().toISOString(),
+        truncated: captured.truncated,
+    };
+    if (!subscriberPublicKey) return { ...base, content: captured.content };
+    try {
+        const encrypted = await encryptEphemeral(captured.content, subscriberPublicKey);
+        return { ...base, encrypted };
+    } catch (err) {
+        log(`⧉ stream ${sessionName}: frame encrypt failed (${err instanceof Error ? err.message : err}) — frame dropped`);
+        return null;
+    }
+};
+
+/**
+ * Handle agent.stream.start / agent.stream.stop. Returns true when the message
+ * was a stream-control message (so the caller skips the one-shot screen-peek
+ * path). start is idempotent — a repeat restarts the loop.
+ */
+export const handleStreamControl = (
+    req: StreamControl,
+    send: (data: Record<string, unknown>) => void,
+): boolean => {
+    if (req.subtype === 'agent.stream.stop') {
+        if (req.sessionName) stopStream(req.sessionName);
+        return true;
+    }
+    if (req.subtype !== 'agent.stream.start') return false;
+    // Not addressed to this machine — let other listeners answer.
+    if (req.targetDeviceId !== computeListenerDeviceId()) return false;
+    const sessionName = req.sessionName;
+    if (!sessionName) return true;
+    if (!collectSessions().some((s) => s.name === sessionName)) {
+        send(streamErrorFrame(sessionName, 'unknown_session'));
+        return true;
+    }
+    stopStream(sessionName); // idempotent restart (frees this session's slot first)
+    // Concurrency guard AFTER the restart-stop: re-subscribing to an already
+    // active session doesn't count against the cap, only a genuinely new one
+    // does. Refuse the new stream instead of adding to the shared-throttle load.
+    if (isStreamCapReached(activeStreams.size)) {
+        log(`⧉ stream ${sessionName}: refused — ${activeStreams.size}/${MAX_CONCURRENT_STREAMS} streams already active on this listener`);
+        send(streamErrorFrame(sessionName, 'stream_limit'));
+        return true;
+    }
+    let lastContent: string | null = null;
+    const stats: StreamStats = {
+        startedAt: Date.now(),
+        frames: 0,
+        bytes: 0,
+        skipped: 0,
+        lastLogAt: Date.now(),
+        lastLogFrames: 0,
+        lastLogBytes: 0,
+    };
+    // E2EE handshake: load-or-create this device's keypair up front. The
+    // subscriber asked for encryption, so key failure is FAIL-CLOSED: refuse
+    // to stream rather than downgrade to plaintext — a silent downgrade is
+    // exactly the signal a key-stripping relay would produce. The phone sees
+    // the error frame and can choose to re-subscribe without a key.
+    const subscriberPublicKey = req.subscriberPublicKey;
+    if (subscriberPublicKey) {
+        initDeviceCrypto().catch((err) => {
+            // Stream stopped or replaced while init was in flight — the
+            // failure belongs to the old incarnation, not the current one.
+            if (activeStreams.get(sessionName)?.stats !== stats) return;
+            log(`⧉ stream ${sessionName}: device crypto init failed (${err instanceof Error ? err.message : err}) — refusing to stream (fail-closed)`);
+            send(streamErrorFrame(sessionName, 'e2ee_unavailable'));
+            stopStream(sessionName);
+        });
+    }
+    let wireSeq = 0;
+    let encryptFailures = 0;
+    const timer = setInterval(() => {
+        const captured = capturePane(sessionName, true, STREAM_CAPTURE_LINES);
+        if (!captured || captured.content === lastContent) {
+            stats.skipped++;
+            return; // diff-gate
+        }
+        lastContent = captured.content;
+        // Stamp the sequence in CAPTURE order, synchronously — frame assembly
+        // is async (encryption) and fire-and-forget, so resolve order is not
+        // guaranteed under load; the receiver drops any seq it has already
+        // painted past.
+        const seq = ++wireSeq;
+        void buildStreamFrame(captured, sessionName, subscriberPublicKey).then((frame) => {
+            // Stream stopped or restarted while this frame was in flight —
+            // `stats` is unique per start, so it doubles as the identity
+            // token. Don't send into a dead/replaced stream or skew its stats.
+            if (activeStreams.get(sessionName)?.stats !== stats) return;
+            if (!frame) {
+                // Encrypt failure — frame dropped, diff-gate un-marked so the
+                // next tick retries. A key that keeps failing (malformed
+                // subscriber key) never recovers: fail closed after a few
+                // strikes instead of retrying every 400ms for 5 minutes.
+                lastContent = null;
+                // Init still in flight (or failed — its own path fail-closes):
+                // a not-yet-ready key is not a malformed key, don't strike.
+                if (getDevicePublicKey() === null) return;
+                encryptFailures++;
+                if (encryptFailures >= STREAM_MAX_ENCRYPT_FAILURES) {
+                    send(streamErrorFrame(sessionName, 'encrypt_failed'));
+                    stopStream(sessionName);
+                }
+                return;
+            }
+            encryptFailures = 0;
+            stats.frames++;
+            // Measure the actual wire payload (the encrypted envelope is
+            // ~1.4× the plaintext; base fields now count too, so plaintext
+            // streams read slightly higher than the pre-E2EE content-only
+            // metric) — this feeds the R2 cost instrumentation.
+            stats.bytes += Buffer.byteLength(JSON.stringify(frame), 'utf-8');
+            // seq = capture order; epoch = this stream incarnation, so the
+            // receiver's ordering guard resets across daemon-side restarts.
+            send({ ...frame, seq, epoch: stats.startedAt });
+            maybeLogStreamStats(sessionName, stats);
+        }).catch((err) => {
+            // A long-lived daemon must never crash on an unhandled rejection
+            // from send()/logging — report and let the next tick carry on.
+            log(`⧉ stream ${sessionName}: frame send failed (${err instanceof Error ? err.message : err})`);
+        });
+    }, STREAM_INTERVAL_MS);
+    timer.unref?.();
+    activeStreams.set(sessionName, { timer, stats });
+    const expiry = setTimeout(() => stopStream(sessionName), STREAM_MAX_MS);
+    expiry.unref?.();
+    return true;
 };
 
 export interface CollectResult {
@@ -1518,9 +1813,17 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                 // Screen peek (§S4): the phone asks for this machine's live
                 // pane content over the ephemeral relay; the reply rides the
                 // same channel. Nothing is persisted server-side.
-                const reply = handleScreenRequest(m.data as ScreenRequest);
-                if (reply && sock.readyState === WebSocket.OPEN) {
-                    sock.send(JSON.stringify({ type: 'ephemeral', data: reply }));
+                const sendEphemeral = (data: object) => {
+                    if (sock.readyState === WebSocket.OPEN) {
+                        sock.send(JSON.stringify({ type: 'ephemeral', data }));
+                    }
+                };
+                // Live mirror (PoC): agent.stream.start/stop drives a
+                // continuous, diff-gated frame loop; falls through to the
+                // one-shot screen-peek when it isn't a stream-control message.
+                if (!handleStreamControl(m.data as StreamControl, sendEphemeral)) {
+                    const reply = handleScreenRequest(m.data as ScreenRequest);
+                    if (reply) sendEphemeral(reply);
                 }
             }
             // Surface server-side errors from listener.sessions reports.
@@ -1544,6 +1847,7 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
         });
 
         sock.on('close', (code, reasonBuf) => {
+            stopAllStreams();
             cleanup();
             resolve({ closeCode: code, reason: reasonBuf?.toString('utf-8') ?? '', connected: opened });
         });

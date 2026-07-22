@@ -395,3 +395,84 @@ export const encryptFileForSelf = async (
     encryptedKey: JSON.stringify({ encryptedKey: result.encryptedKey, keyIv: result.keyIv }),
   };
 };
+
+// ─── Per-device crypto (stream E2EE) ───
+//
+// Unlike the per-user keypair above (server-synced, shared across devices —
+// see the threat-model note at the top), the DEVICE keypair is true E2E
+// material: generated on this host, private key never leaves
+// ~/.zeph/device-keys.json, never uploaded anywhere. It matches the web
+// app's per-device `'device'` slot, so a frame encrypted here is decryptable
+// only by the one phone whose public key it was wrapped for.
+
+/**
+ * Flat ephemeral envelope — field-for-field what the web's decrypt()
+ * (libs/crypto) consumes, with the sender public key riding along so the
+ * receiver needs no out-of-band key lookup.
+ */
+export interface EncryptedEphemeralPayload extends EncryptedPayload {
+  senderPublicKey: string;
+}
+
+const DEVICE_KEYS_DIR = join(homedir(), '.zeph');
+const DEVICE_KEYS_PATH = join(DEVICE_KEYS_DIR, 'device-keys.json');
+
+let deviceKeyPair: CryptoKeyPair | null = null;
+let deviceExportedPublicKey: string | null = null;
+let deviceInitPromise: Promise<string> | null = null;
+
+const loadStoredDeviceKeys = (): ExportedKeyPair | null => {
+  try {
+    return JSON.parse(readFileSync(DEVICE_KEYS_PATH, 'utf-8')) as ExportedKeyPair;
+  } catch {
+    return null;
+  }
+};
+
+const storeDeviceKeys = (exported: ExportedKeyPair): void => {
+  mkdirSync(DEVICE_KEYS_DIR, { recursive: true, mode: 0o700 });
+  writeFileSync(DEVICE_KEYS_PATH, JSON.stringify(exported, null, 2), { mode: 0o600 });
+};
+
+/**
+ * Load-or-create the per-device keypair. Local-only — no server round-trip,
+ * no upload. Safe to call concurrently (dedupes to one init). Returns the
+ * exported public key (Base64 SPKI).
+ */
+export const initDeviceCrypto = (): Promise<string> => {
+  if (deviceInitPromise) return deviceInitPromise;
+  deviceInitPromise = (async () => {
+    const stored = loadStoredDeviceKeys();
+    if (stored) {
+      deviceKeyPair = await importKeyPair(stored);
+      deviceExportedPublicKey = stored.publicKey;
+      return stored.publicKey;
+    }
+    const keyPair = await generateKeyPair();
+    const exported = await exportKeyPair(keyPair);
+    storeDeviceKeys(exported);
+    deviceKeyPair = keyPair;
+    deviceExportedPublicKey = exported.publicKey;
+    return exported.publicKey;
+  })().catch((err) => {
+    deviceInitPromise = null;
+    throw err;
+  });
+  return deviceInitPromise;
+};
+
+export const getDevicePublicKey = (): string | null => deviceExportedPublicKey;
+
+/**
+ * Encrypt an ephemeral payload (e.g. a stream frame) for one recipient
+ * device. Requires initDeviceCrypto() to have completed.
+ */
+export const encryptEphemeral = async (
+  plaintext: string,
+  recipientPublicKeyRaw: string,
+): Promise<EncryptedEphemeralPayload> => {
+  if (!deviceKeyPair || !deviceExportedPublicKey) throw new Error('Device crypto not initialized');
+  const recipientKey = await importPublicKey(recipientPublicKeyRaw);
+  const payload = await encrypt(plaintext, deviceKeyPair.privateKey, recipientKey);
+  return { ...payload, senderPublicKey: deviceExportedPublicKey };
+};
