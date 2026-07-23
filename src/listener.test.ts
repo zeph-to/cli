@@ -693,7 +693,10 @@ describe('handleStreamControl (live mirror PoC)', () => {
     });
 
     it('claims a stop message and is a no-op for an unknown session', () => {
-        expect(handleStreamControl({ subtype: 'agent.stream.stop', sessionName: 'zeph-proj' }, () => {})).toBe(true);
+        // targetDeviceId is required now: the relay fans stream-control out to
+        // every connection, so an unaddressed stop must not reach into another
+        // machine's stream of the same tmux name.
+        expect(handleStreamControl({ subtype: 'agent.stream.stop', targetDeviceId: myDevice, sessionName: 'zeph-proj' }, () => {})).toBe(true);
         expect(() => stopStream('zeph-proj')).not.toThrow();
         expect(() => stopAllStreams()).not.toThrow();
     });

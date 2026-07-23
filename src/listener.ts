@@ -1082,6 +1082,15 @@ export const handleStreamControl = (
     req: StreamControl,
     send: (data: Record<string, unknown>) => void,
 ): boolean => {
+    if (req.subtype !== 'agent.stream.start' && req.subtype !== 'agent.stream.stop' && req.subtype !== 'agent.stream.renew') {
+        return false;
+    }
+    // Every stream-control message names one machine, and the relay fans them
+    // out to all of this user's connections — so decide addressing once, here.
+    // Two machines can run the same tmux session name, and stop/renew carry no
+    // other identity: without this gate a stop meant for one listener would
+    // reach into the other's stream of that name (and a renew would refresh it).
+    if (req.targetDeviceId !== computeListenerDeviceId()) return false;
     if (req.subtype === 'agent.stream.stop') {
         if (req.sessionName) stopStream(req.sessionName);
         return true;
@@ -1094,21 +1103,16 @@ export const handleStreamControl = (
             entry.expiresAt = Date.now() + leaseFor(entry.renewing);
             return true;
         }
-        // We're the addressed machine but hold no such stream: it was reaped
-        // (lost renews), evicted, or dropped when our socket last reconnected.
-        // The viewer has no other way to learn that — it just keeps painting a
+        // Addressed to us but we hold no such stream: it was reaped (lost
+        // renews), evicted, or dropped when our socket last reconnected. The
+        // viewer has no other way to learn that — it just keeps painting a
         // frozen pane under a LIVE badge — so tell it to re-subscribe. Renew
         // carries no subscriber key, so restarting it here would silently
         // downgrade an E2EE stream to plaintext; only the client can redo the
         // handshake.
-        if (req.targetDeviceId === computeListenerDeviceId()) {
-            send(streamErrorFrame(req.sessionName, 'stream_gone'));
-        }
+        send(streamErrorFrame(req.sessionName, 'stream_gone'));
         return true;
     }
-    if (req.subtype !== 'agent.stream.start') return false;
-    // Not addressed to this machine — let other listeners answer.
-    if (req.targetDeviceId !== computeListenerDeviceId()) return false;
     const sessionName = req.sessionName;
     if (!sessionName) return true;
     if (!collectSessions().some((s) => s.name === sessionName)) {

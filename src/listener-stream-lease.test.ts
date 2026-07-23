@@ -109,13 +109,25 @@ describe('stream lease — a vanished subscriber must free its slot', () => {
         });
     });
 
-    it('stays silent on a renew addressed to another machine', () => {
+    it('leaves another machine\'s stream-control alone', () => {
+        // Two machines can run the same tmux session name and the relay fans
+        // these out to every connection, so an unaddressed stop/renew must not
+        // touch our stream of that name.
+        start('zeph-a');
         const sent: Array<Record<string, unknown>> = [];
-        handleStreamControl(
-            { subtype: 'agent.stream.renew', targetDeviceId: 'dev_someone_else', sessionName: 'zeph-a' },
-            (d) => sent.push(d as Record<string, unknown>),
-        );
+        for (const subtype of ['agent.stream.renew', 'agent.stream.stop']) {
+            expect(
+                handleStreamControl(
+                    { subtype, targetDeviceId: 'dev_someone_else', sessionName: 'zeph-a' },
+                    (d) => sent.push(d as Record<string, unknown>),
+                ),
+            ).toBe(false);
+        }
         expect(sent).toEqual([]);
+        // Our stream survived the foreign stop — still holding its slot.
+        start('zeph-b');
+        start('zeph-c');
+        expect(start('zeph-d')[0]).toMatchObject({ error: 'stream_limit' });
     });
 
     it('keeps a stream alive as long as its subscriber renews', () => {
