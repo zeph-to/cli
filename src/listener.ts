@@ -23,11 +23,21 @@
 
 import { spawnSync } from 'child_process';
 import { createHash } from 'crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
 import { homedir, hostname, userInfo } from 'os';
 import { join, basename } from 'path';
 import WebSocket from 'ws';
-import { loadConfig, resolvedEnv } from './config.js';
+import { loadConfig, resolvedEnv, VERSION } from './config.js';
+import {
+    clearListenerRuntime,
+    clearStaleListenerRuntime,
+    LISTENER_LOG_FILE,
+    LISTENER_PID_FILE,
+    runningListenerPid,
+    spawnListenerDetached,
+    stopListener,
+    writeListenerRuntime,
+} from './listener-process.js';
 import { projectHash, remoteDigest, remoteMarkerPath, stateDir } from './gate.js';
 import { matchAgentByPaneCommand, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 import { advanceState, evaluateState, findPatternMatch, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
@@ -1881,9 +1891,6 @@ export const resolveWsUrl = (
 
 // ── Singleton guard (PID file) ──────────────────────────────────────
 
-const ZEPH_DIR = join(homedir(), '.zeph');
-const LISTENER_PID_FILE = join(ZEPH_DIR, 'listener.pid');
-
 /**
  * Whether another `zeph listener` is already running on this machine.
  * The wrapper's autostart and a user typing `zeph listener` by hand can
@@ -1894,35 +1901,55 @@ const LISTENER_PID_FILE = join(ZEPH_DIR, 'listener.pid');
  * wrapper can recover from crashes without manual cleanup.
  */
 const otherListenerAlive = (): number | null => {
-    try {
-        const pid = Number(readFileSync(LISTENER_PID_FILE, 'utf-8').trim());
-        if (!Number.isFinite(pid) || pid <= 0 || pid === process.pid) return null;
-        process.kill(pid, 0); // existence check, throws if dead
-        return pid;
-    } catch {
-        return null;
-    }
+    const pid = runningListenerPid();
+    return pid === null || pid === process.pid ? null : pid;
 };
 
 const writeListenerPid = (): void => {
     try {
-        mkdirSync(ZEPH_DIR, { recursive: true });
-        writeFileSync(LISTENER_PID_FILE, String(process.pid));
+        // Stamp the version alongside the pid: `npm i -g` swaps the package
+        // on disk without touching this already-running process, and the
+        // stamp is how `zeph cc` notices the drift and restarts us.
+        writeListenerRuntime(VERSION);
     } catch (err) {
         log(`! could not write ${LISTENER_PID_FILE}: ${(err as Error).message}`);
     }
 };
 
-const removeListenerPid = (): void => {
-    try {
-        if (!existsSync(LISTENER_PID_FILE)) return;
-        // Only remove our own pid file — don't trample a successor's.
-        const pid = Number(readFileSync(LISTENER_PID_FILE, 'utf-8').trim());
-        if (pid === process.pid) unlinkSync(LISTENER_PID_FILE);
-    } catch { /* best-effort */ }
+const removeListenerPid = (): void => clearListenerRuntime(process.pid);
+
+/**
+ * `--stop` / `--restart`: the daemon is a background service, so the only
+ * way to replace a stale one used to be hunting its pid by hand. `--restart`
+ * relaunches detached (not in the caller's foreground) because restarting is
+ * an ops action — the user wants their shell back, not a new daemon pinned
+ * to it.
+ */
+const handleListenerLifecycle = async (restart: boolean): Promise<number> => {
+    const pid = otherListenerAlive();
+    if (pid) {
+        const stopped = await stopListener(pid);
+        console.log(`zeph listener: stopped pid ${pid}${stopped ? '' : ' (forced)'}`);
+    } else {
+        console.log('zeph listener: no listener running');
+        // A pid file left behind by a crashed daemon would otherwise keep
+        // tripping the singleton guard on the next start.
+        clearStaleListenerRuntime();
+    }
+    if (!restart) return 0;
+    if (!spawnListenerDetached()) {
+        console.error('zeph listener: could not resolve the cli entry to respawn — run `zeph listener` manually.');
+        return 1;
+    }
+    console.log(`zeph listener: restarted in background (log: ${LISTENER_LOG_FILE})`);
+    return 0;
 };
 
 export const handleListener = async (args: Record<string, string | boolean>): Promise<number> => {
+    // Lifecycle flags run before verifyTmux — stopping a daemon shouldn't
+    // require a healthy tmux.
+    if (args.stop === true || args.restart === true) return handleListenerLifecycle(args.restart === true);
+
     verifyTmux();
 
     // Refuse to start when another listener is already running. The
@@ -1965,7 +1992,10 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     writeListenerPid();
     process.on('exit', removeListenerPid);
 
-    log(`zeph listener starting — ${wsUrl}`);
+    // Version on the first line: the only way to tell which build a
+    // long-lived daemon is actually running (an `npm i -g` days ago says
+    // nothing about the process that's been up since before it).
+    log(`zeph listener starting — v${VERSION} — ${wsUrl}`);
     log(`device=${computeListenerDeviceId()} host=${hostname()} pid=${process.pid}`);
     log("Waiting for 'agent.command' pushes from the phone picker. Ctrl-C to stop.");
 

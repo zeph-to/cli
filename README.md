@@ -202,11 +202,21 @@ can never false-flag. Muted projects are never flagged.
 
 ### Diagnostics
 
-The auto-spawned listener writes to two files under `~/.zeph/`:
+The auto-spawned listener writes to three files under `~/.zeph/`:
 
 - `listener.pid` — the running daemon's PID. `cat ~/.zeph/listener.pid`
   + `ps -p <pid>` to confirm it's alive.
+- `listener.version` — the CLI version the daemon booted from. This is
+  what `zeph cc` compares against the installed package to spot a stale
+  daemon (see below).
 - `listener.log` — stdout + stderr from the daemon. `tail -f` to watch.
+
+The daemon logs its version on the first line, which is the only
+reliable way to tell which build a long-running process is on:
+
+```
+[xx:xx:xx] zeph listener starting — v1.26.0 — wss://ws.zeph.to
+```
 
 A healthy listener log shows one line per cycle:
 
@@ -219,12 +229,31 @@ If you see `! server rejected listener.sessions: ...` instead, the
 message points at the failure (auth, missing device record, etc.) so
 you can fix the actual problem instead of guessing.
 
-To force a restart — e.g. after upgrading `@zeph-to/cli`:
+To force a restart:
 
 ```bash
-kill $(cat ~/.zeph/listener.pid)
-rm ~/.zeph/listener.pid
-zeph cc        # autospawns the new build
+zeph listener --restart
+```
+
+**After upgrading `@zeph-to/cli` you normally don't have to.** `npm i -g`
+replaces the package on disk but never the daemon already running from
+the old build — that daemon keeps answering pushes (so agent chat looks
+fine) while silently ignoring every message subtype added since it
+booted. `zeph cc` compares `listener.version` against the installed
+version and restarts the daemon for you when the installed one is newer
+(a daemon *newer* than the `zeph cc` you ran is left alone, so several
+installs on one machine don't fight over it):
+
+```
+zeph: listener 1.25.0 is stale — restarting on 1.26.0
+```
+
+If the PID file is missing (a different account started the daemon, or
+it was removed by hand) the singleton guard can't see it. Find the real
+process instead:
+
+```bash
+ps aux | grep '[c]li.js listener'
 ```
 
 To run it in the foreground (for development of the SDK itself):
@@ -385,6 +414,8 @@ which project + branch finished without writing per-IDE wrappers. Pass
 | `--ws-url <url>` | WebSocket endpoint (or set `ZEPH_WS_URL` env, or `wsUrl` in `~/.zeph/config.json`) |
 | `--key <api-key>` | API key (or set `ZEPH_API_KEY` env) |
 | `--base-url <url>` | REST API base URL (or set `ZEPH_BASE_URL` env, or `baseUrl` in `~/.zeph/config.json`) |
+| `--stop` | Stop the running daemon and clear its PID/version stamps |
+| `--restart` | Stop it and relaunch detached (logs to `~/.zeph/listener.log`) |
 
 The listener reconnects with exponential backoff + jitter (1 s → 30 s
 cap). Heartbeat is ping every 25 s with a 10 s pong timeout. On an

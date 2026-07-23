@@ -49,6 +49,14 @@ DB leak, subpoena, honest-but-curious). It does **not** yet hold against an **ac
 operator that substitutes public keys (MITM); that needs out-of-band device
 verification (a later phase).
 
+### Listener version stamp
+`~/.zeph/listener.version` — the CLI version the *running* daemon booted from,
+written next to `listener.pid` by `writeListenerRuntime()` and read by the `zeph cc`
+wrapper. `npm i -g`는 디스크의 패키지만 바꾸고 상주 프로세스는 그대로 두므로, 이 스탬프가
+"설치본 ≠ 상주본" drift를 감지하는 유일한 신호다. **없으면 = 구버전** (스탬프 도입 이전
+빌드라는 뜻). 두 파일은 `listener-process.ts` 한 곳에서만 쓰고 지운다 — listener와 wrapper가
+각자 경로를 재구현하면 drift 판정이 갈린다.
+
 ### Agent key whitelist (3-site 동기)
 `ALLOWED_KEYS` (listener.ts, phone→pane 키 주입) is mirrored in two other repos'
 files that MUST change together, else a new key is rejected before it reaches the

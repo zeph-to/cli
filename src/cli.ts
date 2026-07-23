@@ -91,6 +91,10 @@ ${usageAgentLines()}
   listener        Resident daemon — receives 'agent.command' pushes from
                   the phone picker and injects them into the matching
                   tmux session.
+                  --stop     stop the running daemon
+                  --restart  stop it and relaunch in the background
+                             (needed after an upgrade: 'npm i -g' swaps
+                              the package but never the live process)
 
 Notify options:
   --title <text>     Push title
