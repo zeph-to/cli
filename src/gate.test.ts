@@ -128,4 +128,18 @@ describe('gate.ts: project state helpers', () => {
         writeFileSync(`/tmp/zeph-pushmode-${projectHash(TMP)}`, 'quiet\n');
         expect(readPushMode(TMP)).toBe('quiet');
     });
+
+    it('readPushMode falls back to the global pushmode-default', () => {
+        const dir = join(TMP, 'state', 'zeph');
+        writeFileSync(join(dir, 'pushmode-default'), 'quiet');
+        expect(readPushMode(TMP)).toBe('quiet');
+        // A per-project dial always outranks the machine-wide default.
+        writeFileSync(join(dir, `pushmode-${projectHash(TMP)}`), 'normal');
+        expect(readPushMode(TMP)).toBe('normal');
+    });
+
+    it('isMuted has no global default — mute stays project-only', () => {
+        writeFileSync(join(TMP, 'state', 'zeph', 'muted-default'), '');
+        expect(isMuted(TMP)).toBe(false);
+    });
 });

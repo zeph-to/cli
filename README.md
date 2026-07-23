@@ -43,6 +43,12 @@ on *every* notification. For notifications only, with no phone control,
 `npx @zeph-to/cli install` is a lighter alternative that skips the global
 binary.
 
+Once installed, the hooks fire in **every** session of each configured
+agent — `zeph cc` is the phone-control bridge, not the notification
+switch. Turn the volume down without uninstalling: `/zeph-quiet --global`
+(blockers only, all projects), `/zeph-mute` (silence, current project),
+`/zeph-status` (what's in effect). See [Mute & push mode](#mute--push-mode).
+
 `~/.zeph/config.json` is the single source of truth — the CLI, the MCP
 server, the plugin hooks, and the listener all read it. You never need
 `ZEPH_API_KEY`-style env vars for a normal setup; they exist as overrides
@@ -363,7 +369,7 @@ zeph notify --title "Hello" --json
 | `--priority <p>` | Priority: `low`, `normal`, `high`, `urgent` |
 | `--device <id>` | Target device ID |
 | `--session <id>` | AI session ID so the push threads into that session's chat (or `ZEPH_SESSION_ID` env) |
-| `--auto` | Apply the push gate before sending — honors the `/zeph-quiet` / `/zeph-loud` push-mode dial; gated-out exits silently with code 0 |
+| `--auto` | Apply the push gate before sending — honors the `/zeph-quiet` / `/zeph-loud` push-mode dial, per project or machine-wide (`--global`); gated-out exits silently with code 0 |
 | `--marker <m>` | Push Signal marker for `--auto`: `skip`, `push`, `high` |
 | `--tools <n>`, `--nonreadonly <n>` | Turn tool counts feeding `--auto`'s heuristic (defaults assume real work) |
 
@@ -401,22 +407,44 @@ code 3 instead of looping forever — fix the key and restart.
 | `--json` | Output JSON format |
 | `--version` | Print version |
 
-### Mute
+### Mute & push mode
 
-Mute is project-scoped (uses project directory hash). Created by Claude
-Code `/zeph-mute` command.
+Both live as state files under `${XDG_STATE_HOME:-~/.local/state}/zeph`,
+keyed by a `cksum` hash of the project directory. Claude Code's
+`/zeph-mute` / `/zeph-quiet` / `/zeph-loud` / `/zeph-normal` write them;
+the CLI reads them (mute on every `notify`, push mode on `--auto`).
 
 Notifications are silently skipped when a mute file exists for the
 current project:
 
 ```bash
-# Mute (created by /zeph-mute in Claude Code plugin)
-HASH=$(echo -n "$PROJECT_DIR" | cksum | cut -d' ' -f1)
-touch /tmp/zeph-muted-$HASH
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/zeph"
+HASH=$(printf '%s' "$PROJECT_DIR" | cksum | cut -d' ' -f1)
+
+# Mute (created by /zeph-mute in the Claude Code plugin)
+mkdir -p "$STATE_DIR" && touch "$STATE_DIR/muted-$HASH"
 
 # Unmute
-rm /tmp/zeph-muted-$HASH
+rm -f "$STATE_DIR/muted-$HASH"
 ```
+
+Push mode is a one-word file (`quiet` / `loud` / `normal`) resolved in
+this order — first hit wins:
+
+| Order | File | Set by |
+|-------|------|--------|
+| 1 | `$STATE_DIR/pushmode-<hash>` | `/zeph-quiet` · `/zeph-loud` · `/zeph-normal` |
+| 2 | `/tmp/zeph-pushmode-<hash>` | older versions (honored only when you own the file) |
+| 3 | `$STATE_DIR/pushmode-default` | `/zeph-quiet --global` — the machine-wide default |
+| 4 | *(none)* | `normal` |
+
+So `/zeph-quiet --global` quiets every project that has no dial of its
+own, and a per-project dial always overrides it. Mute has no `-default`
+form on purpose: it is keyed on presence, not content, so a global mute
+could never be lifted for a single project.
+
+Legacy `/tmp/zeph-muted-<hash>` files are still honored when owned by the
+current user (the state dir moved out of world-writable `/tmp`).
 
 The CLI checks `CLAUDE_PROJECT_DIR`, `CURSOR_PROJECT_DIR`,
 `WINDSURF_PROJECT_DIR`, and falls back to `cwd`.

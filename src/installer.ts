@@ -530,5 +530,15 @@ export const handleInstall = async (args: Record<string, string | boolean>): Pro
   await testConnection(apiKey, baseUrl);
 
   console.log('\n  Done! Restart your agents.\n');
+
+  // The single most-reported surprise: pushes are not scoped to `zeph cc`.
+  // Hooks fire for every session of every configured agent, so say it here —
+  // at the moment the hooks get installed — together with the volume dials.
+  console.log('  Notifications now fire for EVERY session of each agent above');
+  console.log('  (not only sessions launched with `zeph cc`). Dial the volume');
+  console.log('  any time — in Claude Code:');
+  console.log('    /zeph-quiet --global   only blockers + high-priority, all projects');
+  console.log('    /zeph-mute             full silence, current project');
+  console.log('    /zeph-status           show what is in effect\n');
   return 0;
 };
