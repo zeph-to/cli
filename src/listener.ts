@@ -949,11 +949,12 @@ interface ActiveStream {
     stats: StreamStats;
     /** Wall-clock deadline; the capture tick reaps the stream once it passes. */
     expiresAt: number;
-    /** How far a renew (and the initial start) pushes `expiresAt` out. */
-    leaseMs: number;
     /** Subscriber renews — i.e. its silence is proof it's gone, not just quiet. */
     renewing: boolean;
 }
+
+/** How far a start (and each renew) pushes the deadline out. */
+const leaseFor = (renewing: boolean): number => (renewing ? STREAM_LEASE_MS : STREAM_MAX_MS);
 
 const activeStreams = new Map<string, ActiveStream>();
 
@@ -1090,7 +1091,7 @@ export const handleStreamControl = (
         if (!req.sessionName) return true;
         const entry = activeStreams.get(req.sessionName);
         if (entry) {
-            entry.expiresAt = Date.now() + entry.leaseMs;
+            entry.expiresAt = Date.now() + leaseFor(entry.renewing);
             return true;
         }
         // We're the addressed machine but hold no such stream: it was reaped
@@ -1213,13 +1214,12 @@ export const handleStreamControl = (
     timer.unref?.();
     // A renewing subscriber gets the short lease; anything older keeps the
     // 5-minute orphan guard so a version-skewed client isn't cut off mid-view.
-    const leaseMs = req.renew ? STREAM_LEASE_MS : STREAM_MAX_MS;
+    const renewing = !!req.renew;
     activeStreams.set(sessionName, {
         timer,
         stats,
-        expiresAt: Date.now() + leaseMs,
-        leaseMs,
-        renewing: !!req.renew,
+        expiresAt: Date.now() + leaseFor(renewing),
+        renewing,
     });
     return true;
 };
