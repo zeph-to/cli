@@ -98,12 +98,20 @@ const ownedByCurrentUser = (path: string): boolean => {
   }
 };
 
-/** Resolve a state file: current location first, then user-owned legacy /tmp. */
+/**
+ * Resolve a state file: current location first, then user-owned legacy /tmp,
+ * then — for `pushmode` only — the machine-wide default written by
+ * `/zeph-quiet --global`. Mirrors plugin/hooks/gate.sh zeph_state_present,
+ * including the deliberate absence of a global mute (see the comment there).
+ */
 const findStateFile = (kind: 'muted' | 'pushmode', hash: string): string | null => {
   const current = join(stateDir(), `${kind}-${hash}`);
   if (existsSync(current)) return current;
   const legacy = `/tmp/zeph-${kind}-${hash}`;
-  return ownedByCurrentUser(legacy) ? legacy : null;
+  if (ownedByCurrentUser(legacy)) return legacy;
+  if (kind !== 'pushmode') return null;
+  const globalDefault = join(stateDir(), 'pushmode-default');
+  return existsSync(globalDefault) ? globalDefault : null;
 };
 
 export const projectHash = (dir: string): string | null => {
