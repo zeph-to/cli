@@ -9,11 +9,17 @@
  * ($TMUX set) it skips the outer tmux to avoid nesting and execs the
  * agent directly — letting power users keep their own multiplexer setup.
  */
-import { spawn, execFileSync, spawnSync } from 'child_process';
-import { existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync } from 'fs';
-import { homedir } from 'os';
-import { basename, join } from 'path';
-import { PROJECT_DIR_ENV_VARS, resolvedEnv } from './config.js';
+import { execFileSync, spawn, spawnSync } from 'child_process';
+import { basename } from 'path';
+import { isNewer } from './check-update.js';
+import { PROJECT_DIR_ENV_VARS, resolvedEnv, VERSION } from './config.js';
+import {
+    LISTENER_LOG_FILE,
+    runningListenerPid,
+    runningListenerVersion,
+    spawnListenerDetached,
+    stopListener,
+} from './listener-process.js';
 import type { RemoteAgent } from './remote-agents.js';
 
 const FALLBACK_NAME = 'project';
@@ -105,93 +111,44 @@ const targetForAgent = (agent: string, extra: string[]): SpawnTarget => {
 
 // ── Background listener auto-start ────────────────────────────────────
 
-const ZEPH_DIR = join(homedir(), '.zeph');
-const LISTENER_PID_FILE = join(ZEPH_DIR, 'listener.pid');
-const LISTENER_LOG_FILE = join(ZEPH_DIR, 'listener.log');
+/**
+ * Whether the daemon on record is running a different build than the one
+ * we're launching from. `npm i -g @zeph-to/cli` swaps dist/ but leaves the
+ * live process untouched, so a daemon can stay days behind the installed
+ * package — answering pushes (chat looks fine) while silently ignoring every
+ * message subtype added since it booted. That is exactly how a pre-1.24
+ * listener left the phone's live terminal spinning until a reboot.
+ *
+ * A missing stamp means the daemon predates version stamping, which puts it
+ * behind by definition — treat unknown as drifted.
+ *
+ * Strictly "installed is newer", never a plain inequality: one account can
+ * have several installs at different versions (nvm node versions, a repo
+ * build alongside the global one), and `!==` would make each `zeph cc` kill
+ * and respawn the other's daemon forever. An older `zeph cc` leaves a newer
+ * daemon alone — downgrading it would reintroduce the very gap this closes.
+ */
+export const listenerVersionDrifted = (running: string | null, installed: string): boolean =>
+    running === null || isNewer(installed, running);
 
-/** True when the PID file points at a still-alive process. */
-const listenerAlive = (): boolean => {
-    try {
-        const pid = Number(readFileSync(LISTENER_PID_FILE, 'utf-8').trim());
-        if (!Number.isFinite(pid) || pid <= 0) return false;
-        // Signal 0 = existence check; throws when the process is gone.
-        process.kill(pid, 0);
-        return true;
-    } catch {
-        return false;
+/**
+ * Make sure the phone-bridge daemon is running AND is the build we just
+ * launched from. `zeph cc` is the right moment to replace a drifted one: the
+ * user is starting fresh work rather than mid-task, so the ~1s restart window
+ * (in which a push would be dropped — WS fan-out has no queue) costs nothing.
+ */
+export const ensureListenerRunning = async (): Promise<void> => {
+    const pid = runningListenerPid();
+    if (pid !== null) {
+        const running = runningListenerVersion();
+        if (!listenerVersionDrifted(running, VERSION)) return;
+        console.log(`zeph: listener ${running ?? '(pre-1.26)'} is stale — restarting on ${VERSION}`);
+        await stopListener(pid);
     }
-};
-
-/**
- * Path to the running cli.js entry. wrapper.js sits next to cli.js in
- * dist/, so __dirname resolves it directly — independent of how the
- * user invoked us.
- *
- * `process.argv[1]` is unreliable here: when `zeph` runs via the
- * npm-installed bin shim (`/usr/local/bin/zeph` → cli.js via a wrapper
- * script), argv[1] is the shim path (`.../bin/zeph`), NOT `cli.js`.
- * That made the original `/cli\\.(js|ts|mjs|cjs)$/` check silently
- * reject the entry and the autospawn never fired — exactly the bug
- * the user hit ('원래 싱글톤으로 됐었잖아' — yes, on the local alias
- * path where argv[1] IS cli.js; the bug only surfaced once the user
- * switched to the global npm install).
- *
- * Fall back to argv[1] only when the __dirname-relative file doesn't
- * exist (some packaging where dist layout differs).
- */
-const resolveCliPath = (): string | null => {
-    const local = join(__dirname, 'cli.js');
-    if (existsSync(local)) return local;
-    const entry = process.argv[1];
-    if (entry && /cli\.(js|ts|mjs|cjs)$/.test(entry)) return entry;
-    return null;
-};
-
-/**
- * Spawn `zeph listener` in the background if it isn't already running on
- * this machine. The intent is that the user only ever has to know about
- * `zeph cc` — the phone-to-tmux bridge tags along automatically. Output
- * goes to `~/.zeph/listener.log` so it isn't lost on detach; the listener
- * itself writes its own PID to `~/.zeph/listener.pid` on startup and
- * removes it on graceful exit, so subsequent `zeph cc` invocations skip
- * the spawn when a listener is already up.
- *
- * Failure here is non-fatal — `zeph cc` still launches the agent. The
- * user just loses the phone-bridge feature until they restart.
- */
-/**
- * Rotate the listener log once it grows past 5 MB. The daemon runs for
- * days and writes 2-3 lines per 5-s cycle, so without rotation the file
- * climbs into the tens of megabytes range pretty quickly. We keep the
- * previous run's tail under `.old` for post-mortem and start fresh.
- */
-const LISTENER_LOG_MAX_BYTES = 5 * 1024 * 1024;
-
-const rotateListenerLogIfLarge = (): void => {
-    try {
-        if (!existsSync(LISTENER_LOG_FILE)) return;
-        if (statSync(LISTENER_LOG_FILE).size <= LISTENER_LOG_MAX_BYTES) return;
-        renameSync(LISTENER_LOG_FILE, LISTENER_LOG_FILE + '.old');
-    } catch { /* best-effort */ }
-};
-
-const ensureListenerRunning = (): void => {
-    if (listenerAlive()) return;
-    const cliPath = resolveCliPath();
-    if (!cliPath || !existsSync(cliPath)) return;
-    try {
-        mkdirSync(ZEPH_DIR, { recursive: true });
-        rotateListenerLogIfLarge();
-        const out = openSync(LISTENER_LOG_FILE, 'a');
-        const child = spawn(process.execPath, [cliPath, 'listener'], {
-            detached: true,
-            stdio: ['ignore', out, out],
-            env: { ...process.env, ZEPH_LISTENER_AUTOSTART: '1' },
-        });
-        child.unref();
-        console.log(`zeph: listener autostarted in background (log: ${LISTENER_LOG_FILE})`);
-    } catch (err) {
-        console.error(`zeph: listener autostart failed: ${(err as Error).message}`);
+    if (spawnListenerDetached()) {
+        if (pid === null) console.log(`zeph: listener autostarted in background (log: ${LISTENER_LOG_FILE})`);
+    } else {
+        console.error('zeph: listener autostart failed — run `zeph listener` manually.');
     }
 };
 
@@ -201,11 +158,11 @@ const ensureListenerRunning = (): void => {
  * `zeph cc --resume foo` runs `claude --resume foo` inside the session.
  * Returns when the agent exits.
  */
-export const handleAgentSession = (agent: RemoteAgent, extra: string[] = []): Promise<number> => {
-    // Best-effort: make sure the phone-bridge daemon is running before we
-    // launch the agent. The user shouldn't need to remember a second
-    // command for the picker on their phone to work.
-    ensureListenerRunning();
+export const handleAgentSession = async (agent: RemoteAgent, extra: string[] = []): Promise<number> => {
+    // Best-effort: make sure the phone-bridge daemon is running, and running
+    // the build we were launched from. The user shouldn't need to remember a
+    // second command for the picker on their phone to work.
+    await ensureListenerRunning();
     return new Promise<number>((resolve) => {
         const { cmd, args } = targetForAgent(agent.binary, extra);
         const start = Date.now();
