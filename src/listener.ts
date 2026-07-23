@@ -880,6 +880,12 @@ export interface StreamControl {
     sessionName?: string;
     /** Subscriber's device public key (Base64 SPKI) — presence turns on E2EE. */
     subscriberPublicKey?: string;
+    /**
+     * Subscriber promises to send `agent.stream.renew` while it's watching.
+     * Only such a subscriber gets the short lease; clients that predate the
+     * renew protocol keep the 5-minute orphan guard (see STREAM_LEASE_MS).
+     */
+    renew?: boolean;
 }
 
 // ~2.5 fps ceiling. Cadence + diff-gating are the ONLY bound on API Gateway
@@ -890,10 +896,27 @@ export interface StreamControl {
 // still caps the actual payload, so very wide panes get top-truncated.
 const STREAM_CAPTURE_LINES = 200;
 const STREAM_INTERVAL_MS = 400;
-// Orphan guard: a phone that dies without sending agent.stream.stop must not
-// leak an interval forever. Auto-stop after this long; the phone re-subscribes
-// on reopen.
+// Orphan guard for subscribers that can't renew (clients older than the renew
+// protocol): a phone that dies without sending agent.stream.stop must not leak
+// an interval forever. Auto-stop after this long; the phone re-subscribes on
+// reopen.
 const STREAM_MAX_MS = 5 * 60_000;
+// Lease for a renewal-capable subscriber (`start` carried `renew: true`).
+// stream.stop is NOT a reliable slot-release signal: the native terminal runs
+// in its own WebView that the OS destroys on swipe-back, killing the page mid-
+// flight — no unmount, no stop, and the relay is pass-through so we never see
+// the phone's socket drop either. Three such opens used to wedge
+// MAX_CONCURRENT_STREAMS for a full STREAM_MAX_MS with every retry answering
+// stream_limit. A lease inverts the burden: the viewer must keep proving it's
+// there.
+//
+// This is also the worst-case wait before a vanished viewer's slot comes back,
+// so it wants to be short — but a lease can only be as tight as the proof is
+// frequent. At the web's 5s renew cadence this tolerates 3 consecutive dropped
+// renews, the same margin as before, while cutting the wedge from 5 minutes to
+// 15 seconds. A viewer that loses the race gets its stream reaped and re-
+// subscribes on the next renew (see the stream_gone reply below).
+export const STREAM_LEASE_MS = 15_000;
 // Per-listener concurrency guard: the API Gateway WS stage throttle (50 rps)
 // is SHARED across every user, so a runaway machine (many sessions, or a
 // client re-subscribe bug) streaming at 2.5 fps each can starve push delivery
@@ -924,6 +947,12 @@ interface StreamStats {
 interface ActiveStream {
     timer: ReturnType<typeof setInterval>;
     stats: StreamStats;
+    /** Wall-clock deadline; the capture tick reaps the stream once it passes. */
+    expiresAt: number;
+    /** How far a renew (and the initial start) pushes `expiresAt` out. */
+    leaseMs: number;
+    /** Subscriber renews — i.e. its silence is proof it's gone, not just quiet. */
+    renewing: boolean;
 }
 
 const activeStreams = new Map<string, ActiveStream>();
@@ -980,7 +1009,7 @@ export type StreamFramePayload = {
 export type StreamErrorFrame = {
     subtype: 'agent.stream.frame';
     sessionName: string;
-    error: 'unknown_session' | 'e2ee_unavailable' | 'encrypt_failed' | 'stream_limit';
+    error: 'unknown_session' | 'e2ee_unavailable' | 'encrypt_failed' | 'stream_limit' | 'stream_gone';
 };
 
 /**
@@ -989,6 +1018,26 @@ export type StreamErrorFrame = {
  */
 export const isStreamCapReached = (activeCount: number): boolean =>
     activeCount >= MAX_CONCURRENT_STREAMS;
+
+/**
+ * At the cap, hand the slot to the new subscriber when the stalest holder
+ * can't prove it's still watching — an expired lease, or a client too old to
+ * renew at all (those hold a slot for STREAM_MAX_MS on nothing but hope, and
+ * a cached web build can keep producing them long after a deploy). Three
+ * actively-renewing viewers are all real, so that case still refuses.
+ * Returns the evicted session name, or null when every holder is live.
+ */
+const evictStalestStream = (now: number): string | null => {
+    let victim: { name: string; expiresAt: number } | null = null;
+    for (const [name, entry] of activeStreams) {
+        if (entry.renewing && entry.expiresAt > now) continue; // provably watched
+        if (!victim || entry.expiresAt < victim.expiresAt) victim = { name, expiresAt: entry.expiresAt };
+    }
+    if (!victim) return null;
+    log(`⧉ stream ${victim.name}: evicted — slot handed to a newer subscriber (no live lease)`);
+    stopStream(victim.name);
+    return victim.name;
+};
 
 const streamErrorFrame = (sessionName: string, error: StreamErrorFrame['error']): StreamErrorFrame => ({
     subtype: 'agent.stream.frame',
@@ -1036,6 +1085,26 @@ export const handleStreamControl = (
         if (req.sessionName) stopStream(req.sessionName);
         return true;
     }
+    // Lease renewal — the subscriber is still watching.
+    if (req.subtype === 'agent.stream.renew') {
+        if (!req.sessionName) return true;
+        const entry = activeStreams.get(req.sessionName);
+        if (entry) {
+            entry.expiresAt = Date.now() + entry.leaseMs;
+            return true;
+        }
+        // We're the addressed machine but hold no such stream: it was reaped
+        // (lost renews), evicted, or dropped when our socket last reconnected.
+        // The viewer has no other way to learn that — it just keeps painting a
+        // frozen pane under a LIVE badge — so tell it to re-subscribe. Renew
+        // carries no subscriber key, so restarting it here would silently
+        // downgrade an E2EE stream to plaintext; only the client can redo the
+        // handshake.
+        if (req.targetDeviceId === computeListenerDeviceId()) {
+            send(streamErrorFrame(req.sessionName, 'stream_gone'));
+        }
+        return true;
+    }
     if (req.subtype !== 'agent.stream.start') return false;
     // Not addressed to this machine — let other listeners answer.
     if (req.targetDeviceId !== computeListenerDeviceId()) return false;
@@ -1049,7 +1118,7 @@ export const handleStreamControl = (
     // Concurrency guard AFTER the restart-stop: re-subscribing to an already
     // active session doesn't count against the cap, only a genuinely new one
     // does. Refuse the new stream instead of adding to the shared-throttle load.
-    if (isStreamCapReached(activeStreams.size)) {
+    if (isStreamCapReached(activeStreams.size) && !evictStalestStream(Date.now())) {
         log(`⧉ stream ${sessionName}: refused — ${activeStreams.size}/${MAX_CONCURRENT_STREAMS} streams already active on this listener`);
         send(streamErrorFrame(sessionName, 'stream_limit'));
         return true;
@@ -1083,6 +1152,15 @@ export const handleStreamControl = (
     let wireSeq = 0;
     let encryptFailures = 0;
     const timer = setInterval(() => {
+        // Lease check rides the capture tick: one deadline field, no second
+        // timer to leak. (The previous per-start expiry setTimeout was never
+        // cleared on stop, so a restart left the old one armed to kill the new
+        // incarnation.) Reaping here is what frees the slot for everyone whose
+        // stop never arrived.
+        if (Date.now() >= (activeStreams.get(sessionName)?.expiresAt ?? 0)) {
+            stopStream(sessionName);
+            return;
+        }
         const captured = capturePane(sessionName, true, STREAM_CAPTURE_LINES);
         if (!captured || captured.content === lastContent) {
             stats.skipped++;
@@ -1133,9 +1211,16 @@ export const handleStreamControl = (
         });
     }, STREAM_INTERVAL_MS);
     timer.unref?.();
-    activeStreams.set(sessionName, { timer, stats });
-    const expiry = setTimeout(() => stopStream(sessionName), STREAM_MAX_MS);
-    expiry.unref?.();
+    // A renewing subscriber gets the short lease; anything older keeps the
+    // 5-minute orphan guard so a version-skewed client isn't cut off mid-view.
+    const leaseMs = req.renew ? STREAM_LEASE_MS : STREAM_MAX_MS;
+    activeStreams.set(sessionName, {
+        timer,
+        stats,
+        expiresAt: Date.now() + leaseMs,
+        leaseMs,
+        renewing: !!req.renew,
+    });
     return true;
 };
 
