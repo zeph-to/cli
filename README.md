@@ -7,7 +7,7 @@
 
 **Your agent works, hits a decision, and asks your phone. You tap a button (or type a reply), and the answer lands back in the live session — so the agent keeps going.**
 
-`@zeph-to/cli` is the terminal side of that round trip: a zero-dependency push SDK, a `zeph` CLI that wires up 8 AI agents in one command, and a resident listener that lets your phone **drive Claude Code / Codex / Gemini sessions** by typing straight into named tmux sessions.
+`@zeph-to/cli` is the terminal side of that round trip: a zero-dependency push SDK, a `zeph` CLI that wires up 8 AI agents in one command, and a resident listener that lets your phone **drive Claude Code / Codex / Cursor / Gemini sessions** by typing straight into named tmux sessions.
 
 <p align="center">
   <img src="https://zeph.to/readme/demo.gif" alt="Agent asks 'Deploy to prod?' on your phone; you tap Deploy; the session ships" width="560"><br>
@@ -78,7 +78,7 @@ To **send** notifications:
 zeph notify --title "Deploy done" --body "v2.1.0 shipped"
 ```
 
-To **drive a Claude Code / Codex / Gemini session from your phone**, see
+To **drive a Claude Code / Codex / Cursor / Gemini session from your phone**, see
 [Remote Control](#remote-control) below.
 
 ## Remote Control
@@ -111,7 +111,7 @@ tmux session via `tmux send-keys`.
 [zeph listener — resident daemon, started by `zeph cc` automatically]
    │  tmux send-keys -l -t zeph-myapp "리팩토링 마무리해줘" + Enter
    ▼
-[tmux session "zeph-myapp" running claude / codex / gemini]
+[tmux session "zeph-myapp" running claude / codex / cursor-agent / gemini]
 ```
 
 The listener polls its tmux session inventory every 5 seconds and
@@ -136,9 +136,28 @@ an answerable `zeph_ask`).
 | Claude Code | `UserPromptSubmit` → plugin's `zeph-remote.sh` | Zeph plugin |
 | Gemini CLI | `BeforeAgent` → `zeph remote-hook gemini` | `zeph setup` |
 | Codex CLI | `UserPromptSubmit` → `zeph remote-hook codex` | `zeph setup` |
+| Cursor CLI | — none yet | — |
 
 Detection is exact-match: a terminal keystroke racing a phone message
 can never false-flag. Muted projects are never flagged.
+
+`zeph cursor` has no remote-origin hook, so it never enters sticky REMOTE
+mode by itself. **Just ask for it** — one line, once per session:
+
+> I'm driving this session from my phone. End every response with
+> `zeph_ask` so I can answer with a button.
+
+Nothing else is missing: injection works, and the MCP tools are all
+there, `zeph_ask` included. Check them with `cursor-agent mcp list-tools
+zeph` — `mcp list` prints only the *approved* list, not what's
+configured, so it reads as empty even when the server is wired up.
+
+Why it isn't automatic: `hooks.json` is honored by the Cursor IDE but not
+by `cursor-agent`, and `beforeSubmitPrompt`'s output schema is
+`{continue, user_message}` — no context channel to deliver a marker match
+through. Same reason the `stop`-hook auto-push `zeph setup` installs
+covers the Cursor **IDE** but not `zeph cursor` panes; ask for a
+`zeph_notify` when you want one.
 
 ### Setup
 
@@ -162,10 +181,15 @@ can never false-flag. Muted projects are never flagged.
 3. **Run agents through the wrapper.** That's it.
 
    ```bash
-   zeph cc        # claude  → tmux session "zeph-<project>"
-   zeph codex     # codex   → tmux session "zeph-<project>"
-   zeph gemini    # gemini  → tmux session "zeph-<project>"
+   zeph cc        # claude       → tmux session "zeph-<project>"
+   zeph codex     # codex        → tmux session "zeph-<project>"
+   zeph cursor    # cursor-agent → tmux session "zeph-<project>"
+   zeph gemini    # gemini       → tmux session "zeph-<project>"
    ```
+
+   `zeph cursor` runs **`cursor-agent`**, Cursor's terminal agent — a
+   separate install from the Cursor IDE (the bare `cursor` on your PATH
+   is the editor launcher, which exits immediately and can't be driven).
 
    The first `zeph cc` on a machine **auto-spawns a background
    listener** (singleton, PID file at `~/.zeph/listener.pid`,
@@ -360,6 +384,7 @@ zeph test
 # Run an agent in a named tmux session (so the listener can reach it)
 zeph cc                       # claude
 zeph codex                    # codex
+zeph cursor                   # cursor-agent (Cursor CLI, not the IDE)
 zeph gemini                   # gemini
 
 # Run the resident listener (foreground; background it as you like)
