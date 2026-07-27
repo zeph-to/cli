@@ -35,7 +35,7 @@ describe('remote-agents.ts: table invariants', () => {
         }
     });
 
-    it('only claude carries a session resolver (codex/gemini are documented stubs)', () => {
+    it('only claude carries a session resolver (codex/cursor/gemini are documented stubs)', () => {
         for (const a of REMOTE_AGENTS) {
             if (a.kind === 'claude') expect(typeof a.resolveSessionId).toBe('function');
             else expect(a.resolveSessionId).toBeUndefined();
@@ -49,12 +49,20 @@ describe('remote-agents.ts: lookups', () => {
         expect(findAgentBySubcommand('claude')?.kind).toBe('claude');
         expect(findAgentBySubcommand('codex')?.kind).toBe('codex');
         expect(findAgentBySubcommand('gemini')?.kind).toBe('gemini');
-        expect(findAgentBySubcommand('cursor')).toBeUndefined();
+    });
+
+    it('cursor launches the terminal TUI, never the IDE launcher', () => {
+        expect(findAgentBySubcommand('cursor')?.binary).toBe('cursor-agent');
+        expect(findAgentBySubcommand('cursor-agent')?.kind).toBe('cursor');
     });
 
     it('matchAgentByPaneCommand accepts registered binaries only', () => {
         expect(matchAgentByPaneCommand('claude')?.kind).toBe('claude');
         expect(matchAgentByPaneCommand('codex')?.kind).toBe('codex');
+        expect(matchAgentByPaneCommand('cursor-agent')?.kind).toBe('cursor');
+        // The IDE launcher is not an agent pane — a `cursor` pane is someone
+        // opening the editor, and adopting it would address a dead session.
+        expect(matchAgentByPaneCommand('cursor')).toBeUndefined();
         expect(matchAgentByPaneCommand('bash')).toBeUndefined();
         expect(matchAgentByPaneCommand('node')).toBeUndefined();
         expect(matchAgentByPaneCommand('')).toBeUndefined();

@@ -7,9 +7,11 @@
  * and the phone picker, which may validate the enum).
  *
  * This is deliberately NOT merged into `agents.ts`: that table drives
- * install/uninstall/verify detection (8 agents, incl. Cursor/Windsurf
- * which can never be driven via tmux), and the two tables carry different
- * name axes — install id vs subcommand alias vs pane binary.
+ * install/uninstall/verify detection (8 agents, incl. Windsurf, which can
+ * never be driven via tmux), and the two tables carry different name axes
+ * — install id vs subcommand alias vs pane binary. Cursor is the clearest
+ * case for keeping them apart: the `cursor` install id there means the
+ * IDE, while the drivable binary here is `cursor-agent`, its terminal TUI.
  */
 import { readdirSync, readFileSync, statSync } from 'fs';
 import { homedir } from 'os';
@@ -239,6 +241,16 @@ const REMOTE_AGENT_TABLE = [
         subcommands: ['codex'],
     },
     {
+        // The pane binary is `cursor-agent`, Cursor's terminal TUI — NOT the
+        // bare `cursor` on PATH, which is the IDE launcher script: it opens
+        // the app and exits, so a pane started with it dies before the
+        // listener can address it.
+        kind: 'cursor',
+        displayName: 'Cursor CLI',
+        binary: 'cursor-agent',
+        subcommands: ['cursor', 'cursor-agent'],
+    },
+    {
         kind: 'gemini',
         displayName: 'Gemini CLI',
         binary: 'gemini',
@@ -246,7 +258,7 @@ const REMOTE_AGENT_TABLE = [
     },
 ] as const satisfies readonly RemoteAgent[];
 
-/** Closed union of remote-controllable agent kinds ('claude' | 'codex' | 'gemini'). */
+/** Closed union of remote-controllable agent kinds ('claude' | 'codex' | 'cursor' | 'gemini'). */
 export type AgentKind = (typeof REMOTE_AGENT_TABLE)[number]['kind'];
 
 /** A registry row: the uniform RemoteAgent shape with `kind` narrowed to the closed union. */
