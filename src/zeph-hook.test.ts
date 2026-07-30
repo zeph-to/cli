@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // ZephHook.notify branches by payload size:
 //   - body ≤ 512 bytes → POST /pushes/send with the full body inline
@@ -221,5 +224,110 @@ describe('ZephHook.renameAgentSession', () => {
         expect(call?.url).toBe('https://api.example.com/v1/devices/dev_listener_abc/agent-sessions/zeph-proj');
         expect(call?.init?.method).toBe('PATCH');
         expect(JSON.parse(call!.init!.body as string)).toEqual({ alias: 'Prod deploy' });
+    });
+});
+
+// E2E is Pro-only (ADR-0008). A process that initialized crypto while the
+// account was Pro only learns about a downgrade when the send is refused with
+// 403 PRO_REQUIRED — the push must still go out, as plaintext.
+describe('ZephHook.notify — PRO_REQUIRED plaintext fallback', () => {
+    const ENV_KEYS = ['HOME', 'XDG_CONFIG_HOME'] as const;
+    const savedEnv: Record<string, string | undefined> = {};
+    let TMP: string;
+
+    beforeEach(() => {
+        for (const key of ENV_KEYS) {
+            savedEnv[key] = process.env[key];
+            delete process.env[key];
+        }
+        TMP = mkdtempSync(join(tmpdir(), 'sdk-hook-e2e-'));
+        process.env.HOME = TMP;
+        vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    });
+
+    afterEach(() => {
+        rmSync(TMP, { recursive: true, force: true });
+        for (const key of ENV_KEYS) {
+            if (savedEnv[key] === undefined) delete process.env[key];
+            else process.env[key] = savedEnv[key];
+        }
+        vi.restoreAllMocks();
+    });
+
+    // Server has no keys but encryption is on → initCrypto generates a pair and
+    // PUTs it back, so the send that follows is encrypted.
+    const encryptionEnabledBoot = [
+        { ok: true, json: { data: { encryptionEnabled: true, encryptionKeys: null } } },
+        { ok: true, json: { data: {} } },
+    ];
+
+    const proRequired = {
+        ok: false,
+        status: 403,
+        json: { error: { code: 'PRO_REQUIRED', message: 'End-to-end encryption requires Zeph Pro', status: 403 } },
+    };
+
+    it('resends the plaintext payload after an encrypted send is refused', async () => {
+        sequenceResponses([
+            ...encryptionEnabledBoot,
+            proRequired,
+            { ok: true, json: { data: { pushId: 'push_plain_01' } } },
+        ]);
+        const { ZephHook } = await loadHookModule();
+        const hook = new ZephHook({ apiKey: 'ak_test', baseUrl: 'https://api.example.com/v1' });
+
+        const result = await hook.notify({ title: 'Build done', body: 'all green' });
+
+        expect(result.pushId).toBe('push_plain_01');
+        const sends = lastCalls.filter((c) => c.url.endsWith('/pushes/send'));
+        expect(sends).toHaveLength(2);
+        expect(JSON.parse(sends[0].init!.body as string).isEncrypted).toBe(true);
+        const retried = JSON.parse(sends[1].init!.body as string);
+        expect(retried.isEncrypted).toBeUndefined();
+        expect(retried.title).toBe('Build done');
+        expect(retried.body).toBe('all green');
+    });
+
+    it('re-uploads the file as plaintext on the long-body path', async () => {
+        sequenceResponses([
+            ...encryptionEnabledBoot,
+            { ok: true, json: { data: { fileId: 'f1', fileKey: 'fk_enc', uploadUrl: 'https://s3.example.com/put/enc' } } },
+            { ok: true, status: 200, json: {} },
+            proRequired,
+            { ok: true, json: { data: { fileId: 'f2', fileKey: 'fk_plain', uploadUrl: 'https://s3.example.com/put/plain' } } },
+            { ok: true, status: 200, json: {} },
+            { ok: true, json: { data: { pushId: 'push_plain_02' } } },
+        ]);
+        const { ZephHook } = await loadHookModule();
+        const hook = new ZephHook({ apiKey: 'ak_test', baseUrl: 'https://api.example.com/v1' });
+        const longBody = 'x'.repeat(1000);
+
+        const result = await hook.notify({ title: 'big report', body: longBody });
+
+        expect(result.fileKey).toBe('fk_plain');
+        expect(lastCalls.filter((c) => c.url.endsWith('/files/upload-request'))).toHaveLength(2);
+        const uploads = lastCalls.filter((c) => c.url.startsWith('https://s3.example.com/'));
+        expect(uploads).toHaveLength(2);
+        expect(uploads[1].init!.body).toBe(longBody);
+        const sends = lastCalls.filter((c) => c.url.endsWith('/pushes/send'));
+        const retried = JSON.parse(sends[1].init!.body as string);
+        expect(retried.isEncrypted).toBeUndefined();
+        expect(retried.files[0].iv).toBeUndefined();
+        expect(retried.files[0].encryptedKey).toBeUndefined();
+    });
+
+    it('propagates a second PRO_REQUIRED instead of looping', async () => {
+        sequenceResponses([...encryptionEnabledBoot, proRequired]);
+        const { ZephHook, ZephError } = await loadHookModule();
+        const hook = new ZephHook({ apiKey: 'ak_test', baseUrl: 'https://api.example.com/v1' });
+
+        try {
+            await hook.notify({ title: 'x' });
+            expect.fail('should have thrown');
+        } catch (err) {
+            expect(err).toBeInstanceOf(ZephError);
+            expect((err as InstanceType<typeof ZephError>).code).toBe('PRO_REQUIRED');
+        }
+        expect(lastCalls.filter((c) => c.url.endsWith('/pushes/send'))).toHaveLength(2);
     });
 });
