@@ -310,6 +310,23 @@ export const getKeyPair = (): CryptoKeyPair | null => cachedKeyPair;
 export const getPublicKey = (): string | null => cachedExportedPublicKey;
 
 /**
+ * Drop the cached keys so every later send goes out as plaintext.
+ *
+ * Callers use this when the server rejects an encrypted send with
+ * `PRO_REQUIRED` (ADR-0008): E2E is a Pro feature, and a long-lived process
+ * that initialized crypto before a downgrade would otherwise 403 on every push.
+ * Same end state as the "server says encryption disabled" branch in initCrypto.
+ * Keys on disk are left alone, but this process will not pick them up again:
+ * `initCrypto` is memoized on `initPromise` and `ZephHook.ensureCrypto` short-
+ * circuits on `cryptoInitialized`. A restart after an upgrade re-adopts them.
+ */
+export const disableCrypto = (): void => {
+  cachedKeyPair = null;
+  cachedExportedPublicKey = null;
+  cachedOwnPublicKey = null;
+};
+
+/**
  * Encrypt push body for a recipient.
  * Returns fields ready to merge into the sendPush payload.
  */

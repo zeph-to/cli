@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { listenerDeviceId } from './listener-device-id.js';
 import type { ZephOptions, NotifyPayload, NotifyResult, ListParams, ListResult, PushItem, DismissOneResult, DismissAllResult, ApiErrorResponse, UploadRequestResult } from './types.js';
 import { ZephError, AuthenticationError, QuotaExceededError } from './errors.js';
-import { initCrypto, getKeyPair, encryptPushBodyForSelf, encryptFileForSelf } from './crypto.js';
+import { initCrypto, getKeyPair, disableCrypto, encryptPushBodyForSelf, encryptFileForSelf } from './crypto.js';
 
 const DEFAULT_BASE_URL = 'https://api.zeph.to/v1';
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -64,12 +64,42 @@ export class ZephHook {
     }
   }
 
+  /**
+   * A push must not be lost because E2E turned out to be unavailable.
+   *
+   * E2E is Pro-only (ADR-0008) and the server rejects `isEncrypted` from a free
+   * account with 403 `PRO_REQUIRED`. This process may have initialized crypto
+   * while still Pro — a long-lived listener outlives a downgrade — so the
+   * rejection is only visible at send time. Drop the keys and run the send
+   * again from the top: the retry re-encodes the payload as plaintext and, on
+   * the file path, re-uploads the file unencrypted (a payload patch would leave
+   * an undecryptable blob in S3). The first, encrypted object stays orphaned —
+   * accepted cost; the upload endpoint has no quota counter to burn.
+   */
   async notify(payload: NotifyPayload): Promise<NotifyResult> {
+    // Resolved once for both attempts: the lookup shells out to tmux, and a
+    // retry milliseconds later cannot land in a different session.
+    const agentCtx = agentSessionContext();
+    try {
+      return await this.notifyOnce(payload, agentCtx);
+    } catch (err) {
+      // Held keys are what proves this send was encrypted, and dropping them is
+      // also the recursion guard — the retry has none, so a second 403 propagates.
+      if (!(err instanceof ZephError) || err.code !== 'PRO_REQUIRED' || !getKeyPair()) throw err;
+      disableCrypto();
+      console.error('[Crypto] End-to-end encryption requires Zeph Pro — resending as plaintext.');
+      return this.notifyOnce(payload, agentCtx);
+    }
+  }
+
+  private async notifyOnce(
+    payload: NotifyPayload,
+    agentCtx: ReturnType<typeof agentSessionContext>,
+  ): Promise<NotifyResult> {
     // Attach the stable session key when in a tmux agent session so the push
     // joins the agent chat. Merged into `payload` here so both the inline and
     // file-upload (notifyWithFile) paths — which each spread `...payload` —
     // carry it. Explicit caller values win.
-    const agentCtx = agentSessionContext();
     if (agentCtx) payload = { ...agentCtx, ...payload };
     const canEncrypt = await this.ensureCrypto();
     const body = payload.body;
