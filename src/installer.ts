@@ -535,9 +535,13 @@ export const handleInstall = async (args: Record<string, string | boolean>): Pro
   // Hooks fire for every session of every configured agent, so say it here —
   // at the moment the hooks get installed — together with the volume dials.
   console.log('  Notifications now fire for EVERY session of each agent above');
-  console.log('  (not only sessions launched with `zeph cc`). Dial the volume');
-  console.log('  any time — in Claude Code:');
-  console.log('    /zeph-quiet --global   only blockers + high-priority, all projects');
+  console.log('  (not only sessions launched with `zeph cc`).');
+  console.log('');
+  console.log('  In Claude Code the default is QUIET: you get pushed when the agent');
+  console.log('  asks you something and when a session finishes, not on every turn.');
+  console.log('  Dial it any time:');
+  console.log('    /zeph-normal           push on every turn that did real work');
+  console.log('    /zeph-loud             push on every turn');
   console.log('    /zeph-mute             full silence, current project');
   console.log('    /zeph-status           show what is in effect\n');
   return 0;

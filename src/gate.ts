@@ -47,6 +47,11 @@ export interface GateVerdict {
  * (most non-Claude agents pass no counts): in normal mode the push still
  * fires — preserving the historical always-push behavior of the dumb
  * hooks — while quiet/loud now work everywhere.
+ *
+ * These defaults cannot rescue a quiet dial: quiet only lets a `high` marker
+ * through, and a hook with no turn facts has no marker either. That is why
+ * the installed templates pass `--pushmode-default normal` (see templates.ts)
+ * — for them quiet is not a lower volume, it is permanent silence.
  */
 export const GATE_DEFAULTS = {
   toolCount: 2,
@@ -152,15 +157,62 @@ export const isMuted = (dir: string): boolean => {
   return hash !== null && findStateFile('muted', hash) !== null;
 };
 
-/** The user's session push-mode dial (/zeph-quiet | /zeph-loud), default normal. */
-export const readPushMode = (dir: string): GatePushMode => {
+/**
+ * Push mode for an install that has never set a dial. The twin is
+ * plugin/hooks/gate.sh's missing-5th-argument default; the shared vectors
+ * never reach either one (every vector passes pushMode explicitly), so both
+ * sides pin it in their own tests.
+ */
+export const PUSHMODE_DEFAULT: GatePushMode = 'quiet';
+
+/**
+ * `notify` flag naming the push mode to assume when the project has no dial.
+ * Written by templates.ts into every hook-driven agent's completion hook and
+ * read back in cli.ts — shared so the two can never drift apart.
+ */
+export const PUSHMODE_DEFAULT_FLAG = 'pushmode-default';
+
+/**
+ * The user's session push-mode dial (/zeph-quiet | /zeph-loud | /zeph-normal).
+ *
+ * Three failure shapes, three answers — "no dial" is the only one that gets
+ * the quiet default:
+ *   - no dial file          → `fallback` (PUSHMODE_DEFAULT unless the caller
+ *                             overrides it with --pushmode-default)
+ *   - unusable dial file    → normal. A missing project hash, an unreadable
+ *                             file, or a garbled/empty value is a broken
+ *                             setting, and resolving breakage to silence
+ *                             leaves the user with no symptom to debug. The
+ *                             point of the new default is quiet, not hidden
+ *                             errors.
+ *   - readable dial file    → whatever it says.
+ */
+export const readPushMode = (
+  dir: string,
+  fallback: GatePushMode = PUSHMODE_DEFAULT,
+): GatePushMode => {
   const hash = projectHash(dir);
   if (!hash) return 'normal';
   const file = findStateFile('pushmode', hash);
-  if (!file) return 'normal';
+  if (!file) return fallback;
   try {
     return normalizePushMode(readFileSync(file, 'utf-8').replace(/\s+/g, ''));
   } catch {
     return 'normal';
   }
 };
+
+/**
+ * Push mode for a `--auto` notify: the user's dial if they set one, otherwise
+ * the mode named by `--pushmode-default`, otherwise the built-in quiet.
+ *
+ * The dial outranks the flag deliberately. The flag exists so an agent whose
+ * hook cannot participate in the heuristic still pushes out of the box; if it
+ * outranked the dial, `/zeph-quiet` would silently do nothing for that agent.
+ *
+ * A flag value that isn't one of the three modes resolves to `normal`, not to
+ * the quiet default — same rule as a garbled dial file. A caller that passes
+ * nonsense has a bug, and answering a bug with silence hides it.
+ */
+export const autoPushMode = (dir: string, flag: string | boolean | undefined): GatePushMode =>
+  readPushMode(dir, typeof flag === 'string' ? normalizePushMode(flag) : PUSHMODE_DEFAULT);

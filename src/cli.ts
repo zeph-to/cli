@@ -11,7 +11,9 @@ import { handleCheckUpdate } from './check-update.js';
 import { handleAgentSession } from './wrapper.js';
 import { handleListener, computeListenerDeviceId } from './listener.js';
 import { detectProjectDir, loadConfig, resolvedEnv, VERSION } from './config.js';
-import { decidePush, GATE_DEFAULTS, isMuted, normalizeMarker, readPushMode } from './gate.js';
+import {
+  autoPushMode, decidePush, GATE_DEFAULTS, isMuted, normalizeMarker, PUSHMODE_DEFAULT_FLAG,
+} from './gate.js';
 import { findAgentBySubcommand, REMOTE_AGENTS } from './remote-agents.js';
 import { isRemoteHookAgent, runRemoteHook } from './remote-hook.js';
 
@@ -106,6 +108,10 @@ Notify options:
   --session <id>     AI session ID (or set ZEPH_SESSION_ID env)
   --auto             Apply the push gate before sending (honors the
                      /zeph-quiet | /zeph-loud dial; silent exit when gated)
+  --pushmode-default <m>
+                     Mode --auto assumes when the project has no dial
+                     (quiet|normal|loud) [default: quiet]. A dial set with
+                     /zeph-quiet | /zeph-loud | /zeph-normal always wins
   --marker <m>       Push Signal marker for --auto (skip|push|high)
   --tools <n>        Turn tool count for --auto [default: assume real work]
   --nonreadonly <n>  Non-read-only tool count for --auto
@@ -268,13 +274,14 @@ const handleNotify = async (args: Record<string, string | boolean>): Promise<num
   // GATE_DEFAULTS ("assume real work") so dumb hooks keep their historical
   // always-push behavior in normal mode, while the /zeph-quiet | /zeph-loud
   // dial now works for every hook-driven agent. Gated-out → silent success.
+  // With no dial the mode falls back to --pushmode-default, then to quiet.
   if (args.auto === true) {
     const verdict = decidePush({
       toolCount: gateCount(args.tools, GATE_DEFAULTS.toolCount),
       nonReadonlyCount: gateCount(args.nonreadonly, GATE_DEFAULTS.nonReadonlyCount),
       alreadyAsked: GATE_DEFAULTS.alreadyAsked,
       marker: normalizeMarker(typeof args.marker === 'string' ? args.marker : undefined),
-      pushMode: readPushMode(projectDir),
+      pushMode: autoPushMode(projectDir, args[PUSHMODE_DEFAULT_FLAG]),
     });
     if (!verdict.push) return 0;
     if (verdict.priority === 'high' && !args.priority) args.priority = 'high';

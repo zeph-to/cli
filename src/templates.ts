@@ -17,6 +17,7 @@
 // Keeping this in one place means a rule change lands everywhere at once
 // and the agents can't drift apart.
 
+import { PUSHMODE_DEFAULT_FLAG } from './gate.js';
 import { ZEPH_CORE_HOOK_DRIVEN, ZEPH_CORE_RULE_ONLY } from './zeph-core.generated.js';
 
 // Graceful resolution: prefer the installed `zeph` CLI, but fall back to
@@ -26,12 +27,21 @@ import { ZEPH_CORE_HOOK_DRIVEN, ZEPH_CORE_RULE_ONLY } from './zeph-core.generate
 // pattern in plugin/hooks/zeph-{stop,ask}.sh.
 //
 // `--auto` applies the shared push-gate before sending (see src/gate.ts):
-// in normal mode the push still fires (gate defaults assume real work), but
-// the /zeph-quiet | /zeph-loud dial now works for every hook-driven agent.
-// Older installed `zeph` versions parse `--auto` as an unknown boolean flag
-// and ignore it — graceful backward compatibility.
+// the push still fires (gate defaults assume real work), and the
+// /zeph-quiet | /zeph-loud dial works for every hook-driven agent.
+//
+// `--pushmode-default normal` is what keeps the first half of that true. The
+// built-in default for a project with no dial is quiet, and quiet only lets a
+// `high` Push Signal marker through — a marker these hooks have no way to
+// emit. Without the flag they would install and then never push again. The
+// user's own dial still outranks it, so /zeph-quiet keeps working here.
+//
+// Older installed `zeph` versions parse both flags as unknown booleans and
+// ignore them — graceful backward compatibility, and for `--pushmode-default`
+// specifically the old build's behavior was already "normal when no dial".
 const NOTIFY_CMD =
-  '$(command -v zeph || echo "npx -y @zeph-to/cli") notify --title "Task done" --auto 2>/dev/null || true';
+  '$(command -v zeph || echo "npx -y @zeph-to/cli") notify --title "Task done" --auto '
+  + `--${PUSHMODE_DEFAULT_FLAG} normal 2>/dev/null || true`;
 
 // Prompt-submit hook command — remote-origin detection (ADR-0002). Reads
 // the hook JSON on stdin and prints additionalContext JSON on a marker

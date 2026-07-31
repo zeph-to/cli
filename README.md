@@ -45,9 +45,11 @@ binary.
 
 Once installed, the hooks fire in **every** session of each configured
 agent — `zeph cc` is the phone-control bridge, not the notification
-switch. Turn the volume down without uninstalling: `/zeph-quiet --global`
-(blockers only, all projects), `/zeph-mute` (silence, current project),
-`/zeph-status` (what's in effect). See [Mute & push mode](#mute--push-mode).
+switch. In Claude Code the routine per-turn push starts off (`quiet` is
+the default); `/zeph-normal` turns it on for a project, `/zeph-loud`
+pushes on every turn, `/zeph-mute` silences a project entirely, and
+`/zeph-status` shows what's in effect. See
+[Mute & push mode](#mute--push-mode).
 
 `~/.zeph/config.json` is the single source of truth — the CLI, the MCP
 server, the plugin hooks, and the listener all read it. You never need
@@ -399,6 +401,7 @@ zeph notify --title "Hello" --json
 | `--device <id>` | Target device ID |
 | `--session <id>` | AI session ID so the push threads into that session's chat (or `ZEPH_SESSION_ID` env) |
 | `--auto` | Apply the push gate before sending — honors the `/zeph-quiet` / `/zeph-loud` push-mode dial, per project or machine-wide (`--global`); gated-out exits silently with code 0 |
+| `--pushmode-default <m>` | Mode `--auto` assumes when the project has no dial: `quiet` (built-in), `normal`, `loud`. A dial the user set always wins |
 | `--marker <m>` | Push Signal marker for `--auto`: `skip`, `push`, `high` |
 | `--tools <n>`, `--nonreadonly <n>` | Turn tool counts feeding `--auto`'s heuristic (defaults assume real work) |
 
@@ -466,13 +469,25 @@ this order — first hit wins:
 |-------|------|--------|
 | 1 | `$STATE_DIR/pushmode-<hash>` | `/zeph-quiet` · `/zeph-loud` · `/zeph-normal` |
 | 2 | `/tmp/zeph-pushmode-<hash>` | older versions (honored only when you own the file) |
-| 3 | `$STATE_DIR/pushmode-default` | `/zeph-quiet --global` — the machine-wide default |
-| 4 | *(none)* | `normal` |
+| 3 | `$STATE_DIR/pushmode-default` | the `--global` form of any dial — the machine-wide default |
+| 4 | `--pushmode-default <mode>` | the calling hook (the installed ones pass `normal`) |
+| 5 | *(nothing above)* | `quiet` |
 
-So `/zeph-quiet --global` quiets every project that has no dial of its
-own, and a per-project dial always overrides it. Mute has no `-default`
-form on purpose: it is keyed on presence, not content, so a global mute
-could never be lifted for a single project.
+**Row 5 changed**: an install with no dial anywhere used to be `normal`.
+It is now `quiet`, so upgrading turns the routine per-turn push off until
+you run `/zeph-normal`. Row 4 is why the hooks this CLI installs are
+unaffected: they name `normal` themselves, since a hook that supplies no
+turn counts also supplies no `high` marker, and `quiet` would make it
+permanently silent rather than merely quieter. Row 4 sits *below* the
+state files on purpose — the flag names a default, it does not override a
+dial the user set.
+
+A dial file that exists but reads empty resolves to `normal`, not to row
+5: an empty file is a failed write, and resolving breakage to silence
+leaves no symptom to debug.
+
+Mute has no `-default` form on purpose: it is keyed on presence, not
+content, so a global mute could never be lifted for a single project.
 
 Legacy `/tmp/zeph-muted-<hash>` files are still honored when owned by the
 current user (the state dir moved out of world-writable `/tmp`).
