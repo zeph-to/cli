@@ -4,8 +4,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-    decidePush, GATE_DEFAULTS, isMuted, normalizeMarker, normalizePushMode,
-    projectHash, readPushMode, stateDir,
+    autoPushMode, decidePush, GATE_DEFAULTS, isMuted, normalizeMarker, normalizePushMode,
+    projectHash, PUSHMODE_DEFAULT, PUSHMODE_DEFAULT_FLAG, readPushMode, stateDir,
 } from './gate.js';
 
 // ── Cross-repo parity vectors ────────────────────────────────────
@@ -68,6 +68,14 @@ describe('gate.ts: normalizers', () => {
         expect(decidePush({ ...GATE_DEFAULTS, marker: 'none', pushMode: 'normal' }))
             .toEqual({ push: true, priority: 'normal' });
     });
+
+    // Why --pushmode-default exists: a hook that supplies no turn facts also
+    // supplies no marker, and quiet only lets a `high` marker through. So for
+    // those agents quiet is not a lower volume, it is permanent silence.
+    it('GATE_DEFAULTS can never push in quiet mode', () => {
+        expect(decidePush({ ...GATE_DEFAULTS, marker: 'none', pushMode: 'quiet' }))
+            .toEqual({ push: false, priority: 'normal' });
+    });
 });
 
 // ── Per-project state files (hash parity with the bash hooks) ────
@@ -113,9 +121,60 @@ describe('gate.ts: project state helpers', () => {
         expect(isMuted(TMP)).toBe(true);
     });
 
+    // ── The default: no dial file ────────────────────────────────
+    //
+    // This is the twin of plugin/hooks/gate.sh's missing-5th-argument default
+    // (tested in plugin/tests/test-gate-vectors.sh). The shared vectors never
+    // reach it — every vector passes pushMode explicitly — so each side has to
+    // pin it locally or the two can drift without either CI noticing.
+
+    it('PUSHMODE_DEFAULT is quiet', () => {
+        expect(PUSHMODE_DEFAULT).toBe('quiet');
+    });
+
+    it('readPushMode falls back to quiet when no dial file exists', () => {
+        expect(readPushMode(TMP)).toBe('quiet');
+    });
+
+    it('readPushMode takes a caller-supplied fallback for the no-dial case', () => {
+        // What --pushmode-default gives the hook-driven agents whose hooks
+        // cannot emit a marker.
+        expect(readPushMode(TMP, 'normal')).toBe('normal');
+    });
+
+    it('a dial file always outranks the caller-supplied fallback', () => {
+        const file = join(TMP, 'state', 'zeph', `pushmode-${projectHash(TMP)}`);
+        writeFileSync(file, 'quiet');
+        expect(readPushMode(TMP, 'loud')).toBe('quiet');
+    });
+
+    // The twin of plugin/tests/test-zeph-stop.sh "project hash unavailable".
+    // Without `cksum` no state file can be keyed, so no dial can be found even
+    // if one exists — a broken environment, not a user who left the dial alone.
+    // This branch had no coverage on either side, which is how the two
+    // implementations drifted apart on it in the first place.
+    it('an unhashable project falls back to normal, not to the no-dial default', () => {
+        const savedPath = process.env.PATH;
+        process.env.PATH = '';
+        try {
+            expect(projectHash(TMP)).toBeNull();
+            expect(readPushMode(TMP)).toBe('normal');
+        } finally {
+            process.env.PATH = savedPath;
+        }
+    });
+
+    it('an empty dial file reads as normal, not as the no-dial default', () => {
+        // A truncated or failed write is a corrupted dial, not an absent one.
+        // Resolving it to quiet would hide the breakage as silence. The bash
+        // twin substitutes `normal` in zeph-stop.sh for the same reason.
+        const file = join(TMP, 'state', 'zeph', `pushmode-${projectHash(TMP)}`);
+        writeFileSync(file, '   \n');
+        expect(readPushMode(TMP, 'loud')).toBe('normal');
+    });
+
     it('readPushMode reads the dial file, tolerating whitespace', () => {
         const file = join(TMP, 'state', 'zeph', `pushmode-${projectHash(TMP)}`);
-        expect(readPushMode(TMP)).toBe('normal');
         writeFileSync(file, 'quiet\n');
         expect(readPushMode(TMP)).toBe('quiet');
         writeFileSync(file, ' loud ');
@@ -124,18 +183,39 @@ describe('gate.ts: project state helpers', () => {
         expect(readPushMode(TMP)).toBe('normal');
     });
 
+    // `loud`, not `quiet`: quiet is now what a missing dial resolves to, so a
+    // quiet expectation here would pass even if the file were never read.
     it('readPushMode falls back to a user-owned legacy /tmp dial file', () => {
-        writeFileSync(`/tmp/zeph-pushmode-${projectHash(TMP)}`, 'quiet\n');
-        expect(readPushMode(TMP)).toBe('quiet');
+        writeFileSync(`/tmp/zeph-pushmode-${projectHash(TMP)}`, 'loud\n');
+        expect(readPushMode(TMP)).toBe('loud');
     });
 
     it('readPushMode falls back to the global pushmode-default', () => {
         const dir = join(TMP, 'state', 'zeph');
-        writeFileSync(join(dir, 'pushmode-default'), 'quiet');
-        expect(readPushMode(TMP)).toBe('quiet');
+        writeFileSync(join(dir, 'pushmode-default'), 'loud');
+        expect(readPushMode(TMP)).toBe('loud');
         // A per-project dial always outranks the machine-wide default.
         writeFileSync(join(dir, `pushmode-${projectHash(TMP)}`), 'normal');
         expect(readPushMode(TMP)).toBe('normal');
+    });
+
+    // ── --pushmode-default (the flag the installed hooks carry) ──
+
+    // Only what autoPushMode adds on top of readPushMode is asserted here —
+    // the pass-through cases are already covered above, and duplicating them
+    // would light up four failures for one cause.
+    it('autoPushMode ignores a valueless or garbled flag', () => {
+        // `--pushmode-default` with nothing after it parses to boolean true.
+        expect(autoPushMode(TMP, true)).toBe('quiet');
+        expect(autoPushMode(TMP, 'banana')).toBe('normal');
+    });
+
+    it("autoPushMode lets the user's dial beat the flag", () => {
+        // The whole priority rule: the flag only names a default. A dial is an
+        // expression of intent and always wins, or /zeph-quiet would be a lie
+        // for every hook-driven agent.
+        writeFileSync(join(TMP, 'state', 'zeph', `pushmode-${projectHash(TMP)}`), 'quiet');
+        expect(autoPushMode(TMP, 'loud')).toBe('quiet');
     });
 
     it('isMuted has no global default — mute stays project-only', () => {
