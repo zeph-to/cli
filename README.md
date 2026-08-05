@@ -629,12 +629,21 @@ key.
 Toggle encryption in the Zeph app (Settings → Encryption); when it is
 off, the CLI sends plaintext. No configuration needed.
 
-**Threat model:** the backend stores ciphertext plus wrapped keys it
-cannot unwrap, so it never sees push contents. Two limits worth knowing:
-there is no forward secrecy (the ECDH secret for a given sender/device
-pair is static, so compromising either private key opens past pushes
-wrapped for that pair), and nothing signs `senderPublicKey` — a
-malicious server could make a push undecryptable, though not readable.
+**Threat model:** against a passive backend — a leaked snapshot, an
+operator reading the table — the stored ciphertext and wrapped keys are
+useless, so push contents stay private. Three limits worth knowing:
+
+- **No protection from an active malicious operator.** Recipient public
+  keys come from `GET /devices` on that same server, unsigned and
+  unpinned. A backend that injects a device record carrying its own key
+  gets the message key wrapped for it, and reads everything. Closing
+  this needs out-of-band device verification (ADR-0007 Phase 4, not
+  built).
+- **No forward secrecy.** The ECDH secret for a given sender/device pair
+  is static, so compromising either private key opens every past push
+  wrapped for that pair.
+- **`senderPublicKey` is unsigned**, so a swapped one makes a push
+  undecryptable — that direction fails closed rather than leaking.
 
 A device that has not registered a per-device public key cannot be sent
 to; it is skipped, and if no device qualifies the push goes out in the

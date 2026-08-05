@@ -42,6 +42,8 @@ export interface PushItem {
   title?: string;
   body?: string;
   createdAt: string;
+  /** E2E: when true, `title`/`body` are absent and the ciphertext is in `body`. */
+  isEncrypted?: boolean;
 }
 
 export interface ListResult {

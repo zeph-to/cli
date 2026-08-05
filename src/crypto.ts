@@ -360,18 +360,23 @@ export const encryptPushBodyForDevices = async (
  * Encrypt file content for the given recipient devices.
  */
 export const encryptFileForDevices = async (
-  content: string,
+  content: string | Buffer,
   recipients: DeviceRecipient[],
 ): Promise<{ ciphertext: Buffer; iv: string; deviceKeyMap: DeviceKeyMap }> => {
   if (!deviceKeyPair) throw new Error('Crypto not initialized');
 
+  // Binary content must be encrypted byte for byte — running a Buffer through
+  // TextEncoder would UTF-8 mangle every non-ASCII byte. Today's only caller
+  // passes markdown, so this is a guard against the first binary sender rather
+  // than a live fix (the MCP twin took that bug in production).
+  const buffer =
+    typeof content === 'string'
+      ? new TextEncoder().encode(content)
+      : new Uint8Array(content.buffer as ArrayBuffer, content.byteOffset, content.byteLength);
+
   const fileKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    fileKey,
-    new TextEncoder().encode(content),
-  );
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, fileKey, buffer);
   const rawFileKey = await crypto.subtle.exportKey('raw', fileKey);
 
   return {
@@ -381,14 +386,17 @@ export const encryptFileForDevices = async (
   };
 };
 
-// ─── Per-device crypto (stream E2EE) ───
+// ─── Per-device keypair (stream E2EE + push/file bodies) ───
 //
-// Unlike the per-user keypair above (server-synced, shared across devices —
-// see the threat-model note at the top), the DEVICE keypair is true E2E
-// material: generated on this host, private key never leaves
-// ~/.zeph/device-keys.json, never uploaded anywhere. It matches the web
-// app's per-device `'device'` slot, so a frame encrypted here is decryptable
-// only by the one phone whose public key it was wrapped for.
+// One keypair per host: generated here, private key never leaves
+// ~/.zeph/device-keys.json, never uploaded. It matches the web app's
+// per-device `'device'` slot, so anything encrypted here is decryptable only
+// by the devices whose public keys it was wrapped for.
+//
+// Stream frames use it unconditionally; push and file bodies only once the
+// account opts in (see `pushCryptoEnabled`). It replaced the escrowed
+// account-wide keypair entirely — the file header explains why that one is
+// gone.
 
 /**
  * Flat ephemeral envelope — field-for-field what the web's decrypt()

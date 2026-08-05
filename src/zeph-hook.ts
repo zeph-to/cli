@@ -137,7 +137,11 @@ export class ZephHook {
     if (recipients) {
       try {
         const enc = await encryptPushBodyForDevices({ title: payload.title, body: payload.body, url: payload.url }, recipients);
-        sendPayload = { ...sendPayload, title: undefined, body: enc.body, isEncrypted: true, deviceKeyMap: enc.deviceKeyMap, senderPublicKey: enc.senderPublicKey };
+        // `url: undefined` alongside the title: it is already sealed inside the
+        // ciphertext, and on a link push it IS the payload. Spreading `payload`
+        // above left the plaintext copy at the top level, handing the server the
+        // one thing `isEncrypted` promises it cannot see.
+        sendPayload = { ...sendPayload, title: undefined, url: undefined, body: enc.body, isEncrypted: true, deviceKeyMap: enc.deviceKeyMap, senderPublicKey: enc.senderPublicKey };
       } catch (err) {
         console.error('[Crypto] Push encryption failed, sending plaintext:', err);
       }
@@ -195,6 +199,8 @@ export class ZephHook {
         deviceKeyMap: encrypted?.file.deviceKeyMap,
       }],
       ...(encrypted && {
+        // See notifyOnce: the url must not survive in the clear either.
+        url: undefined,
         isEncrypted: true,
         deviceKeyMap: encrypted.push.deviceKeyMap,
         senderPublicKey: encrypted.push.senderPublicKey,
@@ -241,8 +247,12 @@ export class ZephHook {
     const pushes = json.data.map((p) => ({
       pushId: p.pushId,
       type: p.type,
-      title: p.title,
-      body: p.body?.slice(0, 100),
+      // An encrypted push carries no plaintext title and a JSON envelope in
+      // `body`; slicing that renders `{"ciphertext":"AAAB...` as if it were the
+      // message. This host cannot decrypt (send-only), so say so instead.
+      title: p.isEncrypted ? undefined : p.title,
+      body: p.isEncrypted ? '[encrypted]' : p.body?.slice(0, 100),
+      isEncrypted: p.isEncrypted,
       createdAt: p.createdAt,
     }));
     return { pushes, count: pushes.length, hasMore: json.pagination?.hasMore ?? false };
