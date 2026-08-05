@@ -254,12 +254,23 @@ describe('ZephHook.notify — PRO_REQUIRED plaintext fallback', () => {
         vi.restoreAllMocks();
     });
 
-    // Server has no keys but encryption is on → initCrypto generates a pair and
-    // PUTs it back, so the send that follows is encrypted.
-    const encryptionEnabledBoot = [
-        { ok: true, json: { data: { encryptionEnabled: true, encryptionKeys: null } } },
-        { ok: true, json: { data: {} } },
-    ];
+    /**
+     * Boot responses for an encrypted send: the account opt-in, then the
+     * device list the message key gets wrapped for. The device public key has
+     * to be a real P-256 SPKI — an unusable one makes wrapping fail, and the
+     * push would fall back to plaintext before the 403 under test.
+     */
+    const encryptionEnabledBoot = async () => {
+        const kp = await crypto.subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits'],
+        );
+        const spki = await crypto.subtle.exportKey('spki', kp.publicKey);
+        const publicKey = Buffer.from(new Uint8Array(spki)).toString('base64');
+        return [
+            { ok: true, json: { data: { encryptionEnabled: true, encryptionKeys: null } } },
+            { ok: true, json: { data: [{ deviceId: 'dev_phone', publicKey }] } },
+        ];
+    };
 
     const proRequired = {
         ok: false,
@@ -269,7 +280,7 @@ describe('ZephHook.notify — PRO_REQUIRED plaintext fallback', () => {
 
     it('resends the plaintext payload after an encrypted send is refused', async () => {
         sequenceResponses([
-            ...encryptionEnabledBoot,
+            ...(await encryptionEnabledBoot()),
             proRequired,
             { ok: true, json: { data: { pushId: 'push_plain_01' } } },
         ]);
@@ -290,7 +301,7 @@ describe('ZephHook.notify — PRO_REQUIRED plaintext fallback', () => {
 
     it('re-uploads the file as plaintext on the long-body path', async () => {
         sequenceResponses([
-            ...encryptionEnabledBoot,
+            ...(await encryptionEnabledBoot()),
             { ok: true, json: { data: { fileId: 'f1', fileKey: 'fk_enc', uploadUrl: 'https://s3.example.com/put/enc' } } },
             { ok: true, status: 200, json: {} },
             proRequired,
@@ -317,7 +328,7 @@ describe('ZephHook.notify — PRO_REQUIRED plaintext fallback', () => {
     });
 
     it('propagates a second PRO_REQUIRED instead of looping', async () => {
-        sequenceResponses([...encryptionEnabledBoot, proRequired]);
+        sequenceResponses([...(await encryptionEnabledBoot()), proRequired, proRequired]);
         const { ZephHook, ZephError } = await loadHookModule();
         const hook = new ZephHook({ apiKey: 'ak_test', baseUrl: 'https://api.example.com/v1' });
 

@@ -619,25 +619,31 @@ session.
 
 ## Encryption
 
-Push bodies are encrypted with AES-256-GCM. The wrapping key is derived
-via ECDH P-256 and synced across your own devices on first run so every
-device can read the same push. Toggle encryption in the Zeph app
-(Settings → Encryption); when disabled, the CLI sends plaintext. No
-configuration needed.
+Push bodies and long-body attachments are encrypted with AES-256-GCM.
+This host holds its own ECDH P-256 keypair in `~/.zeph/device-keys.json`
+— generated on first use, and the private half never leaves the machine.
+Each push is encrypted once, and its AES key is wrapped separately for
+every device on your account using ECDH against that device's public
+key.
 
-**Threat model honesty:** keys are persisted on the Zeph backend to
-enable cross-device sync, so this is *device-shared* encryption — not
-true end-to-end. It protects push contents from passive network
-observers and from a leaked database snapshot taken without the key
-store, but it does **not** protect against the Zeph backend itself (it
-has the keys it serves to your devices). A true E2E mode (per-device
-keypairs, server stores only public keys, no key escrow) is on the
-roadmap.
+Toggle encryption in the Zeph app (Settings → Encryption); when it is
+off, the CLI sends plaintext. No configuration needed.
 
-The `zeph listener` ignores `isEncrypted` pushes for now — it has no
-per-device key to decrypt them. Stop-hook auto-pushes and `zeph_ask`
-responses are not part of the `@<session>` injection path, so this
-doesn't affect normal use.
+**Threat model:** the backend stores ciphertext plus wrapped keys it
+cannot unwrap, so it never sees push contents. Two limits worth knowing:
+there is no forward secrecy (the ECDH secret for a given sender/device
+pair is static, so compromising either private key opens past pushes
+wrapped for that pair), and nothing signs `senderPublicKey` — a
+malicious server could make a push undecryptable, though not readable.
+
+A device that has not registered a per-device public key cannot be sent
+to; it is skipped, and if no device qualifies the push goes out in the
+clear rather than arriving as something nothing can open.
+
+The `zeph listener` ignores `isEncrypted` pushes for now — it does not
+try to decrypt them. Stop-hook auto-pushes and `zeph_ask` responses are
+not part of the `@<session>` injection path, so this doesn't affect
+normal use.
 
 ## Requirements
 

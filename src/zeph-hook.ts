@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { listenerDeviceId } from './listener-device-id.js';
 import type { ZephOptions, NotifyPayload, NotifyResult, ListParams, ListResult, PushItem, DismissOneResult, DismissAllResult, ApiErrorResponse, UploadRequestResult } from './types.js';
 import { ZephError, AuthenticationError, QuotaExceededError } from './errors.js';
-import { initCrypto, getKeyPair, disableCrypto, encryptPushBodyForSelf, encryptFileForSelf } from './crypto.js';
+import { initCrypto, getKeyPair, disableCrypto, selectRecipients, encryptPushBodyForDevices, encryptFileForDevices, type DeviceRecipient } from './crypto.js';
 
 const DEFAULT_BASE_URL = 'https://api.zeph.to/v1';
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -52,15 +52,37 @@ export class ZephHook {
     this.timeoutMs = options.timeout ?? DEFAULT_TIMEOUT_MS;
   }
 
-  private async ensureCrypto(): Promise<boolean> {
-    if (this.cryptoInitialized) return !!getKeyPair();
+  /**
+   * Resolve who this push can be encrypted for, or null when it cannot be.
+   *
+   * The device list is fetched per send rather than cached: a phone that
+   * registered its key a minute ago must be able to read the next push, and a
+   * long-lived listener would otherwise keep wrapping for a stale set.
+   * Failures here are not fatal — plaintext the user can read beats a
+   * notification that never arrives.
+   */
+  private async ensureCrypto(): Promise<DeviceRecipient[] | null> {
+    if (!this.cryptoInitialized) {
+      try {
+        await initCrypto(this.apiKey, this.baseUrl);
+      } catch {
+        // fall through — getKeyPair() stays null and we send plaintext
+      }
+      this.cryptoInitialized = true;
+    }
+    if (!getKeyPair()) return null;
+
     try {
-      await initCrypto(this.apiKey, this.baseUrl);
-      this.cryptoInitialized = true;
-      return !!getKeyPair();
-    } catch {
-      this.cryptoInitialized = true;
-      return false;
+      const json = await this.request<{ data: { deviceId: string; publicKey?: string }[] }>('GET', '/devices');
+      const recipients = selectRecipients(json.data ?? []);
+      if (recipients.length === 0) {
+        console.error('[Crypto] No device has a per-device public key — sending plaintext.');
+        return null;
+      }
+      return recipients;
+    } catch (err) {
+      console.error('[Crypto] Could not list devices, sending plaintext:', err);
+      return null;
     }
   }
 
@@ -101,21 +123,21 @@ export class ZephHook {
     // file-upload (notifyWithFile) paths — which each spread `...payload` —
     // carry it. Explicit caller values win.
     if (agentCtx) payload = { ...agentCtx, ...payload };
-    const canEncrypt = await this.ensureCrypto();
+    const recipients = await this.ensureCrypto();
     const body = payload.body;
     const bodyBytes = body ? new TextEncoder().encode(body).byteLength : 0;
     const isLongBody = bodyBytes > BODY_FILE_THRESHOLD;
 
     if (isLongBody && body) {
-      return this.notifyWithFile(payload, body, bodyBytes, canEncrypt);
+      return this.notifyWithFile(payload, body, bodyBytes, recipients);
     }
 
     // Encrypt push body if possible
     let sendPayload: Record<string, unknown> = { ...payload };
-    if (canEncrypt) {
+    if (recipients) {
       try {
-        const enc = await encryptPushBodyForSelf({ title: payload.title, body: payload.body, url: payload.url });
-        sendPayload = { ...sendPayload, title: undefined, body: enc.body, isEncrypted: true, encryptedKey: enc.encryptedKey, senderPublicKey: enc.senderPublicKey };
+        const enc = await encryptPushBodyForDevices({ title: payload.title, body: payload.body, url: payload.url }, recipients);
+        sendPayload = { ...sendPayload, title: undefined, body: enc.body, isEncrypted: true, deviceKeyMap: enc.deviceKeyMap, senderPublicKey: enc.senderPublicKey };
       } catch (err) {
         console.error('[Crypto] Push encryption failed, sending plaintext:', err);
       }
@@ -129,50 +151,55 @@ export class ZephHook {
     return { pushId };
   }
 
-  private async notifyWithFile(payload: NotifyPayload, body: string, fileSize: number, canEncrypt: boolean): Promise<NotifyResult> {
+  private async notifyWithFile(payload: NotifyPayload, body: string, fileSize: number, recipients: DeviceRecipient[] | null): Promise<NotifyResult> {
     const fileName = 'response.md';
-    let fileType = inferMimeType(fileName);
-
-    // Encrypt file content if possible
-    let uploadContent: string | Buffer = body;
-    let uploadSize = fileSize;
-    let fileIv: string | undefined;
-    let fileEncryptedKey: string | undefined;
-
-    if (canEncrypt) {
-      try {
-        const encrypted = await encryptFileForSelf(body);
-        uploadContent = encrypted.ciphertext;
-        uploadSize = encrypted.ciphertext.length;
-        fileType = 'application/octet-stream';
-        fileIv = encrypted.iv;
-        fileEncryptedKey = encrypted.encryptedKey;
-      } catch (err) {
-        console.error('[Crypto] File encryption failed, sending plaintext:', err);
-      }
-    }
-
-    const upload = await this.requestUpload({ fileName, fileType, fileSize: uploadSize });
-    await this.uploadToS3(upload.uploadUrl, uploadContent, fileType);
-
     const preview = body.length > PREVIEW_LENGTH ? body.slice(0, PREVIEW_LENGTH) + '...' : body;
 
-    // Encrypt push body
-    let sendPayload: Record<string, unknown> = {
-      ...payload,
-      body: preview,
-      type: payload.type ?? 'file',
-      files: [{ fileKey: upload.fileKey, fileName, fileSize, fileType: inferMimeType(fileName), iv: fileIv, encryptedKey: fileEncryptedKey }],
-    };
-
-    if (canEncrypt) {
+    // Encrypt the attachment and the push body together, before anything is
+    // uploaded. Doing them one at a time around the upload let a failure land
+    // in between and ship ciphertext under a push with no `isEncrypted` — an
+    // attachment no client would even try to open.
+    let encrypted: {
+      file: Awaited<ReturnType<typeof encryptFileForDevices>>;
+      push: Awaited<ReturnType<typeof encryptPushBodyForDevices>>;
+    } | null = null;
+    if (recipients) {
       try {
-        const enc = await encryptPushBodyForSelf({ title: payload.title, body: preview, url: payload.url });
-        sendPayload = { ...sendPayload, title: undefined, body: enc.body, isEncrypted: true, encryptedKey: enc.encryptedKey, senderPublicKey: enc.senderPublicKey };
+        encrypted = {
+          file: await encryptFileForDevices(body, recipients),
+          push: await encryptPushBodyForDevices({ title: payload.title, body: preview, url: payload.url }, recipients),
+        };
       } catch (err) {
-        console.error('[Crypto] Push encryption failed, sending plaintext:', err);
+        console.error('[Crypto] Encryption failed, sending plaintext:', err);
       }
     }
+
+    const uploadContent: string | Buffer = encrypted?.file.ciphertext ?? body;
+    const uploadType = encrypted ? 'application/octet-stream' : inferMimeType(fileName);
+    const uploadSize = encrypted ? encrypted.file.ciphertext.length : fileSize;
+
+    const upload = await this.requestUpload({ fileName, fileType: uploadType, fileSize: uploadSize });
+    await this.uploadToS3(upload.uploadUrl, uploadContent, uploadType);
+
+    const sendPayload: Record<string, unknown> = {
+      ...payload,
+      title: encrypted ? undefined : payload.title,
+      body: encrypted ? encrypted.push.body : preview,
+      type: payload.type ?? 'file',
+      files: [{
+        fileKey: upload.fileKey,
+        fileName,
+        fileSize,
+        fileType: inferMimeType(fileName),
+        iv: encrypted?.file.iv,
+        deviceKeyMap: encrypted?.file.deviceKeyMap,
+      }],
+      ...(encrypted && {
+        isEncrypted: true,
+        deviceKeyMap: encrypted.push.deviceKeyMap,
+        senderPublicKey: encrypted.push.senderPublicKey,
+      }),
+    };
 
     const json = await this.request<{ data: { pushId: string } }>('POST', '/pushes/send', sendPayload);
 
