@@ -1,14 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { EncryptedEphemeralPayload } from './crypto.js';
 
 // Mirror of mcp-server's crypto tests — the two crypto.ts files are
 // near-identical inline copies (until we extract into a shared package),
-// so they share the same test cases plus the SDK-specific
-// encryptPushBody / encryptFileForRecipient that the MCP version
-// doesn't export.
+// so they share the same test cases, plus the stream-frame helpers below
+// that the MCP version doesn't have.
 
 const CRYPTO_ENV_KEYS = ['HOME', 'XDG_CONFIG_HOME'] as const;
 const originalEnv: Record<string, string | undefined> = {};
@@ -33,57 +32,123 @@ afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-const stubServerWithNoKeys = (): void => {
+const ECDH: EcKeyImportParams = { name: 'ECDH', namedCurve: 'P-256' };
+const b64 = (buf: ArrayBuffer): string => Buffer.from(new Uint8Array(buf)).toString('base64');
+const unb64 = (s: string): Buffer => Buffer.from(s, 'base64');
+
+/** A stand-in recipient device with its own keypair. */
+const makeDevice = async (): Promise<{ publicKey: string; privateKey: string }> => {
+    const kp = await crypto.subtle.generateKey(ECDH, true, ['deriveKey', 'deriveBits']);
+    const [pub, priv] = await Promise.all([
+        crypto.subtle.exportKey('spki', kp.publicKey),
+        crypto.subtle.exportKey('pkcs8', kp.privateKey),
+    ]);
+    return { publicKey: b64(pub), privateKey: b64(priv) };
+};
+
+/** Unwrap the way a recipient device does: ECDH(my private, sender public). */
+const unwrapAsDevice = async (
+    devicePrivateKey: string,
+    senderPublicKey: string,
+    wrappedEntry: string,
+    ciphertext: string | Buffer,
+    iv: string,
+): Promise<Buffer> => {
+    const priv = await crypto.subtle.importKey('pkcs8', unb64(devicePrivateKey), ECDH, false, ['deriveKey']);
+    const pub = await crypto.subtle.importKey('spki', unb64(senderPublicKey), ECDH, false, []);
+    const sharedKey = await crypto.subtle.deriveKey(
+        { name: 'ECDH', public: pub }, priv, { name: 'AES-GCM', length: 256 }, false, ['decrypt'],
+    );
+
+    const { encryptedKey, keyIv } = JSON.parse(wrappedEntry) as { encryptedKey: string; keyIv: string };
+    const rawKey = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(keyIv) }, sharedKey, unb64(encryptedKey));
+    const messageKey = await crypto.subtle.importKey('raw', rawKey, { name: 'AES-GCM' }, false, ['decrypt']);
+
+    const bytes = typeof ciphertext === 'string' ? unb64(ciphertext) : ciphertext;
+    return Buffer.from(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(iv) }, messageKey, bytes));
+};
+
+const stubServer = (data: { encryptionEnabled: boolean; publicKey?: string }): void => {
     vi.stubGlobal('fetch', vi.fn(async () => ({
         ok: true,
-        json: async () => ({ data: { encryptionEnabled: true, encryptionKeys: null } }),
+        json: async () => ({
+            data: {
+                encryptionEnabled: data.encryptionEnabled,
+                encryptionKeys: data.publicKey ? { publicKey: data.publicKey } : null,
+            },
+        }),
     } as unknown as Response)));
 };
 
+const fetchCalls = (): { url: string; method: string }[] => {
+    const calls = (fetch as unknown as { mock?: { calls: unknown[][] } }).mock?.calls ?? [];
+    return calls.map((args) => ({
+        url: String(args[0]),
+        method: ((args[1] as RequestInit | undefined)?.method ?? 'GET').toUpperCase(),
+    }));
+};
+
 describe('initCrypto', () => {
-    it('generates and persists a keypair when none exists locally', async () => {
-        stubServerWithNoKeys();
-        const { initCrypto, getPublicKey } = await import('./crypto.js');
+    it('adopts the per-device keypair when the account has opted in', async () => {
+        stubServer({ encryptionEnabled: true });
+        const { initCrypto, getPublicKey, getDevicePublicKey } = await import('./crypto.js');
+
         const pub = await initCrypto('ak_test', 'https://api.example.com/v1');
+
         expect(pub).toBeTruthy();
         expect(getPublicKey()).toBe(pub);
-        const keysPath = join(TMP, '.config', 'zeph', 'keys.json');
-        expect(existsSync(keysPath)).toBe(true);
-        const stored = JSON.parse(readFileSync(keysPath, 'utf-8'));
-        expect(stored).toHaveProperty('publicKey');
-        expect(stored).toHaveProperty('privateKey');
+        // Same keypair the stream frames use — one identity per host.
+        expect(getDevicePublicKey()).toBe(pub);
+        expect(existsSync(join(TMP, '.zeph', 'device-keys.json'))).toBe(true);
     });
 
-    it('never sends the private key to the server on upload (security)', async () => {
-        const calls: { url: string; init?: RequestInit }[] = [];
-        vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
-            calls.push({ url, init });
-            return {
-                ok: true,
-                json: async () => ({ data: { encryptionEnabled: true, encryptionKeys: null } }),
-            } as unknown as Response;
-        }));
+    it('never writes key material to the server', async () => {
+        stubServer({ encryptionEnabled: true });
+        const { initCrypto } = await import('./crypto.js');
+
+        await initCrypto('ak_test', 'https://api.example.com/v1');
+
+        // The old code PUT this host's public key to /users/me/keys, which
+        // overwrote the account key every other client reads and made pushes
+        // undecryptable everywhere.
+        expect(fetchCalls().some((c) => c.method === 'PUT')).toBe(false);
+        expect(fetchCalls().every((c) => c.method === 'GET')).toBe(true);
+    });
+
+    it('deletes the escrowed account keypair an old build may have left behind', async () => {
+        const legacyPath = join(TMP, '.config', 'zeph', 'keys.json');
+        mkdirSync(join(TMP, '.config', 'zeph'), { recursive: true });
+        writeFileSync(legacyPath, JSON.stringify({ publicKey: 'p', privateKey: 'q' }));
+
+        stubServer({ encryptionEnabled: true });
         const { initCrypto } = await import('./crypto.js');
         await initCrypto('ak_test', 'https://api.example.com/v1');
-        const put = calls.find((c) => c.init?.method === 'PUT' && c.url.endsWith('/users/me/keys'));
-        expect(put).toBeDefined();
-        const body = JSON.parse(String(put?.init?.body ?? '{}'));
-        expect(body).toHaveProperty('publicKey');
-        expect(body).not.toHaveProperty('privateKey');
+
+        expect(existsSync(legacyPath)).toBe(false);
     });
 
-    it('local-only mode works without apiKey', async () => {
-        const { initCrypto, getPublicKey } = await import('./crypto.js');
+    it('stays off in local-only mode (no apiKey)', async () => {
+        const { initCrypto, getPublicKey, getKeyPair } = await import('./crypto.js');
+
         const pub = await initCrypto();
-        expect(pub).toBeTruthy();
-        expect(getPublicKey()).toBe(pub);
+
+        // No flag to consult, so encryption must not be inferred.
+        expect(pub).toBe('');
+        expect(getPublicKey()).toBe(null);
+        expect(getKeyPair()).toBe(null);
     });
 
-    it('skips crypto when server says encryption is disabled', async () => {
-        vi.stubGlobal('fetch', vi.fn(async () => ({
-            ok: true,
-            json: async () => ({ data: { encryptionEnabled: false, encryptionKeys: null } }),
-        } as unknown as Response)));
+    it('skips crypto when the account has not opted in', async () => {
+        stubServer({ encryptionEnabled: false });
+        const { initCrypto, getPublicKey, getKeyPair } = await import('./crypto.js');
+        const pub = await initCrypto('ak_test', 'https://api.example.com/v1');
+        expect(pub).toBe('');
+        expect(getPublicKey()).toBe(null);
+        expect(getKeyPair()).toBe(null);
+    });
+
+    it('stays off when the server is unreachable', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network down'); }));
         const { initCrypto, getPublicKey, getKeyPair } = await import('./crypto.js');
         const pub = await initCrypto('ak_test', 'https://api.example.com/v1');
         expect(pub).toBe('');
@@ -92,90 +157,99 @@ describe('initCrypto', () => {
     });
 
     it('deduplicates concurrent calls', async () => {
-        stubServerWithNoKeys();
+        stubServer({ encryptionEnabled: true });
         const { initCrypto } = await import('./crypto.js');
         const [a, b] = await Promise.all([
             initCrypto('ak_test', 'https://api.example.com/v1'),
             initCrypto('ak_test', 'https://api.example.com/v1'),
         ]);
         expect(a).toBe(b);
+        expect(fetchCalls().length).toBe(1);
     });
 });
 
-describe('encryptPushBodyForSelf', () => {
-    it('returns a complete encrypted envelope', async () => {
-        stubServerWithNoKeys();
-        const { initCrypto, encryptPushBodyForSelf } = await import('./crypto.js');
+describe('selectRecipients', () => {
+    it('drops devices with no public key and devices still on the account key', async () => {
+        stubServer({ encryptionEnabled: true, publicKey: 'ACCOUNT_PUB' });
+        const { initCrypto, selectRecipients } = await import('./crypto.js');
         await initCrypto('ak_test', 'https://api.example.com/v1');
 
-        const enc = await encryptPushBodyForSelf({ title: 'hi', body: 'hello world', url: 'https://x.test' });
+        const picked = selectRecipients([
+            { deviceId: 'dev_new', publicKey: 'PHONE_PUB' },
+            { deviceId: 'dev_stale', publicKey: 'ACCOUNT_PUB' },
+            { deviceId: 'dev_old' },
+        ]);
+
+        expect(picked).toEqual([{ deviceId: 'dev_new', publicKey: 'PHONE_PUB' }]);
+    });
+});
+
+describe('encryptPushBodyForDevices', () => {
+    it('produces an envelope every recipient device can open', async () => {
+        stubServer({ encryptionEnabled: true });
+        const { initCrypto, encryptPushBodyForDevices } = await import('./crypto.js');
+        await initCrypto('ak_test', 'https://api.example.com/v1');
+
+        const phone = await makeDevice();
+        const laptop = await makeDevice();
+        const enc = await encryptPushBodyForDevices(
+            { title: 'hi', body: 'hello world', url: 'https://x.test' },
+            [{ deviceId: 'dev_phone', publicKey: phone.publicKey }, { deviceId: 'dev_laptop', publicKey: laptop.publicKey }],
+        );
+
         expect(enc.isEncrypted).toBe(true);
-        expect(enc.senderPublicKey).toBeTruthy();
-        const parsed = JSON.parse(enc.body);
-        expect(parsed.ciphertext).toMatch(/^[A-Za-z0-9+/=]+$/);
-        expect(parsed).toHaveProperty('iv');
+        expect(Object.keys(enc.deviceKeyMap)).toEqual(['dev_phone', 'dev_laptop']);
+        const { ciphertext, iv } = JSON.parse(enc.body) as { ciphertext: string; iv: string };
+
+        for (const [deviceId, kp] of [['dev_phone', phone], ['dev_laptop', laptop]] as const) {
+            const plain = await unwrapAsDevice(kp.privateKey, enc.senderPublicKey, enc.deviceKeyMap[deviceId], ciphertext, iv);
+            expect(JSON.parse(plain.toString('utf-8'))).toEqual({ title: 'hi', body: 'hello world', url: 'https://x.test' });
+        }
     });
 
     it('produces different ciphertext on repeated calls', async () => {
-        stubServerWithNoKeys();
-        const { initCrypto, encryptPushBodyForSelf } = await import('./crypto.js');
+        stubServer({ encryptionEnabled: true });
+        const { initCrypto, encryptPushBodyForDevices } = await import('./crypto.js');
         await initCrypto('ak_test', 'https://api.example.com/v1');
-        const a = await encryptPushBodyForSelf({ body: 'same' });
-        const b = await encryptPushBodyForSelf({ body: 'same' });
+        const phone = await makeDevice();
+        const to = [{ deviceId: 'dev_phone', publicKey: phone.publicKey }];
+
+        const a = await encryptPushBodyForDevices({ body: 'same' }, to);
+        const b = await encryptPushBodyForDevices({ body: 'same' }, to);
         expect(JSON.parse(a.body).ciphertext).not.toBe(JSON.parse(b.body).ciphertext);
     });
 
-    it('throws when called before initCrypto', async () => {
-        const { encryptPushBodyForSelf } = await import('./crypto.js');
-        await expect(encryptPushBodyForSelf({ body: 'x' })).rejects.toThrow(/Crypto not initialized/);
-    });
-});
-
-describe('encryptPushBody (SDK-only — recipient-targeted)', () => {
-    it('encrypts for a separate recipient public key', async () => {
-        stubServerWithNoKeys();
-        // First init: generate a "recipient" identity we'll export the pub from
-        const mod1 = await import('./crypto.js');
-        await mod1.initCrypto();
-        const recipientPub = mod1.getPublicKey();
-        expect(recipientPub).toBeTruthy();
-
-        // Reset modules + new HOME so we get a different sender identity
-        const TMP2 = mkdtempSync(join(tmpdir(), 'sdk-crypto-sender-'));
-        process.env.HOME = TMP2;
-        vi.resetModules();
-        const mod2 = await import('./crypto.js');
-        await mod2.initCrypto();
-        const senderPub = mod2.getPublicKey();
-        expect(senderPub).not.toBe(recipientPub);
-
-        const enc = await mod2.encryptPushBody({ body: 'cross-keypair' }, recipientPub!);
-        expect(enc.isEncrypted).toBe(true);
-        expect(enc.senderPublicKey).toBe(senderPub);
-
-        rmSync(TMP2, { recursive: true, force: true });
-    });
-});
-
-describe('encryptFileForSelf', () => {
-    it('returns ciphertext buffer + iv + wrapped key', async () => {
-        stubServerWithNoKeys();
-        const { initCrypto, encryptFileForSelf } = await import('./crypto.js');
+    it('throws rather than sending unencrypted when no recipient is usable', async () => {
+        stubServer({ encryptionEnabled: true });
+        const { initCrypto, encryptPushBodyForDevices } = await import('./crypto.js');
         await initCrypto('ak_test', 'https://api.example.com/v1');
-        const enc = await encryptFileForSelf('file content');
-        expect(Buffer.isBuffer(enc.ciphertext)).toBe(true);
-        expect(enc.ciphertext.length).toBeGreaterThan(0);
-        expect(enc.iv).toMatch(/^[A-Za-z0-9+/=]+$/);
+
+        await expect(
+            encryptPushBodyForDevices({ body: 'x' }, [{ deviceId: 'dev_bad', publicKey: 'not-a-key' }]),
+        ).rejects.toThrow(/No recipient device/);
+    });
+
+    it('throws when called before initCrypto', async () => {
+        const { encryptPushBodyForDevices } = await import('./crypto.js');
+        await expect(encryptPushBodyForDevices({ body: 'x' }, [])).rejects.toThrow(/Crypto not initialized/);
     });
 });
 
-describe('key persistence', () => {
-    it('reuses stored keys on second init', async () => {
-        stubServerWithNoKeys();
-        const first = await (await import('./crypto.js')).initCrypto();
-        vi.resetModules();
-        const second = await (await import('./crypto.js')).initCrypto();
-        expect(second).toBe(first);
+describe('encryptFileForDevices', () => {
+    it('round-trips the content for a recipient device', async () => {
+        stubServer({ encryptionEnabled: true });
+        const { initCrypto, encryptFileForDevices, getPublicKey } = await import('./crypto.js');
+        await initCrypto('ak_test', 'https://api.example.com/v1');
+
+        const phone = await makeDevice();
+        const enc = await encryptFileForDevices('héllo — 안녕', [{ deviceId: 'dev_phone', publicKey: phone.publicKey }]);
+
+        expect(Buffer.isBuffer(enc.ciphertext)).toBe(true);
+        expect(enc.iv).toMatch(/^[A-Za-z0-9+/=]+$/);
+        const plain = await unwrapAsDevice(
+            phone.privateKey, getPublicKey()!, enc.deviceKeyMap['dev_phone'], enc.ciphertext, enc.iv,
+        );
+        expect(plain.toString('utf-8')).toBe('héllo — 안녕');
     });
 });
 
@@ -253,14 +327,18 @@ describe('initDeviceCrypto', () => {
         expect(a).toBe(b);
     });
 
-    it('is independent from the per-user keypair (keys.json untouched)', async () => {
-        stubServerWithNoKeys();
+    it('is available for stream frames even when push encryption is off', async () => {
+        stubServer({ encryptionEnabled: false });
         const mod = await import('./crypto.js');
-        const userPub = await mod.initCrypto();
+        await mod.initCrypto('ak_test', 'https://api.example.com/v1');
+
+        // The account opt-in gates push/file bodies only. Stream frames are
+        // always encrypted, so the device keypair has to work regardless —
+        // and push encryption must stay off despite the keypair existing.
         const devicePub = await mod.initDeviceCrypto();
-        expect(devicePub).not.toBe(userPub);
-        const userStored = JSON.parse(readFileSync(join(TMP, '.config', 'zeph', 'keys.json'), 'utf-8'));
-        expect(userStored.publicKey).toBe(userPub);
+        expect(devicePub).toBeTruthy();
+        expect(mod.getDevicePublicKey()).toBe(devicePub);
+        expect(mod.getKeyPair()).toBe(null);
     });
 });
 

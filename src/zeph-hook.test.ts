@@ -254,12 +254,23 @@ describe('ZephHook.notify — PRO_REQUIRED plaintext fallback', () => {
         vi.restoreAllMocks();
     });
 
-    // Server has no keys but encryption is on → initCrypto generates a pair and
-    // PUTs it back, so the send that follows is encrypted.
-    const encryptionEnabledBoot = [
-        { ok: true, json: { data: { encryptionEnabled: true, encryptionKeys: null } } },
-        { ok: true, json: { data: {} } },
-    ];
+    /**
+     * Boot responses for an encrypted send: the account opt-in, then the
+     * device list the message key gets wrapped for. The device public key has
+     * to be a real P-256 SPKI — an unusable one makes wrapping fail, and the
+     * push would fall back to plaintext before the 403 under test.
+     */
+    const encryptionEnabledBoot = async () => {
+        const kp = await crypto.subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits'],
+        );
+        const spki = await crypto.subtle.exportKey('spki', kp.publicKey);
+        const publicKey = Buffer.from(new Uint8Array(spki)).toString('base64');
+        return [
+            { ok: true, json: { data: { encryptionEnabled: true, encryptionKeys: null } } },
+            { ok: true, json: { data: [{ deviceId: 'dev_phone', publicKey }] } },
+        ];
+    };
 
     const proRequired = {
         ok: false,
@@ -269,7 +280,7 @@ describe('ZephHook.notify — PRO_REQUIRED plaintext fallback', () => {
 
     it('resends the plaintext payload after an encrypted send is refused', async () => {
         sequenceResponses([
-            ...encryptionEnabledBoot,
+            ...(await encryptionEnabledBoot()),
             proRequired,
             { ok: true, json: { data: { pushId: 'push_plain_01' } } },
         ]);
@@ -290,7 +301,7 @@ describe('ZephHook.notify — PRO_REQUIRED plaintext fallback', () => {
 
     it('re-uploads the file as plaintext on the long-body path', async () => {
         sequenceResponses([
-            ...encryptionEnabledBoot,
+            ...(await encryptionEnabledBoot()),
             { ok: true, json: { data: { fileId: 'f1', fileKey: 'fk_enc', uploadUrl: 'https://s3.example.com/put/enc' } } },
             { ok: true, status: 200, json: {} },
             proRequired,
@@ -313,11 +324,86 @@ describe('ZephHook.notify — PRO_REQUIRED plaintext fallback', () => {
         const retried = JSON.parse(sends[1].init!.body as string);
         expect(retried.isEncrypted).toBeUndefined();
         expect(retried.files[0].iv).toBeUndefined();
-        expect(retried.files[0].encryptedKey).toBeUndefined();
+        expect(retried.files[0].deviceKeyMap).toBeUndefined();
+    });
+
+    // ── The encrypted shape itself ────────────────────────────────
+    it('wraps the message key per device and strips the plaintext title and url', async () => {
+        sequenceResponses([
+            ...(await encryptionEnabledBoot()),
+            { ok: true, json: { data: { pushId: 'push_enc_01' } } },
+        ]);
+        const { ZephHook } = await loadHookModule();
+        const hook = new ZephHook({ apiKey: 'ak_test', baseUrl: 'https://api.example.com/v1' });
+
+        await hook.notify({ title: 'Deploy done', body: 'prod is live', url: 'https://secret.example.com/build/42' });
+
+        const sent = JSON.parse(lastCalls.find((c) => c.url.endsWith('/pushes/send'))!.init!.body as string);
+        expect(sent.isEncrypted).toBe(true);
+        expect(sent.senderPublicKey).toBeTruthy();
+        expect(Object.keys(sent.deviceKeyMap)).toEqual(['dev_phone']);
+        expect(JSON.parse(sent.deviceKeyMap.dev_phone)).toEqual({
+            encryptedKey: expect.any(String), keyIv: expect.any(String),
+        });
+        // The url is sealed inside the ciphertext; a plaintext copy at the top
+        // level would hand the server the one thing isEncrypted promises it
+        // cannot see — and on a link push the url IS the payload.
+        expect(sent.title).toBeUndefined();
+        expect(sent.url).toBeUndefined();
+        expect(sent.body).not.toContain('secret.example.com');
+    });
+
+    it('keeps the url in the clear when the push is not encrypted', async () => {
+        sequenceResponses([
+            { ok: true, json: { data: { encryptionEnabled: false, encryptionKeys: null } } },
+            { ok: true, json: { data: { pushId: 'push_plain_03' } } },
+        ]);
+        const { ZephHook } = await loadHookModule();
+        const hook = new ZephHook({ apiKey: 'ak_test', baseUrl: 'https://api.example.com/v1' });
+
+        await hook.notify({ title: 'Link', url: 'https://example.com/x' });
+
+        const sent = JSON.parse(lastCalls.find((c) => c.url.endsWith('/pushes/send'))!.init!.body as string);
+        expect(sent.isEncrypted).toBeUndefined();
+        expect(sent.url).toBe('https://example.com/x');
+    });
+
+    // ── Fallbacks that are not PRO_REQUIRED ───────────────────────
+    it('sends plaintext when no device has a per-device public key', async () => {
+        sequenceResponses([
+            { ok: true, json: { data: { encryptionEnabled: true, encryptionKeys: null } } },
+            { ok: true, json: { data: [{ deviceId: 'dev_old' }] } },
+            { ok: true, json: { data: { pushId: 'push_plain_04' } } },
+        ]);
+        const { ZephHook } = await loadHookModule();
+        const hook = new ZephHook({ apiKey: 'ak_test', baseUrl: 'https://api.example.com/v1' });
+
+        await hook.notify({ title: 'Build done', body: 'all green' });
+
+        // Ciphertext nobody holds a key for is worse than a readable push.
+        const sent = JSON.parse(lastCalls.find((c) => c.url.endsWith('/pushes/send'))!.init!.body as string);
+        expect(sent.isEncrypted).toBeUndefined();
+        expect(sent.body).toBe('all green');
+    });
+
+    it('sends plaintext when the device list cannot be fetched', async () => {
+        sequenceResponses([
+            { ok: true, json: { data: { encryptionEnabled: true, encryptionKeys: null } } },
+            { ok: false, status: 500, json: { error: { code: 'ERROR', message: 'boom', status: 500 } } },
+            { ok: true, json: { data: { pushId: 'push_plain_05' } } },
+        ]);
+        const { ZephHook } = await loadHookModule();
+        const hook = new ZephHook({ apiKey: 'ak_test', baseUrl: 'https://api.example.com/v1' });
+
+        await hook.notify({ title: 'Build done', body: 'all green' });
+
+        const sent = JSON.parse(lastCalls.find((c) => c.url.endsWith('/pushes/send'))!.init!.body as string);
+        expect(sent.isEncrypted).toBeUndefined();
+        expect(sent.body).toBe('all green');
     });
 
     it('propagates a second PRO_REQUIRED instead of looping', async () => {
-        sequenceResponses([...encryptionEnabledBoot, proRequired]);
+        sequenceResponses([...(await encryptionEnabledBoot()), proRequired, proRequired]);
         const { ZephHook, ZephError } = await loadHookModule();
         const hook = new ZephHook({ apiKey: 'ak_test', baseUrl: 'https://api.example.com/v1' });
 

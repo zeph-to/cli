@@ -619,25 +619,40 @@ session.
 
 ## Encryption
 
-Push bodies are encrypted with AES-256-GCM. The wrapping key is derived
-via ECDH P-256 and synced across your own devices on first run so every
-device can read the same push. Toggle encryption in the Zeph app
-(Settings → Encryption); when disabled, the CLI sends plaintext. No
-configuration needed.
+Push bodies and long-body attachments are encrypted with AES-256-GCM.
+This host holds its own ECDH P-256 keypair in `~/.zeph/device-keys.json`
+— generated on first use, and the private half never leaves the machine.
+Each push is encrypted once, and its AES key is wrapped separately for
+every device on your account using ECDH against that device's public
+key.
 
-**Threat model honesty:** keys are persisted on the Zeph backend to
-enable cross-device sync, so this is *device-shared* encryption — not
-true end-to-end. It protects push contents from passive network
-observers and from a leaked database snapshot taken without the key
-store, but it does **not** protect against the Zeph backend itself (it
-has the keys it serves to your devices). A true E2E mode (per-device
-keypairs, server stores only public keys, no key escrow) is on the
-roadmap.
+Toggle encryption in the Zeph app (Settings → Encryption); when it is
+off, the CLI sends plaintext. No configuration needed.
 
-The `zeph listener` ignores `isEncrypted` pushes for now — it has no
-per-device key to decrypt them. Stop-hook auto-pushes and `zeph_ask`
-responses are not part of the `@<session>` injection path, so this
-doesn't affect normal use.
+**Threat model:** against a passive backend — a leaked snapshot, an
+operator reading the table — the stored ciphertext and wrapped keys are
+useless, so push contents stay private. Three limits worth knowing:
+
+- **No protection from an active malicious operator.** Recipient public
+  keys come from `GET /devices` on that same server, unsigned and
+  unpinned. A backend that injects a device record carrying its own key
+  gets the message key wrapped for it, and reads everything. Closing
+  this needs out-of-band device verification (ADR-0007 Phase 4, not
+  built).
+- **No forward secrecy.** The ECDH secret for a given sender/device pair
+  is static, so compromising either private key opens every past push
+  wrapped for that pair.
+- **`senderPublicKey` is unsigned**, so a swapped one makes a push
+  undecryptable — that direction fails closed rather than leaking.
+
+A device that has not registered a per-device public key cannot be sent
+to; it is skipped, and if no device qualifies the push goes out in the
+clear rather than arriving as something nothing can open.
+
+The `zeph listener` ignores `isEncrypted` pushes for now — it does not
+try to decrypt them. Stop-hook auto-pushes and `zeph_ask` responses are
+not part of the `@<session>` injection path, so this doesn't affect
+normal use.
 
 ## Requirements
 
