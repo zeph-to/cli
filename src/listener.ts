@@ -1022,6 +1022,11 @@ interface ActiveStream {
      *  frames are encrypted for it, so inbound plaintext input is refused
      *  rather than typed — the inbound half must not be the one leg in clear. */
     subscriberPublicKey?: string;
+    /** Consecutive failed decrypts of sealed input on THIS incarnation. The
+     *  subscriber-key binding gates who may enqueue an ECDH derive, not how
+     *  many can fail, so this is what stops a flood; a successful decrypt
+     *  clears it, and a re-subscribe mints a fresh entry. */
+    inputDecryptFailures: number;
     /** Replace an IDLE-armed tick with an immediate burst tick. Input landing
      *  just after an idle tick must not wait out the remaining ~400ms gap —
      *  that gap IS the latency the burst exists to remove. No-op while a
@@ -1435,6 +1440,7 @@ export const handleStreamControl = (
         timer,
         stats,
         lastInputAt: null,
+        inputDecryptFailures: 0,
         expiresAt: Date.now() + leaseFor(renewing),
         renewing,
         subscriberPublicKey,
@@ -1711,6 +1717,15 @@ const handleEncryptedInput = (msg: AgentCommandInput, send: SendEphemeral): void
     if (inputDecryptDepth >= MAX_PENDING_DECRYPTS) {
         return refuse('decrypt queue full');
     }
+    // The binding compares against a public key the relay has seen, so it says
+    // who MAY enqueue an ECDH derive, not that they can produce an openable
+    // envelope. Sustained garbage would otherwise spend the one shared decrypt
+    // chain on every stream at once. Same fail-closed shape as the outbound
+    // half (STREAM_MAX_ENCRYPT_FAILURES): after a few consecutive failures this
+    // stream takes no more sealed input until it is re-subscribed.
+    if (stream.inputDecryptFailures >= STREAM_MAX_ENCRYPT_FAILURES) {
+        return refuse('too many failed decrypts on this stream');
+    }
     inputDecryptDepth++;
     inputDecryptChain = inputDecryptChain.then(async () => {
         inputDecryptDepth--;
@@ -1720,8 +1735,14 @@ const handleEncryptedInput = (msg: AgentCommandInput, send: SendEphemeral): void
         } catch (err) {
             // AES-GCM is authenticated, so this is a forged, truncated or
             // misaddressed envelope — never a partially readable one.
+            const live = activeStreams.get(sessionName);
+            if (live?.stats === incarnation) live.inputDecryptFailures++;
             return refuse(`decrypt failed (${err instanceof Error ? err.message : err})`);
         }
+        // A real envelope clears the strikes: the cap is there to stop a flood,
+        // not to retire a stream that saw one corrupted message.
+        const live = activeStreams.get(sessionName);
+        if (live?.stats === incarnation) live.inputDecryptFailures = 0;
         if (activeStreams.get(sessionName)?.stats !== incarnation) {
             return refuse('stream replaced while decrypting');
         }

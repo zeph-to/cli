@@ -458,6 +458,37 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
             await pendingInputDecrypts();
         });
 
+        it('stops taking sealed input after repeated failed decrypts', async () => {
+            // The binding says who may enqueue an ECDH derive, not that they
+            // can produce an openable envelope — so a flood of garbage would
+            // otherwise spend the one shared decrypt chain indefinitely.
+            const subscriberKey = await hostKey();
+            openE2eeStream(subscriberKey, 'zeph-a');
+            const garbage = { ciphertext: 'AAAA', iv: 'AAAA', encryptedKey: 'AAAA', keyIv: 'AAAA', senderPublicKey: subscriberKey };
+
+            for (let i = 0; i < 6; i++) {
+                handleCommandInput(input({ sessionName: 'zeph-a', seq: i + 1, keys: undefined, encrypted: garbage }), send);
+                await pendingInputDecrypts();
+            }
+            // Struck out: a genuine envelope now gets no decrypt either, until
+            // the stream is re-subscribed.
+            handleCommandInput(
+                input({ sessionName: 'zeph-a', seq: 9, keys: undefined, encrypted: await seal({ keys: ['down'] }, { sessionName: 'zeph-a', seq: 9 }) }),
+                send,
+            );
+            await pendingInputDecrypts();
+            expect(injections()).toEqual([]);
+
+            // A fresh subscription mints a fresh entry, so the strikes are gone.
+            openE2eeStream(subscriberKey, 'zeph-a');
+            handleCommandInput(
+                input({ sessionName: 'zeph-a', seq: 1, keys: undefined, encrypted: await seal({ keys: ['down'] }, { sessionName: 'zeph-a', seq: 1 }) }),
+                send,
+            );
+            await pendingInputDecrypts();
+            expect(injections()).toEqual(['-t zeph-a Down']);
+        });
+
         it('injects keys carried inside an envelope from the stream subscriber', async () => {
             openE2eeStream(await hostKey());
 
