@@ -54,6 +54,7 @@ const {
     computeListenerDeviceId,
     checkRateLimit,
     validateInputMessage,
+    pendingInputDecrypts,
     MAX_INPUT_KEYS,
     MAX_INPUT_BODY_CHARS,
 } = await import('./listener.js');
@@ -175,9 +176,10 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         expect(rejections()).toHaveLength(2);
     });
 
-    it('refuses an encrypted payload while E2EE is unimplemented', () => {
-        // Fail closed: injecting the plaintext that rode alongside would leave
-        // a sender believing its input was protected when it was not.
+    it('refuses an encrypted payload on a plaintext stream', () => {
+        // Nothing binds the envelope to a subscriber on a stream that handshook
+        // no key, and injecting the plaintext riding alongside would leave a
+        // sender believing its input was protected when it was not.
         openStream('zeph-a');
         handleCommandInput(input({ encrypted: { iv: 'x', ciphertext: 'y' } }), send);
         handleCommandInput(input({ seq: 2, keys: undefined, body: 'hi', encrypted: {} }), send);
@@ -279,7 +281,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
     it('refuses plaintext input on an E2EE stream', () => {
         // Outbound frames are already encrypted for this subscriber, so typing
         // a plaintext keystroke in would leave the inbound half in the clear.
-        // Fail closed until the daemon can decrypt the inbound envelope.
+        // An encrypted stream takes encrypted input or none.
         handleStreamControl(
             { subtype: 'agent.stream.start', targetDeviceId: device, sessionName: 'zeph-a', renew: true, subscriberPublicKey: 'pk' },
             send,
@@ -384,5 +386,286 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
             input: { tokens: null, text: 'hi' },
         });
         expect(tmuxCalls).toEqual([]);
+    });
+
+    // ─── E2EE input ─────────────────────────────────────────────────
+    //
+    // Real ECDH keys throughout — a stubbed envelope would prove nothing about
+    // a path whose whole job is cryptographic. The subscriber is played by this
+    // host's own device keypair: ECDH is symmetric, so an envelope
+    // `encryptEphemeral` seals for that key carries it as `senderPublicKey`
+    // AND opens with it, which is exactly the shape a real web subscriber
+    // produces. That the WEB's encrypt() produces the same five fields is
+    // crypto.test.ts's job (decryptEphemeral ← webEncrypt); what is under test
+    // here is the routing and the guards around it.
+    describe('encrypted input', () => {
+        /** Open an E2EE stream whose subscriber holds `subscriberPublicKey`. */
+        const openE2eeStream = (subscriberPublicKey: string, sessionName = 'zeph-a') => {
+            handleStreamControl(
+                { subtype: 'agent.stream.start', targetDeviceId: device, sessionName, renew: true, subscriberPublicKey },
+                send,
+            );
+            sent = [];
+            tmuxCalls = [];
+        };
+
+        /** A stranger's public key — a device that is not the subscriber. */
+        const strangerPublicKey = async (): Promise<string> => {
+            const { webcrypto } = await import('node:crypto');
+            const wc = webcrypto as unknown as Crypto;
+            const pair = await wc.subtle.generateKey(
+                { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits'],
+            ) as CryptoKeyPair;
+            const spki = new Uint8Array(await wc.subtle.exportKey('spki', pair.publicKey));
+            let bin = '';
+            for (let i = 0; i < spki.length; i++) bin += String.fromCharCode(spki[i]);
+            return btoa(bin);
+        };
+
+        const hostKey = () => import('./crypto.js').then((m) => m.initDeviceCrypto());
+
+        /**
+         * Seal one payload the way the web does: the routing stamp
+         * (sessionName, seq, epoch) rides INSIDE the ciphertext next to the
+         * keys, so a relay that captured an envelope cannot replay it under a
+         * fresh plaintext stamp. Defaults match `input()`'s, so a sealed
+         * message and the frame carrying it agree unless a test says otherwise.
+         */
+        const seal = async (
+            payload: Record<string, unknown>,
+            stamp: Record<string, unknown> = {},
+            recipient?: string,
+        ) => {
+            const { encryptEphemeral } = await import('./crypto.js');
+            return encryptEphemeral(
+                JSON.stringify({ sessionName: 'zeph-a', seq: 1, epoch: 100, ...payload, ...stamp }),
+                recipient ?? (await hostKey()),
+            );
+        };
+
+        it('refuses new envelopes once the decrypt queue is full', async () => {
+            // The subscriber-key binding is a string compare against a public
+            // key every same-account connection saw, so it cannot bound the
+            // ECDH work a flooding client queues — the depth cap must.
+            const { MAX_PENDING_DECRYPTS } = await import('./listener.js');
+            openE2eeStream(await hostKey());
+            const envelope = await seal({ keys: ['down'] });
+
+            for (let i = 0; i < MAX_PENDING_DECRYPTS + 5; i++) {
+                handleCommandInput(input({ seq: 1, keys: undefined, encrypted: envelope }), send);
+            }
+            expect(rejections().length).toBeGreaterThanOrEqual(5);
+            await pendingInputDecrypts();
+        });
+
+        it('injects keys carried inside an envelope from the stream subscriber', async () => {
+            openE2eeStream(await hostKey());
+
+            handleCommandInput(input({ keys: undefined, encrypted: await seal({ keys: ['down'] }) }), send);
+            await pendingInputDecrypts();
+
+            expect(injections()).toEqual(['-t zeph-a Down']);
+            expect(rejections()).toEqual([]);
+        });
+
+        it('injects literal text carried inside an envelope', async () => {
+            openE2eeStream(await hostKey());
+
+            handleCommandInput(input({ keys: undefined, encrypted: await seal({ body: 'hello; rm -rf /' }) }), send);
+            await pendingInputDecrypts();
+
+            expect(injections()).toEqual(['-l -t zeph-a hello; rm -rf /', '-t zeph-a Enter']);
+        });
+
+        it('never puts the decrypted payload back on the wire', async () => {
+            // The relay carries the refusal frames, so a decrypted key name
+            // echoed into one would undo the encryption it just came out of.
+            openE2eeStream(await hostKey());
+
+            handleCommandInput(input({ keys: undefined, encrypted: await seal({ keys: ['C-c'] }) }), send);
+            await pendingInputDecrypts();
+
+            expect(rejections()).toHaveLength(1);
+            expect(JSON.stringify(sent)).not.toContain('C-c');
+        });
+
+        // ── Replay binding ──
+        //
+        // The relay is the party E2EE distrusts, and it sees every envelope go
+        // past. Without the stamp sealed inside, it could keep a captured
+        // keystroke and re-send it under a seq the daemon has not used yet —
+        // the ciphertext still opens, the subscriber key still matches, and a
+        // real key lands in the pane a second time at a moment of its choosing.
+
+        it('refuses a captured envelope replayed under a fresh seq', async () => {
+            openE2eeStream(await hostKey());
+            const encrypted = await seal({ keys: ['down'] }, { seq: 1 });
+
+            // The genuine send, then the relay's replay of the very same bytes
+            // under the next seq — which the sequencer would otherwise take as
+            // an ordinary following keystroke.
+            handleCommandInput(input({ seq: 1, keys: undefined, encrypted }), send);
+            await pendingInputDecrypts();
+            handleCommandInput(input({ seq: 2, keys: undefined, encrypted }), send);
+            await pendingInputDecrypts();
+
+            expect(injections()).toEqual(['-t zeph-a Down']);
+            expect(rejections()).toHaveLength(1);
+        });
+
+        it('refuses an envelope re-stamped with another epoch or session', async () => {
+            openE2eeStream(await hostKey());
+            openE2eeStream(await hostKey(), 'zeph-rate'); // a second stream to aim at
+
+            // Same three seals, each contradicted by the plaintext frame in one
+            // field. Every one of them decrypts perfectly.
+            handleCommandInput(input({ keys: undefined, epoch: 999, encrypted: await seal({ keys: ['down'] }) }), send);
+            handleCommandInput(input({ seq: 2, keys: undefined, encrypted: await seal({ keys: ['down'] }, { seq: 2, sessionName: 'zeph-rate' }) }), send);
+            handleCommandInput(input({ seq: 3, keys: undefined, encrypted: await seal({ keys: ['down'] }, { seq: 3, epoch: 7 }) }), send);
+            await pendingInputDecrypts();
+
+            expect(injections()).toEqual([]);
+            expect(rejections()).toHaveLength(3);
+        });
+
+        it('refuses an envelope carrying no stamp at all', async () => {
+            // A sealed payload from a client too old to stamp: it cannot be
+            // told apart from a replay, so it is refused rather than trusted.
+            openE2eeStream(await hostKey());
+            const { encryptEphemeral } = await import('./crypto.js');
+
+            handleCommandInput(
+                input({ keys: undefined, encrypted: await encryptEphemeral(JSON.stringify({ keys: ['down'] }), await hostKey()) }),
+                send,
+            );
+            await pendingInputDecrypts();
+
+            expect(injections()).toEqual([]);
+            expect(rejections()).toHaveLength(1);
+        });
+
+        it('refuses an envelope sealed by anyone but the stream subscriber', async () => {
+            // The binding is what makes E2EE input exclusive to the device that
+            // is watching. This envelope is perfectly decryptable by this host —
+            // only the key it names is not the one that handshook the stream —
+            // so nothing but the binding check can refuse it.
+            openE2eeStream(await strangerPublicKey());
+
+            handleCommandInput(input({ keys: undefined, encrypted: await seal({ keys: ['down'] }) }), send);
+            await pendingInputDecrypts();
+
+            expect(injections()).toEqual([]);
+            expect(rejections()).toHaveLength(1);
+        });
+
+        it('refuses an undecryptable envelope without taking the daemon down', async () => {
+            const subscriberKey = await hostKey();
+            openE2eeStream(subscriberKey);
+
+            // Passes the binding check, then fails every way an envelope can:
+            // unparseable Base64, valid Base64 that is not ciphertext, and a
+            // shape missing fields entirely.
+            const garbage = [
+                { ciphertext: '!!!', iv: '!!!', encryptedKey: '!!!', keyIv: '!!!', senderPublicKey: subscriberKey },
+                { ciphertext: 'AAAA', iv: 'AAAA', encryptedKey: 'AAAA', keyIv: 'AAAA', senderPublicKey: subscriberKey },
+                { senderPublicKey: subscriberKey },
+            ];
+            garbage.forEach((encrypted, i) =>
+                handleCommandInput(input({ seq: i + 1, keys: undefined, encrypted }), send));
+            await pendingInputDecrypts();
+
+            expect(injections()).toEqual([]);
+            expect(rejections()).toHaveLength(3);
+        });
+
+        it('refuses an envelope that is not an envelope at all', async () => {
+            openE2eeStream(await hostKey());
+
+            // `encrypted` is relay JSON like every other field — a string, an
+            // array or a null must be refused, not thrown on.
+            for (const [i, encrypted] of ['nope', 42, null, [], { senderPublicKey: 7 }].entries()) {
+                handleCommandInput(input({ seq: i + 1, keys: undefined, encrypted }), send);
+            }
+            await pendingInputDecrypts();
+
+            expect(injections()).toEqual([]);
+            expect(rejections()).toHaveLength(5);
+        });
+
+        it('applies the whitelist and the caps to the DECRYPTED payload', async () => {
+            // The envelope hides the payload from the relay, not from the
+            // daemon's own guards — every check the plaintext path runs has to
+            // run again on the other side of the decrypt.
+            openE2eeStream(await hostKey());
+
+            const payloads = [
+                { keys: Array.from({ length: MAX_INPUT_KEYS + 1 }, () => 'down') },
+                { keys: ['M-x'] },
+                { keys: ['__proto__'] },
+                { body: 'x'.repeat(MAX_INPUT_BODY_CHARS + 1) },
+                { keys: ['down'], body: 'both' },
+                {},
+            ];
+            for (const [i, payload] of payloads.entries()) {
+                handleCommandInput(
+                    input({ seq: i + 1, keys: undefined, encrypted: await seal(payload, { seq: i + 1 }) }),
+                    send,
+                );
+            }
+            await pendingInputDecrypts();
+
+            expect(injections()).toEqual([]);
+            expect(rejections()).toHaveLength(payloads.length);
+        });
+
+        it('ignores plaintext keys riding alongside an envelope', async () => {
+            // A relay that appends its own `keys` to a real encrypted message
+            // must not get them typed. Only the ciphertext decides.
+            openE2eeStream(await hostKey());
+
+            handleCommandInput(input({ keys: ['up'], body: undefined, encrypted: await seal({ keys: ['down'] }) }), send);
+            await pendingInputDecrypts();
+
+            expect(injections()).toEqual(['-t zeph-a Down']);
+        });
+
+        it('refuses input for a stream that was replaced while the decrypt was in flight', async () => {
+            // A re-subscribe can swap the subscriber key under an in-flight
+            // decrypt; delivering into the new incarnation would type a key the
+            // current subscriber never sent.
+            openE2eeStream(await hostKey());
+
+            // Both prepared up front: the replacement has to land in the same
+            // synchronous run as the send, or the decrypt simply wins the race
+            // and the test proves nothing.
+            const encrypted = await seal({ keys: ['down'] });
+            const newSubscriber = await strangerPublicKey();
+            handleCommandInput(input({ keys: undefined, encrypted }), send);
+            openE2eeStream(newSubscriber); // restarts the stream under the decrypt
+            await pendingInputDecrypts();
+
+            expect(injections()).toEqual([]);
+            expect(rejections()).toHaveLength(1);
+        });
+
+        it('echoes the refused seq/epoch and sender so the web can fall back', async () => {
+            const subscriberKey = await hostKey();
+            openE2eeStream(subscriberKey);
+
+            handleCommandInput(
+                input({ keys: undefined, deviceId: 'dev-phone', seq: 5, epoch: 42, encrypted: { senderPublicKey: subscriberKey } }),
+                send,
+            );
+            await pendingInputDecrypts();
+
+            expect(rejections()[0]).toMatchObject({
+                subtype: 'agent.stream.frame',
+                sessionName: 'zeph-a',
+                error: 'input_rejected',
+                seq: 5,
+                epoch: 42,
+                inputDeviceId: 'dev-phone',
+            });
+        });
     });
 });

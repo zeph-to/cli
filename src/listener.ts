@@ -42,7 +42,7 @@ import { projectHash, remoteDigest, remoteMarkerPath, stateDir } from './gate.js
 import { matchAgentByPaneCommand, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 import { advanceState, evaluateState, findPatternMatch, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
-import { encryptEphemeral, getDevicePublicKey, initDeviceCrypto, type EncryptedEphemeralPayload } from './crypto.js';
+import { decryptEphemeral, encryptEphemeral, getDevicePublicKey, initDeviceCrypto, type EncryptedEphemeralPayload } from './crypto.js';
 import { createInputSequencer, type InputSequencer, type SequencedInput } from './input-sequencer.js';
 
 const PING_INTERVAL_MS = 25_000;
@@ -1473,7 +1473,12 @@ export interface AgentCommandInput {
     /** Sender's monotonic counter, and the incarnation it counts within. */
     seq?: number;
     epoch?: number;
-    /** Reserved for the E2EE slice — refused while unimplemented. */
+    /** E2EE envelope sealing `{ keys | body }` plus a copy of the
+     *  `sessionName`/`seq`/`epoch` stamp as JSON — the only way in on an
+     *  encrypted stream, where `keys`/`body` above are refused. Present means
+     *  the plaintext pair is ignored entirely: on a message the relay can
+     *  append to, only the ciphertext decides what gets typed, and the sealed
+     *  stamp is what proves the plaintext one was not re-written for a replay. */
     encrypted?: unknown;
 }
 
@@ -1520,6 +1525,30 @@ const isSeqNumber = (v: unknown): v is number =>
 const isKeyList = (v: unknown): v is string[] =>
     Array.isArray(v) && v.length > 0 && v.every((k) => typeof k === 'string');
 
+/** Every field of an inbound envelope, all of them relay JSON. A missing or
+ *  ill-typed one would reach WebCrypto as a string it cannot Base64-decode;
+ *  refusing here keeps the failure a refusal rather than a thrown rejection. */
+const isInputEnvelope = (v: unknown): v is EncryptedEphemeralPayload =>
+    typeof v === 'object' && v !== null && !Array.isArray(v)
+    && (['ciphertext', 'iv', 'encryptedKey', 'keyIv', 'senderPublicKey'] as const)
+        .every((field) => typeof (v as Record<string, unknown>)[field] === 'string');
+
+/** The decrypted payload, under the same stance as the outer message: an
+ *  unchecked cast that validateInputMessage re-checks field by field. Only the
+ *  envelope's authenticity is proven at this point, never its contents —
+ *  a subscriber can seal anything, including 400 keys. */
+const parseSealedInput = (
+    json: string,
+): Pick<AgentCommandInput, 'keys' | 'body' | 'seq' | 'epoch' | 'sessionName'> | null => {
+    try {
+        const parsed: unknown = JSON.parse(json);
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+        return parsed as Pick<AgentCommandInput, 'keys' | 'body' | 'seq' | 'epoch' | 'sessionName'>;
+    } catch {
+        return null;
+    }
+};
+
 /**
  * Parse and whitelist an inbound input message. Pure — the lease gate and the
  * tmux-side guards stay in the caller, so this is testable on its own.
@@ -1527,10 +1556,13 @@ const isKeyList = (v: unknown): v is string[] =>
 export const validateInputMessage = (msg: AgentCommandInput): InputCheck => {
     const { sessionName, seq, epoch } = msg;
     if (typeof sessionName !== 'string' || !sessionName) return { ok: false, reason: 'no sessionName' };
-    // E2EE lands in a later slice. Accepting the field now would inject
-    // whatever plaintext rode next to it — an encrypting sender would believe
-    // its payload was protected. Fail closed until the envelope is real.
-    if (msg.encrypted !== undefined) return { ok: false, reason: 'encrypted input not supported yet' };
+    // This function reads plaintext `keys`/`body` and nothing else, so it must
+    // never see a message that still carries an envelope: the encrypted path
+    // opens one and hands the decrypted fields back through here with the
+    // envelope stripped. A message arriving with both would otherwise get the
+    // plaintext half injected while its sender believed the sealed half was
+    // what landed. Fail closed instead.
+    if (msg.encrypted !== undefined) return { ok: false, reason: 'envelope reached the plaintext validator' };
     if (!isSeqNumber(seq) || !isSeqNumber(epoch)) return { ok: false, reason: 'missing seq/epoch' };
     const base = {
         sessionName,
@@ -1588,9 +1620,142 @@ const inputSequencerFor = (key: string): InputSequencer<PendingInput> | null => 
     return created;
 };
 
+/** Hand a validated injection to its sender's ordering lane. Shared by both
+ *  inbound paths — plaintext and decrypted input order against each other. */
+const enqueueInput = (input: ValidatedInput, send: SendEphemeral): void => {
+    // One ordering run per sender, not per session: two devices typing into
+    // the same pane each carry their own seq/epoch, and a shared sequencer
+    // would let the higher epoch supersede the other and silence it.
+    const senderKey = input.deviceId ? `${input.sessionName}#${input.deviceId}` : input.sessionName;
+    const sequencer = inputSequencerFor(senderKey);
+    if (!sequencer) {
+        log(`! input ${input.sessionName}: sender lane cap reached — drop`);
+        send(streamErrorFrame(input.sessionName, 'input_rejected', input));
+        return;
+    }
+    const accepted = sequencer.accept({ ...input, send });
+    if (accepted !== 'ok') {
+        // overflow / superseded / stale — the message was dropped, and the
+        // sender must hear so instead of waiting on a keystroke that never
+        // lands (the sequencer reports swept HELD messages via onDiscard).
+        log(`! input ${input.sessionName}: ${accepted} — drop`);
+        send(streamErrorFrame(input.sessionName, 'input_rejected', input));
+    }
+};
+
+/**
+ * Tail of the encrypted-input decrypt chain.
+ *
+ * Encrypted inputs are opened one at a time rather than concurrently. That
+ * bounds the ECDH work one socket can have in flight, and it keeps arrival
+ * order into the sequencer — two keystrokes whose decrypts race would
+ * otherwise reach it in whichever order WebCrypto finished, turning an
+ * in-order pair into a gap and a 500 ms hold.
+ */
+let inputDecryptChain: Promise<void> = Promise.resolve();
+let inputDecryptDepth = 0;
+
+/** Ceiling on queued decrypts. The subscriber-key binding is a string compare
+ *  against a public key the relay fanned out to every same-account connection,
+ *  so it gates WHO can enqueue an ECDH derive, not how many — a flooding
+ *  client would otherwise grow the chain without bound. Mirrors
+ *  MAX_PENDING_INPUTS' role on the plaintext side. */
+export const MAX_PENDING_DECRYPTS = 32;
+
+/** Resolves once every encrypted input accepted so far has been routed. */
+export const pendingInputDecrypts = (): Promise<void> => inputDecryptChain;
+
+/**
+ * Open an E2EE input envelope and route what was inside it.
+ *
+ * Every cheap guard runs synchronously, before any crypto: an envelope from
+ * anyone but the subscriber costs a string compare, not an ECDH derive. What
+ * comes out of the decrypt is then re-validated by exactly the checks the
+ * plaintext path runs — the envelope hides the payload from the relay, never
+ * from the whitelist or the caps.
+ */
+const handleEncryptedInput = (msg: AgentCommandInput, send: SendEphemeral): void => {
+    const { sessionName } = msg;
+    const refuse = (reason: string): void => {
+        log(`! input ${sessionName ?? '(no session)'}: ${reason} — drop`);
+        // No sessionName means the sender can't match the error to anything.
+        // The reason never rides along: it is derived from plaintext the relay
+        // must not learn, so it stays in this host's log.
+        if (typeof sessionName === 'string' && sessionName) {
+            send(streamErrorFrame(sessionName, 'input_rejected', msg));
+        }
+    };
+    if (typeof sessionName !== 'string' || !sessionName) return refuse('no sessionName');
+    const stream = activeStreams.get(sessionName);
+    if (!stream) return refuse('encrypted input with no live stream');
+    // A stream that handshook no subscriber key has no key to bind this
+    // envelope against — and its own frames go out in the clear, so there is
+    // nothing here worth protecting and no way to prove who sent it.
+    const { subscriberPublicKey } = stream;
+    if (!subscriberPublicKey) return refuse('encrypted input on a plaintext stream');
+    if (!isInputEnvelope(msg.encrypted)) return refuse('malformed encrypted envelope');
+    // THE binding. Opening an envelope proves only that its sender holds some
+    // private key; it is this comparison that makes it the key the subscriber
+    // handshook with, and so makes ephemeral input exclusive to the device
+    // actually watching the pane. Without it, anyone who learned this host's
+    // public key could type into it.
+    const envelope = msg.encrypted;
+    if (envelope.senderPublicKey !== subscriberPublicKey) {
+        return refuse('envelope not sealed by the stream subscriber');
+    }
+    // The incarnation this message was admitted under. A stream can stop and
+    // restart — with a different subscriber key — while the decrypt is in
+    // flight, and the lease check inside deliverInput only asks whether SOME
+    // stream of this name exists.
+    const incarnation = stream.stats;
+    if (inputDecryptDepth >= MAX_PENDING_DECRYPTS) {
+        return refuse('decrypt queue full');
+    }
+    inputDecryptDepth++;
+    inputDecryptChain = inputDecryptChain.then(async () => {
+        inputDecryptDepth--;
+        let opened: string;
+        try {
+            opened = await decryptEphemeral(envelope);
+        } catch (err) {
+            // AES-GCM is authenticated, so this is a forged, truncated or
+            // misaddressed envelope — never a partially readable one.
+            return refuse(`decrypt failed (${err instanceof Error ? err.message : err})`);
+        }
+        if (activeStreams.get(sessionName)?.stats !== incarnation) {
+            return refuse('stream replaced while decrypting');
+        }
+        const payload = parseSealedInput(opened);
+        if (!payload) return refuse('sealed payload is not an input object');
+        // Replay binding: the ciphertext must vouch for the plaintext stamps.
+        // AES-GCM stops the relay from forging content, but without this check
+        // it could replay a captured envelope under a fresh seq and type a
+        // real keystroke twice — the relay is exactly the party E2EE distrusts.
+        if (payload.seq !== msg.seq || payload.epoch !== msg.epoch || payload.sessionName !== sessionName) {
+            return refuse('sealed stamps do not match the plaintext ones (replay?)');
+        }
+        const checked = validateInputMessage({
+            sessionName,
+            seq: msg.seq,
+            epoch: msg.epoch,
+            deviceId: msg.deviceId,
+            keys: payload.keys,
+            body: payload.body,
+        });
+        if (!checked.ok) return refuse(checked.reason);
+        enqueueInput(checked.input, send);
+    }).catch((err) => {
+        // Nothing above should throw outside the decrypt, but one broken link
+        // must not stall every keystroke queued behind it.
+        log(`! input ${sessionName}: encrypted routing failed (${err instanceof Error ? err.message : err})`);
+    });
+};
+
 /**
  * Handle agent.command.input. Returns true when the message was ours to
- * answer, so the caller stops routing it.
+ * answer, so the caller stops routing it. Encrypted messages finish
+ * asynchronously — the return value reports routing, not delivery, exactly as
+ * it already did for a message the sequencer holds.
  */
 export const handleCommandInput = (
     msg: AgentCommandInput,
@@ -1601,6 +1766,13 @@ export const handleCommandInput = (
     // message out to all of this user's connections, and two machines can run
     // the same tmux session name — an unaddressed inject would type into both.
     if (msg.targetDeviceId !== computeListenerDeviceId()) return false;
+    // An envelope decides the message on its own. Branching here rather than
+    // inside the validator is what keeps the plaintext `keys`/`body` a relay
+    // could staple alongside it out of reach.
+    if (msg.encrypted !== undefined) {
+        handleEncryptedInput(msg, send);
+        return true;
+    }
     const checked = validateInputMessage(msg);
     if (!checked.ok) {
         log(`! input ${msg.sessionName ?? '(no session)'}: ${checked.reason} — drop`);
@@ -1621,34 +1793,15 @@ export const handleCommandInput = (
         return true;
     }
     // This stream's outbound half is E2EE for that subscriber, so accepting a
-    // plaintext keystroke would leave the inbound leg the only one in clear.
-    // Encrypted payloads are already refused above; until a later slice can
-    // decrypt them, an encrypted stream simply takes no ephemeral input.
+    // plaintext keystroke would leave the inbound leg the only one in clear —
+    // and nothing about it proves the subscriber sent it. An encrypted stream
+    // takes sealed input (above) or none.
     if (stream.subscriberPublicKey) {
         log(`! input ${input.sessionName}: stream is E2EE, plaintext input refused — drop`);
         send(streamErrorFrame(input.sessionName, 'input_rejected', input));
         return true;
     }
-    // One ordering run per sender, not per session: two devices typing into
-    // the same pane each carry their own seq/epoch, and a shared sequencer
-    // would let the higher epoch supersede the other and silence it.
-    const senderKey = typeof msg.deviceId === 'string' && msg.deviceId
-        ? `${input.sessionName}#${msg.deviceId}`
-        : input.sessionName;
-    const sequencer = inputSequencerFor(senderKey);
-    if (!sequencer) {
-        log(`! input ${input.sessionName}: sender lane cap reached — drop`);
-        send(streamErrorFrame(input.sessionName, 'input_rejected', input));
-        return true;
-    }
-    const accepted = sequencer.accept({ ...input, send });
-    if (accepted !== 'ok') {
-        // overflow / superseded / stale — the message was dropped, and the
-        // sender must hear so instead of waiting on a keystroke that never
-        // lands (the sequencer reports swept HELD messages via onDiscard).
-        log(`! input ${input.sessionName}: ${accepted} — drop`);
-        send(streamErrorFrame(input.sessionName, 'input_rejected', input));
-    }
+    enqueueInput(input, send);
     return true;
 };
 

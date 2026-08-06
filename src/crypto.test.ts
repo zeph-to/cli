@@ -374,3 +374,99 @@ describe('encryptEphemeral', () => {
         await expect(encryptEphemeral('x', recipient.publicKeyB64)).rejects.toThrow(/Device crypto not initialized/);
     });
 });
+
+// Mirror of the web's encrypt() (libs/crypto/encrypt.ts), with senderPublicKey
+// appended the way the web's input path does. Reproduced here so the
+// decryptEphemeral round-trip proves the daemon opens what libs/crypto emits,
+// rather than only what this file's own encryptEphemeral emits.
+const webEncrypt = async (
+    plaintext: string,
+    sender: { publicKeyB64: string; privateKey: CryptoKey },
+    recipientPublicKeyB64: string,
+): Promise<EncryptedEphemeralPayload> => {
+    const { webcrypto } = await import('node:crypto');
+    const wc = webcrypto as unknown as Crypto;
+    const b64 = (s: string): ArrayBuffer => {
+        const bin = atob(s);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return bytes.buffer;
+    };
+    const toB64 = (buf: ArrayBuffer): string => {
+        const bytes = new Uint8Array(buf);
+        let bin = '';
+        for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+        return btoa(bin);
+    };
+    const recipientPub = await wc.subtle.importKey(
+        'spki', b64(recipientPublicKeyB64), { name: 'ECDH', namedCurve: 'P-256' }, true, [],
+    );
+    const messageKey = await wc.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+    const iv = wc.getRandomValues(new Uint8Array(12));
+    const ciphertext = await wc.subtle.encrypt(
+        { name: 'AES-GCM', iv }, messageKey, new TextEncoder().encode(plaintext),
+    );
+    const sharedKey = await wc.subtle.deriveKey(
+        { name: 'ECDH', public: recipientPub }, sender.privateKey,
+        { name: 'AES-GCM', length: 256 }, false, ['encrypt'],
+    );
+    const keyIv = wc.getRandomValues(new Uint8Array(12));
+    const encryptedKey = await wc.subtle.encrypt(
+        { name: 'AES-GCM', iv: keyIv }, sharedKey, await wc.subtle.exportKey('raw', messageKey),
+    );
+    return {
+        ciphertext: toB64(ciphertext),
+        iv: toB64(iv.buffer as ArrayBuffer),
+        encryptedKey: toB64(encryptedKey),
+        keyIv: toB64(keyIv.buffer as ArrayBuffer),
+        senderPublicKey: sender.publicKeyB64,
+    };
+};
+
+describe('decryptEphemeral', () => {
+    it('opens an envelope produced by the web encrypt() algorithm', async () => {
+        const { initDeviceCrypto, decryptEphemeral } = await import('./crypto.js');
+        const devicePub = await initDeviceCrypto();
+        const web = await makeRecipient();
+
+        const envelope = await webEncrypt('{"keys":["escape"]}', web, devicePub);
+        await expect(decryptEphemeral(envelope)).resolves.toBe('{"keys":["escape"]}');
+    });
+
+    it('is the exact inverse of encryptEphemeral for a self-addressed envelope', async () => {
+        const { initDeviceCrypto, encryptEphemeral, decryptEphemeral } = await import('./crypto.js');
+        const devicePub = await initDeviceCrypto();
+
+        const envelope = await encryptEphemeral('안녕 — \x1b[32m✓\x1b[0m', devicePub);
+        await expect(decryptEphemeral(envelope)).resolves.toBe('안녕 — \x1b[32m✓\x1b[0m');
+    });
+
+    it('rejects an envelope sealed for someone else', async () => {
+        const { initDeviceCrypto, decryptEphemeral } = await import('./crypto.js');
+        await initDeviceCrypto();
+        const web = await makeRecipient();
+        const stranger = await makeRecipient();
+
+        // Encrypted to a third party's public key: the shared secret this host
+        // derives is a different one, so unwrapping the message key fails.
+        const envelope = await webEncrypt('{"body":"secret"}', web, stranger.publicKeyB64);
+        await expect(decryptEphemeral(envelope)).rejects.toThrow();
+    });
+
+    it('rejects a tampered ciphertext (AES-GCM is authenticated)', async () => {
+        const { initDeviceCrypto, encryptEphemeral, decryptEphemeral } = await import('./crypto.js');
+        const devicePub = await initDeviceCrypto();
+
+        const envelope = await encryptEphemeral('{"keys":["up"]}', devicePub);
+        const flipped = btoa(atob(envelope.ciphertext).replace(/^./, (c) =>
+            String.fromCharCode(c.charCodeAt(0) ^ 0xff)));
+        await expect(decryptEphemeral({ ...envelope, ciphertext: flipped })).rejects.toThrow();
+    });
+
+    it('throws when called before initDeviceCrypto', async () => {
+        const { decryptEphemeral } = await import('./crypto.js');
+        const web = await makeRecipient();
+        const envelope = await webEncrypt('x', web, web.publicKeyB64);
+        await expect(decryptEphemeral(envelope)).rejects.toThrow(/Device crypto not initialized/);
+    });
+});
