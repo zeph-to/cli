@@ -892,14 +892,62 @@ export interface StreamControl {
     renew?: boolean;
 }
 
-// ~2.5 fps ceiling. Cadence + diff-gating are the ONLY bound on API Gateway
-// WS cost (the $default route has no per-message limit), so keep it modest
-// and let unchanged frames drop.
+// ~2.5 fps idle ceiling. Cadence + diff-gating + the per-second send budget
+// are the ONLY bound on API Gateway WS cost (the $default route has no
+// per-message limit), so keep it modest and let unchanged frames drop.
 // How far back the live-stream capture reaches — more than the screen-peek
 // window so the mirror has scrollback to scroll through. SCREEN_PEEK_MAX_BYTES
 // still caps the actual payload, so very wide panes get top-truncated.
 const STREAM_CAPTURE_LINES = 200;
-const STREAM_INTERVAL_MS = 400;
+export const STREAM_INTERVAL_MS = 400;
+// Burst cadence: right after a keystroke lands, the pane IS what the user is
+// staring at, so captures tighten for BURST_WINDOW_MS and then fall back to
+// the idle cadence. The window is what keeps this affordable — one keypress
+// costs a bounded number of extra frames instead of raising the steady rate.
+export const BURST_INTERVAL_MS = 120;
+export const BURST_WINDOW_MS = 2_500;
+// Cost bound the burst must not break: MAX_CONCURRENT_STREAMS × 8 = 24 msg/s
+// worst case, under half of the API Gateway WS stage throttle (50 rps) that is
+// SHARED across every user, so a bursting host still leaves headroom for push
+// delivery and presence. At BURST_INTERVAL_MS the chain tops out at 8.3 fps,
+// so this budget bites only in the last fraction of a fully bursting second —
+// it is what holds the line if the burst cadence is ever tightened further.
+export const MAX_FRAMES_PER_SEC = 8;
+
+/**
+ * Delay before the next capture: burst while the last input is still echoing,
+ * idle otherwise. Exclusive at the boundary — exactly BURST_WINDOW_MS after
+ * the input is already idle, so the window can't stretch. A lastInputAt in the
+ * future (wall-clock jump) reads as fresh input rather than as an expired
+ * window: bursting is the recoverable side of that.
+ */
+export const streamCadence = (lastInputAt: number | null, now: number): number =>
+    lastInputAt !== null && now - lastInputAt < BURST_WINDOW_MS ? BURST_INTERVAL_MS : STREAM_INTERVAL_MS;
+
+/** Rolling one-second send budget for a single stream. */
+export interface FrameBudget {
+    windowStartedAt: number;
+    sent: number;
+}
+
+/**
+ * Claim one send from the budget, rolling the window over when the second has
+ * passed. False means this tick must skip WITHOUT marking the frame as sent —
+ * the diff-gate would otherwise swallow that content for good.
+ */
+export const claimFrameSend = (budget: FrameBudget, now: number): boolean => {
+    // `now < windowStartedAt` = the clock ran backwards (NTP step, resume).
+    // Without the guard the window never rolls again and a spent budget
+    // freezes the mirror for the whole regression — same failure streamCadence
+    // already defends against, so the two must agree.
+    if (now - budget.windowStartedAt >= 1_000 || now < budget.windowStartedAt) {
+        budget.windowStartedAt = now;
+        budget.sent = 0;
+    }
+    if (budget.sent >= MAX_FRAMES_PER_SEC) return false;
+    budget.sent++;
+    return true;
+};
 // Orphan guard for subscribers that can't renew (clients older than the renew
 // protocol): a phone that dies without sending agent.stream.stop must not leak
 // an interval forever. Auto-stop after this long; the phone re-subscribes on
@@ -942,15 +990,30 @@ interface StreamStats {
     startedAt: number;
     frames: number; // frames actually sent (post diff-gate)
     bytes: number; // payload bytes sent
-    skipped: number; // ticks suppressed by the diff-gate
+    /** The burst phase's share of frames/bytes, and the wall time spent at the
+     *  burst cadence — burst vs idle cost is the question B-full turns on, and
+     *  a single blended fps hides it. Idle is the remainder. */
+    framesBurst: number;
+    bytesBurst: number;
+    burstMs: number;
+    skipped: number; // ticks that sent nothing (diff-gate, or the send budget)
+    rateCapped: number; // subset of `skipped` refused by MAX_FRAMES_PER_SEC
     lastLogAt: number;
     lastLogFrames: number;
     lastLogBytes: number;
+    lastLogFramesBurst: number;
+    lastLogBurstMs: number;
 }
 
 interface ActiveStream {
-    timer: ReturnType<typeof setInterval>;
+    /** Handle of the ONE armed tick. The capture loop re-arms itself every
+     *  tick (the cadence changes between ticks), so this is replaced each
+     *  time — stopping a stream means clearing whatever is current. */
+    timer: ReturnType<typeof setTimeout>;
     stats: StreamStats;
+    /** When input last landed in this pane, or null if none has. Drives the
+     *  burst cadence; set by noteStreamInput from the shared inject path. */
+    lastInputAt: number | null;
     /** Wall-clock deadline; the capture tick reaps the stream once it passes. */
     expiresAt: number;
     /** Subscriber renews — i.e. its silence is proof it's gone, not just quiet. */
@@ -959,6 +1022,11 @@ interface ActiveStream {
      *  frames are encrypted for it, so inbound plaintext input is refused
      *  rather than typed — the inbound half must not be the one leg in clear. */
     subscriberPublicKey?: string;
+    /** Replace an IDLE-armed tick with an immediate burst tick. Input landing
+     *  just after an idle tick must not wait out the remaining ~400ms gap —
+     *  that gap IS the latency the burst exists to remove. No-op while a
+     *  burst tick is armed, so a keystroke flurry can't starve the chain. */
+    wake: () => void;
 }
 
 /** How far a start (and each renew) pushes the deadline out. */
@@ -972,22 +1040,48 @@ const activeStreams = new Map<string, ActiveStream>();
  *  session name from a relay too old to stamp the sender. */
 const inputSequencers = new Map<string, InputSequencer<PendingInput>>();
 
+/** Frames per second for one cadence phase. A phase that got no wall time in
+ *  the window (a stream that never bursted) reads 0.0, never NaN. */
+const phaseFps = (frames: number, ms: number): string => (ms > 0 ? (frames / (ms / 1000)).toFixed(1) : '0.0');
+
 const maybeLogStreamStats = (sessionName: string, stats: StreamStats): void => {
     const elapsed = Date.now() - stats.lastLogAt;
     if (elapsed < STREAM_LOG_INTERVAL_MS) return;
     const secs = elapsed / 1000;
-    const fps = (stats.frames - stats.lastLogFrames) / secs;
+    const frames = stats.frames - stats.lastLogFrames;
+    const fps = frames / secs;
     const kbps = (stats.bytes - stats.lastLogBytes) / 1024 / secs;
-    log(`⧉ stream ${sessionName}: ${fps.toFixed(1)} fps, ${kbps.toFixed(1)} KB/s (${stats.frames} sent, ${stats.skipped} diff-skipped)`);
+    // burstMs is charged when a burst tick is armed, so it can overshoot the
+    // window by at most one interval — phaseFps clamps the idle remainder.
+    const burstMs = stats.burstMs - stats.lastLogBurstMs;
+    const burstFrames = stats.framesBurst - stats.lastLogFramesBurst;
+    log(
+        `⧉ stream ${sessionName}: ${fps.toFixed(1)} fps, ${kbps.toFixed(1)} KB/s ` +
+            `(${stats.frames} sent, ${stats.skipped} skipped incl. ${stats.rateCapped} rate-capped) ` +
+            `[burst ${phaseFps(burstFrames, burstMs)} fps · idle ${phaseFps(frames - burstFrames, elapsed - burstMs)} fps]`,
+    );
     stats.lastLogAt = Date.now();
     stats.lastLogFrames = stats.frames;
     stats.lastLogBytes = stats.bytes;
+    stats.lastLogFramesBurst = stats.framesBurst;
+    stats.lastLogBurstMs = stats.burstMs;
+};
+
+/** A keystroke landed in this pane, so the next captures run at the burst
+ *  cadence and the echo is visible instead of up to STREAM_INTERVAL_MS late.
+ *  Called from the shared inject helpers, which is what both the ephemeral
+ *  (agent.command.input) and the REST (agent.command) paths funnel through. */
+const noteStreamInput = (sessionName: string): void => {
+    const entry = activeStreams.get(sessionName);
+    if (!entry) return;
+    entry.lastInputAt = Date.now();
+    entry.wake();
 };
 
 export const stopStream = (sessionName: string): void => {
     const entry = activeStreams.get(sessionName);
     if (!entry) return;
-    clearInterval(entry.timer);
+    clearTimeout(entry.timer);
     activeStreams.delete(sessionName);
     // The next stream is a new run: a sequencer carrying this one's high-water
     // mark would swallow its first keys if the sender restarts its counter.
@@ -1003,7 +1097,9 @@ export const stopStream = (sessionName: string): void => {
     log(
         `⧉ stream ${sessionName} stopped: ${stats.frames} frames / ` +
             `${(stats.bytes / 1024).toFixed(1)} KB over ${secs.toFixed(1)}s ` +
-            `(${(stats.frames / secs).toFixed(1)} fps avg, ${stats.skipped} diff-skipped)`,
+            `(${(stats.frames / secs).toFixed(1)} fps avg, ${stats.skipped} skipped incl. ${stats.rateCapped} rate-capped) ` +
+            `[burst ${stats.framesBurst} frames / ${(stats.bytesBurst / 1024).toFixed(1)} KB ` +
+            `over ${(stats.burstMs / 1000).toFixed(1)}s = ${phaseFps(stats.framesBurst, stats.burstMs)} fps]`,
     );
 };
 
@@ -1122,6 +1218,14 @@ export const buildStreamFrame = async (
  * was a stream-control message (so the caller skips the one-shot screen-peek
  * path). start is idempotent — a repeat restarts the loop.
  */
+// deep: over the body-length limit on purpose. Everything past the guards is
+// one capture loop whose state (lastContent, wireSeq, encryptFailures, budget,
+// and `stats` as the incarnation token) is only correct while it stays private
+// to a single start. Hoisting it into a factory would turn those five into
+// parameters and expose the incarnation invariant — the one that keeps an
+// orphaned chain from capturing forever — to callers that have no reason to
+// know it exists. Nothing outside needs the internals; deleting this deletes
+// the live mirror whole.
 export const handleStreamControl = (
     req: StreamControl,
     send: (data: Record<string, unknown>) => void,
@@ -1177,10 +1281,16 @@ export const handleStreamControl = (
         startedAt: Date.now(),
         frames: 0,
         bytes: 0,
+        framesBurst: 0,
+        bytesBurst: 0,
+        burstMs: 0,
         skipped: 0,
+        rateCapped: 0,
         lastLogAt: Date.now(),
         lastLogFrames: 0,
         lastLogBytes: 0,
+        lastLogFramesBurst: 0,
+        lastLogBurstMs: 0,
     };
     // E2EE handshake: load-or-create this device's keypair up front. The
     // subscriber asked for encryption, so key failure is FAIL-CLOSED: refuse
@@ -1200,21 +1310,41 @@ export const handleStreamControl = (
     }
     let wireSeq = 0;
     let encryptFailures = 0;
-    const timer = setInterval(() => {
+    const budget: FrameBudget = { windowStartedAt: Date.now(), sent: 0 };
+    /**
+     * One capture. Returns false only when the stream is gone and the chain
+     * must NOT re-arm — every other outcome re-arms at the single call site in
+     * runTick, so no early return can silently freeze the mirror.
+     */
+    const captureTick = (entry: ActiveStream): boolean => {
         // Lease check rides the capture tick: one deadline field, no second
         // timer to leak. (The previous per-start expiry setTimeout was never
         // cleared on stop, so a restart left the old one armed to kill the new
         // incarnation.) Reaping here is what frees the slot for everyone whose
         // stop never arrived.
-        if (Date.now() >= (activeStreams.get(sessionName)?.expiresAt ?? 0)) {
+        if (Date.now() >= entry.expiresAt) {
             stopStream(sessionName);
-            return;
+            return false;
         }
         const captured = capturePane(sessionName, true, STREAM_CAPTURE_LINES);
         if (!captured || captured.content === lastContent) {
             stats.skipped++;
-            return; // diff-gate
+            return true; // diff-gate
         }
+        const now = Date.now();
+        // Send budget BEFORE the diff-gate is marked: a frame refused here has
+        // to stay "changed" so a later tick retries it, or this content is
+        // never sent at all — the next tick would diff-skip it as unchanged.
+        if (!claimFrameSend(budget, now)) {
+            stats.skipped++;
+            stats.rateCapped++;
+            return true;
+        }
+        // Phase = the gap that PRODUCED this tick (armedDelay), matching how
+        // burstMs is charged in arm() — deciding by wall-clock here instead
+        // made the last burst-armed frame count idle, under-reporting burst
+        // fps by one frame per episode in the R2 numbers.
+        const inBurst = armedDelay === BURST_INTERVAL_MS;
         lastContent = captured.content;
         // Stamp the sequence in CAPTURE order, synchronously — frame assembly
         // is async (encryption) and fire-and-forget, so resolve order is not
@@ -1230,7 +1360,7 @@ export const handleStreamControl = (
                 // Encrypt failure — frame dropped, diff-gate un-marked so the
                 // next tick retries. A key that keeps failing (malformed
                 // subscriber key) never recovers: fail closed after a few
-                // strikes instead of retrying every 400ms for 5 minutes.
+                // strikes instead of retrying every tick for 5 minutes.
                 lastContent = null;
                 // Init still in flight (or failed — its own path fail-closes):
                 // a not-yet-ready key is not a malformed key, don't strike.
@@ -1248,7 +1378,12 @@ export const handleStreamControl = (
             // ~1.4× the plaintext; base fields now count too, so plaintext
             // streams read slightly higher than the pre-E2EE content-only
             // metric) — this feeds the R2 cost instrumentation.
-            stats.bytes += Buffer.byteLength(JSON.stringify(frame), 'utf-8');
+            const bytes = Buffer.byteLength(JSON.stringify(frame), 'utf-8');
+            stats.bytes += bytes;
+            if (inBurst) {
+                stats.framesBurst++;
+                stats.bytesBurst += bytes;
+            }
             // seq = capture order; epoch = this stream incarnation, so the
             // receiver's ordering guard resets across daemon-side restarts.
             send({ ...frame, seq, epoch: stats.startedAt });
@@ -1258,7 +1393,40 @@ export const handleStreamControl = (
             // from send()/logging — report and let the next tick carry on.
             log(`⧉ stream ${sessionName}: frame send failed (${err instanceof Error ? err.message : err})`);
         });
-    }, STREAM_INTERVAL_MS);
+        return true;
+    };
+    /** Arm the next tick. A chain that outlived its incarnation (restart, or a
+     *  stop racing this tick) must die here instead of capturing forever into
+     *  a stream nobody can cancel — `stats` is the incarnation token. */
+    let armedDelay = STREAM_INTERVAL_MS;
+    const arm = (delay: number): void => {
+        const entry = activeStreams.get(sessionName);
+        if (entry?.stats !== stats) return;
+        if (delay === BURST_INTERVAL_MS) stats.burstMs += delay;
+        armedDelay = delay;
+        const next = setTimeout(runTick, delay);
+        next.unref?.();
+        entry.timer = next;
+    };
+    const runTick = (): void => {
+        const entry = activeStreams.get(sessionName);
+        if (entry?.stats !== stats) return;
+        if (!captureTick(entry)) return;
+        // The cadence is re-read every tick, so input that lands mid-stream
+        // tightens the NEXT gap rather than the current one.
+        arm(streamCadence(entry.lastInputAt, Date.now()));
+    };
+    /** Swap an idle-armed tick for an immediate burst tick (see ActiveStream.wake).
+     *  Only when the armed gap is the idle one: replacing an armed burst tick
+     *  on every keystroke would push the next capture away indefinitely. */
+    const wake = (): void => {
+        const entry = activeStreams.get(sessionName);
+        if (entry?.stats !== stats) return;
+        if (armedDelay === BURST_INTERVAL_MS) return;
+        clearTimeout(entry.timer);
+        arm(BURST_INTERVAL_MS);
+    };
+    const timer = setTimeout(runTick, STREAM_INTERVAL_MS);
     timer.unref?.();
     // A renewing subscriber gets the short lease; anything older keeps the
     // 5-minute orphan guard so a version-skewed client isn't cut off mid-view.
@@ -1266,9 +1434,11 @@ export const handleStreamControl = (
     activeStreams.set(sessionName, {
         timer,
         stats,
+        lastInputAt: null,
         expiresAt: Date.now() + leaseFor(renewing),
         renewing,
         subscriberPublicKey,
+        wake,
     });
     return true;
 };
@@ -1681,6 +1851,7 @@ const tryInject = (session: string, text: string, deps: HandlePushDeps): boolean
     const preview = text.length > 60 ? text.slice(0, 60) + '…' : text;
     log(`${ok ? '→' : '✗'} ${session}: ${preview}`);
     if (ok) {
+        noteStreamInput(session);
         const cwd = (deps.paneCwd ?? defaultPaneCwd)(session);
         if (cwd) writeRemoteMarker(cwd, text);
     }
@@ -1692,6 +1863,7 @@ const tryInject = (session: string, text: string, deps: HandlePushDeps): boolean
 const tryInjectKeys = (session: string, tokens: string[], deps: HandlePushDeps): boolean => {
     if (!passesInjectGuards(session, deps)) return false;
     const ok = (deps.sendKeys ?? injectNamedKeys)(session, tokens);
+    if (ok) noteStreamInput(session);
     log(`${ok ? '⌨' : '✗'} ${session}: [${tokens.join(' ')}]`);
     return ok;
 };
