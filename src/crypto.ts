@@ -137,6 +137,26 @@ const encrypt = async (
   };
 };
 
+const decrypt = async (
+  payload: EncryptedPayload,
+  recipientPrivateKey: CryptoKey,
+  senderPublicKey: CryptoKey,
+): Promise<string> => {
+  const sharedKey = await deriveAesKey(recipientPrivateKey, senderPublicKey);
+  const rawMessageKey = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: new Uint8Array(fromBase64(payload.keyIv)) },
+    sharedKey,
+    fromBase64(payload.encryptedKey),
+  );
+  const messageKey = await crypto.subtle.importKey('raw', rawMessageKey, { name: 'AES-GCM' }, false, ['decrypt']);
+  const plaintext = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: new Uint8Array(fromBase64(payload.iv)) },
+    messageKey,
+    fromBase64(payload.ciphertext),
+  );
+  return new TextDecoder().decode(plaintext);
+};
+
 // ─── Superseded account keystore ───
 //
 // Held the escrowed account keypair. Nothing reads it any more; it is deleted
@@ -468,4 +488,27 @@ export const encryptEphemeral = async (
   const recipientKey = await importPublicKey(recipientPublicKeyRaw);
   const payload = await encrypt(plaintext, deviceKeyPair.privateKey, recipientKey);
   return { ...payload, senderPublicKey: deviceExportedPublicKey };
+};
+
+/**
+ * Open an ephemeral envelope addressed to this device — the exact inverse of
+ * encryptEphemeral, and of the web's `encrypt` from @zeph/crypto, which
+ * produces the same five fields.
+ *
+ * Rejects rather than returning null: AES-GCM is authenticated, so a throw
+ * here means the envelope was sealed for another key, tampered with, or is not
+ * an envelope at all. Callers must treat every rejection as a refusal — there
+ * is no partial result to fall back on. Requires initDeviceCrypto().
+ *
+ * Note that opening an envelope proves only that its sender holds the private
+ * half of `senderPublicKey`; nothing signs that field, so it authenticates the
+ * key pairing and not the sender. A caller that needs to know *which* peer
+ * sent this must compare `senderPublicKey` against a key it already trusts.
+ */
+export const decryptEphemeral = async (
+  payload: EncryptedEphemeralPayload,
+): Promise<string> => {
+  if (!deviceKeyPair) throw new Error('Device crypto not initialized');
+  const senderKey = await importPublicKey(payload.senderPublicKey);
+  return decrypt(payload, deviceKeyPair.privateKey, senderKey);
 };

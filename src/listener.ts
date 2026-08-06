@@ -42,7 +42,8 @@ import { projectHash, remoteDigest, remoteMarkerPath, stateDir } from './gate.js
 import { matchAgentByPaneCommand, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 import { advanceState, evaluateState, findPatternMatch, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
-import { encryptEphemeral, getDevicePublicKey, initDeviceCrypto, type EncryptedEphemeralPayload } from './crypto.js';
+import { decryptEphemeral, encryptEphemeral, getDevicePublicKey, initDeviceCrypto, type EncryptedEphemeralPayload } from './crypto.js';
+import { createInputSequencer, type InputSequencer, type SequencedInput } from './input-sequencer.js';
 
 const PING_INTERVAL_MS = 25_000;
 const PONG_TIMEOUT_MS = 10_000;
@@ -203,19 +204,22 @@ const injectKeys = (session: string, text: string): boolean => {
 // Maps a lowercase wire name to the exact tmux key token. Whitelist-ONLY:
 // anything outside this map is refused so a compromised sender can't smuggle
 // `C-c`, `M-x`, or a shell command through send-keys' key-name syntax.
-const ALLOWED_KEYS: Record<string, string> = {
-    escape: 'Escape',
-    up: 'Up',
-    down: 'Down',
-    left: 'Left',
-    right: 'Right',
-    enter: 'Enter',
-    tab: 'Tab',
-    backtab: 'BTab',
-    backspace: 'BSpace',
-    delete: 'DC',
-    space: 'Space',
-};
+// A Map, not a plain object: object indexing leaks the prototype chain, so
+// `keys: ['constructor']` resolved to a function that spawnSync happily
+// stringified into the pane. Map lookups know only what was put in.
+const ALLOWED_KEYS = new Map<string, string>([
+    ['escape', 'Escape'],
+    ['up', 'Up'],
+    ['down', 'Down'],
+    ['left', 'Left'],
+    ['right', 'Right'],
+    ['enter', 'Enter'],
+    ['tab', 'Tab'],
+    ['backtab', 'BTab'],
+    ['backspace', 'BSpace'],
+    ['delete', 'DC'],
+    ['space', 'Space'],
+]);
 
 /**
  * Translate a phone-supplied key list to tmux tokens. Returns null if ANY
@@ -226,7 +230,7 @@ const ALLOWED_KEYS: Record<string, string> = {
 export const resolveKeys = (keys: string[]): string[] | null => {
     const out: string[] = [];
     for (const k of keys) {
-        const token = ALLOWED_KEYS[k.toLowerCase().trim()];
+        const token = ALLOWED_KEYS.get(k.toLowerCase().trim());
         if (!token) return null;
         out.push(token);
     }
@@ -888,14 +892,62 @@ export interface StreamControl {
     renew?: boolean;
 }
 
-// ~2.5 fps ceiling. Cadence + diff-gating are the ONLY bound on API Gateway
-// WS cost (the $default route has no per-message limit), so keep it modest
-// and let unchanged frames drop.
+// ~2.5 fps idle ceiling. Cadence + diff-gating + the per-second send budget
+// are the ONLY bound on API Gateway WS cost (the $default route has no
+// per-message limit), so keep it modest and let unchanged frames drop.
 // How far back the live-stream capture reaches — more than the screen-peek
 // window so the mirror has scrollback to scroll through. SCREEN_PEEK_MAX_BYTES
 // still caps the actual payload, so very wide panes get top-truncated.
 const STREAM_CAPTURE_LINES = 200;
-const STREAM_INTERVAL_MS = 400;
+export const STREAM_INTERVAL_MS = 400;
+// Burst cadence: right after a keystroke lands, the pane IS what the user is
+// staring at, so captures tighten for BURST_WINDOW_MS and then fall back to
+// the idle cadence. The window is what keeps this affordable — one keypress
+// costs a bounded number of extra frames instead of raising the steady rate.
+export const BURST_INTERVAL_MS = 120;
+export const BURST_WINDOW_MS = 2_500;
+// Cost bound the burst must not break: MAX_CONCURRENT_STREAMS × 8 = 24 msg/s
+// worst case, under half of the API Gateway WS stage throttle (50 rps) that is
+// SHARED across every user, so a bursting host still leaves headroom for push
+// delivery and presence. At BURST_INTERVAL_MS the chain tops out at 8.3 fps,
+// so this budget bites only in the last fraction of a fully bursting second —
+// it is what holds the line if the burst cadence is ever tightened further.
+export const MAX_FRAMES_PER_SEC = 8;
+
+/**
+ * Delay before the next capture: burst while the last input is still echoing,
+ * idle otherwise. Exclusive at the boundary — exactly BURST_WINDOW_MS after
+ * the input is already idle, so the window can't stretch. A lastInputAt in the
+ * future (wall-clock jump) reads as fresh input rather than as an expired
+ * window: bursting is the recoverable side of that.
+ */
+export const streamCadence = (lastInputAt: number | null, now: number): number =>
+    lastInputAt !== null && now - lastInputAt < BURST_WINDOW_MS ? BURST_INTERVAL_MS : STREAM_INTERVAL_MS;
+
+/** Rolling one-second send budget for a single stream. */
+export interface FrameBudget {
+    windowStartedAt: number;
+    sent: number;
+}
+
+/**
+ * Claim one send from the budget, rolling the window over when the second has
+ * passed. False means this tick must skip WITHOUT marking the frame as sent —
+ * the diff-gate would otherwise swallow that content for good.
+ */
+export const claimFrameSend = (budget: FrameBudget, now: number): boolean => {
+    // `now < windowStartedAt` = the clock ran backwards (NTP step, resume).
+    // Without the guard the window never rolls again and a spent budget
+    // freezes the mirror for the whole regression — same failure streamCadence
+    // already defends against, so the two must agree.
+    if (now - budget.windowStartedAt >= 1_000 || now < budget.windowStartedAt) {
+        budget.windowStartedAt = now;
+        budget.sent = 0;
+    }
+    if (budget.sent >= MAX_FRAMES_PER_SEC) return false;
+    budget.sent++;
+    return true;
+};
 // Orphan guard for subscribers that can't renew (clients older than the renew
 // protocol): a phone that dies without sending agent.stream.stop must not leak
 // an interval forever. Auto-stop after this long; the phone re-subscribes on
@@ -938,19 +990,48 @@ interface StreamStats {
     startedAt: number;
     frames: number; // frames actually sent (post diff-gate)
     bytes: number; // payload bytes sent
-    skipped: number; // ticks suppressed by the diff-gate
+    /** The burst phase's share of frames/bytes, and the wall time spent at the
+     *  burst cadence — burst vs idle cost is the question B-full turns on, and
+     *  a single blended fps hides it. Idle is the remainder. */
+    framesBurst: number;
+    bytesBurst: number;
+    burstMs: number;
+    skipped: number; // ticks that sent nothing (diff-gate, or the send budget)
+    rateCapped: number; // subset of `skipped` refused by MAX_FRAMES_PER_SEC
     lastLogAt: number;
     lastLogFrames: number;
     lastLogBytes: number;
+    lastLogFramesBurst: number;
+    lastLogBurstMs: number;
 }
 
 interface ActiveStream {
-    timer: ReturnType<typeof setInterval>;
+    /** Handle of the ONE armed tick. The capture loop re-arms itself every
+     *  tick (the cadence changes between ticks), so this is replaced each
+     *  time — stopping a stream means clearing whatever is current. */
+    timer: ReturnType<typeof setTimeout>;
     stats: StreamStats;
+    /** When input last landed in this pane, or null if none has. Drives the
+     *  burst cadence; set by noteStreamInput from the shared inject path. */
+    lastInputAt: number | null;
     /** Wall-clock deadline; the capture tick reaps the stream once it passes. */
     expiresAt: number;
     /** Subscriber renews — i.e. its silence is proof it's gone, not just quiet. */
     renewing: boolean;
+    /** Set when the subscriber handed over an E2EE key at start. Outbound
+     *  frames are encrypted for it, so inbound plaintext input is refused
+     *  rather than typed — the inbound half must not be the one leg in clear. */
+    subscriberPublicKey?: string;
+    /** Consecutive failed decrypts of sealed input on THIS incarnation. The
+     *  subscriber-key binding gates who may enqueue an ECDH derive, not how
+     *  many can fail, so this is what stops a flood; a successful decrypt
+     *  clears it, and a re-subscribe mints a fresh entry. */
+    inputDecryptFailures: number;
+    /** Replace an IDLE-armed tick with an immediate burst tick. Input landing
+     *  just after an idle tick must not wait out the remaining ~400ms gap —
+     *  that gap IS the latency the burst exists to remove. No-op while a
+     *  burst tick is armed, so a keystroke flurry can't starve the chain. */
+    wake: () => void;
 }
 
 /** How far a start (and each renew) pushes the deadline out. */
@@ -958,29 +1039,72 @@ const leaseFor = (renewing: boolean): number => (renewing ? STREAM_LEASE_MS : ST
 
 const activeStreams = new Map<string, ActiveStream>();
 
+/** Inbound key ordering, one per (streamed session, sender device) — see the
+ *  `agent.command.input` section below. Lives here so stopStream can drop them
+ *  with the lease they belong to. Keyed `<session>#<deviceId>`, or the bare
+ *  session name from a relay too old to stamp the sender. */
+const inputSequencers = new Map<string, InputSequencer<PendingInput>>();
+
+/** Frames per second for one cadence phase. A phase that got no wall time in
+ *  the window (a stream that never bursted) reads 0.0, never NaN. */
+const phaseFps = (frames: number, ms: number): string => (ms > 0 ? (frames / (ms / 1000)).toFixed(1) : '0.0');
+
 const maybeLogStreamStats = (sessionName: string, stats: StreamStats): void => {
     const elapsed = Date.now() - stats.lastLogAt;
     if (elapsed < STREAM_LOG_INTERVAL_MS) return;
     const secs = elapsed / 1000;
-    const fps = (stats.frames - stats.lastLogFrames) / secs;
+    const frames = stats.frames - stats.lastLogFrames;
+    const fps = frames / secs;
     const kbps = (stats.bytes - stats.lastLogBytes) / 1024 / secs;
-    log(`⧉ stream ${sessionName}: ${fps.toFixed(1)} fps, ${kbps.toFixed(1)} KB/s (${stats.frames} sent, ${stats.skipped} diff-skipped)`);
+    // burstMs is charged when a burst tick is armed, so it can overshoot the
+    // window by at most one interval — phaseFps clamps the idle remainder.
+    const burstMs = stats.burstMs - stats.lastLogBurstMs;
+    const burstFrames = stats.framesBurst - stats.lastLogFramesBurst;
+    log(
+        `⧉ stream ${sessionName}: ${fps.toFixed(1)} fps, ${kbps.toFixed(1)} KB/s ` +
+            `(${stats.frames} sent, ${stats.skipped} skipped incl. ${stats.rateCapped} rate-capped) ` +
+            `[burst ${phaseFps(burstFrames, burstMs)} fps · idle ${phaseFps(frames - burstFrames, elapsed - burstMs)} fps]`,
+    );
     stats.lastLogAt = Date.now();
     stats.lastLogFrames = stats.frames;
     stats.lastLogBytes = stats.bytes;
+    stats.lastLogFramesBurst = stats.framesBurst;
+    stats.lastLogBurstMs = stats.burstMs;
+};
+
+/** A keystroke landed in this pane, so the next captures run at the burst
+ *  cadence and the echo is visible instead of up to STREAM_INTERVAL_MS late.
+ *  Called from the shared inject helpers, which is what both the ephemeral
+ *  (agent.command.input) and the REST (agent.command) paths funnel through. */
+const noteStreamInput = (sessionName: string): void => {
+    const entry = activeStreams.get(sessionName);
+    if (!entry) return;
+    entry.lastInputAt = Date.now();
+    entry.wake();
 };
 
 export const stopStream = (sessionName: string): void => {
     const entry = activeStreams.get(sessionName);
     if (!entry) return;
-    clearInterval(entry.timer);
+    clearTimeout(entry.timer);
     activeStreams.delete(sessionName);
+    // The next stream is a new run: a sequencer carrying this one's high-water
+    // mark would swallow its first keys if the sender restarts its counter.
+    // Every sender that typed into this session holds its own, so drop the
+    // whole `<session>#…` family, not just the bare-name key.
+    for (const [key, sequencer] of inputSequencers) {
+        if (key !== sessionName && !key.startsWith(`${sessionName}#`)) continue;
+        sequencer.reset();
+        inputSequencers.delete(key);
+    }
     const { stats } = entry;
     const secs = Math.max(0.001, (Date.now() - stats.startedAt) / 1000);
     log(
         `⧉ stream ${sessionName} stopped: ${stats.frames} frames / ` +
             `${(stats.bytes / 1024).toFixed(1)} KB over ${secs.toFixed(1)}s ` +
-            `(${(stats.frames / secs).toFixed(1)} fps avg, ${stats.skipped} diff-skipped)`,
+            `(${(stats.frames / secs).toFixed(1)} fps avg, ${stats.skipped} skipped incl. ${stats.rateCapped} rate-capped) ` +
+            `[burst ${stats.framesBurst} frames / ${(stats.bytesBurst / 1024).toFixed(1)} KB ` +
+            `over ${(stats.burstMs / 1000).toFixed(1)}s = ${phaseFps(stats.framesBurst, stats.burstMs)} fps]`,
     );
 };
 
@@ -1006,11 +1130,23 @@ export type StreamFramePayload = {
     encrypted?: EncryptedEphemeralPayload;
 };
 
-/** Wire shape of a live-mirror error frame — same subtype, no pane data. */
+/** Wire shape of a live-mirror error frame — same subtype, no pane data.
+ *  `input_rejected` refuses an ephemeral `agent.command.input`; it rides this
+ *  frame so a viewer already handling stream errors can fall back to the REST
+ *  push path without a second error channel. */
 export type StreamErrorFrame = {
     subtype: 'agent.stream.frame';
     sessionName: string;
-    error: 'unknown_session' | 'e2ee_unavailable' | 'encrypt_failed' | 'stream_limit' | 'stream_gone';
+    error: 'unknown_session' | 'e2ee_unavailable' | 'encrypt_failed' | 'stream_limit' | 'stream_gone' | 'input_rejected';
+    /** `input_rejected` only: the refused message's ordering stamp echoed back.
+     *  A sender with several keystrokes in flight can't tell which one was
+     *  refused without it. Absent when the message carried no usable stamp. */
+    seq?: number;
+    epoch?: number;
+    /** `input_rejected` only: the refused sender's deviceId, echoed so a second
+     *  device whose (seq, epoch) happens to collide doesn't claim the refusal
+     *  and fire a REST resend for an input that was never refused. */
+    inputDeviceId?: string;
 };
 
 /**
@@ -1040,11 +1176,20 @@ const evictStalestStream = (now: number): string | null => {
     return victim.name;
 };
 
-const streamErrorFrame = (sessionName: string, error: StreamErrorFrame['error']): StreamErrorFrame => ({
-    subtype: 'agent.stream.frame',
-    sessionName,
-    error,
-});
+const streamErrorFrame = (
+    sessionName: string,
+    error: StreamErrorFrame['error'],
+    /** The message being refused, when there is one to echo. */
+    echo?: { seq?: unknown; epoch?: unknown; deviceId?: unknown },
+): StreamErrorFrame => {
+    const frame: StreamErrorFrame = { subtype: 'agent.stream.frame', sessionName, error };
+    // A malformed message may carry no stamp at all, or garbage — omitting the
+    // field beats echoing something the sender can't match.
+    if (isSeqNumber(echo?.seq)) frame.seq = echo.seq;
+    if (isSeqNumber(echo?.epoch)) frame.epoch = echo.epoch;
+    if (typeof echo?.deviceId === 'string' && echo.deviceId) frame.inputDeviceId = echo.deviceId;
+    return frame;
+};
 
 /**
  * Build the wire payload for one stream frame. With a subscriber public key
@@ -1078,6 +1223,14 @@ export const buildStreamFrame = async (
  * was a stream-control message (so the caller skips the one-shot screen-peek
  * path). start is idempotent — a repeat restarts the loop.
  */
+// deep: over the body-length limit on purpose. Everything past the guards is
+// one capture loop whose state (lastContent, wireSeq, encryptFailures, budget,
+// and `stats` as the incarnation token) is only correct while it stays private
+// to a single start. Hoisting it into a factory would turn those five into
+// parameters and expose the incarnation invariant — the one that keeps an
+// orphaned chain from capturing forever — to callers that have no reason to
+// know it exists. Nothing outside needs the internals; deleting this deletes
+// the live mirror whole.
 export const handleStreamControl = (
     req: StreamControl,
     send: (data: Record<string, unknown>) => void,
@@ -1133,10 +1286,16 @@ export const handleStreamControl = (
         startedAt: Date.now(),
         frames: 0,
         bytes: 0,
+        framesBurst: 0,
+        bytesBurst: 0,
+        burstMs: 0,
         skipped: 0,
+        rateCapped: 0,
         lastLogAt: Date.now(),
         lastLogFrames: 0,
         lastLogBytes: 0,
+        lastLogFramesBurst: 0,
+        lastLogBurstMs: 0,
     };
     // E2EE handshake: load-or-create this device's keypair up front. The
     // subscriber asked for encryption, so key failure is FAIL-CLOSED: refuse
@@ -1156,21 +1315,41 @@ export const handleStreamControl = (
     }
     let wireSeq = 0;
     let encryptFailures = 0;
-    const timer = setInterval(() => {
+    const budget: FrameBudget = { windowStartedAt: Date.now(), sent: 0 };
+    /**
+     * One capture. Returns false only when the stream is gone and the chain
+     * must NOT re-arm — every other outcome re-arms at the single call site in
+     * runTick, so no early return can silently freeze the mirror.
+     */
+    const captureTick = (entry: ActiveStream): boolean => {
         // Lease check rides the capture tick: one deadline field, no second
         // timer to leak. (The previous per-start expiry setTimeout was never
         // cleared on stop, so a restart left the old one armed to kill the new
         // incarnation.) Reaping here is what frees the slot for everyone whose
         // stop never arrived.
-        if (Date.now() >= (activeStreams.get(sessionName)?.expiresAt ?? 0)) {
+        if (Date.now() >= entry.expiresAt) {
             stopStream(sessionName);
-            return;
+            return false;
         }
         const captured = capturePane(sessionName, true, STREAM_CAPTURE_LINES);
         if (!captured || captured.content === lastContent) {
             stats.skipped++;
-            return; // diff-gate
+            return true; // diff-gate
         }
+        const now = Date.now();
+        // Send budget BEFORE the diff-gate is marked: a frame refused here has
+        // to stay "changed" so a later tick retries it, or this content is
+        // never sent at all — the next tick would diff-skip it as unchanged.
+        if (!claimFrameSend(budget, now)) {
+            stats.skipped++;
+            stats.rateCapped++;
+            return true;
+        }
+        // Phase = the gap that PRODUCED this tick (armedDelay), matching how
+        // burstMs is charged in arm() — deciding by wall-clock here instead
+        // made the last burst-armed frame count idle, under-reporting burst
+        // fps by one frame per episode in the R2 numbers.
+        const inBurst = armedDelay === BURST_INTERVAL_MS;
         lastContent = captured.content;
         // Stamp the sequence in CAPTURE order, synchronously — frame assembly
         // is async (encryption) and fire-and-forget, so resolve order is not
@@ -1186,7 +1365,7 @@ export const handleStreamControl = (
                 // Encrypt failure — frame dropped, diff-gate un-marked so the
                 // next tick retries. A key that keeps failing (malformed
                 // subscriber key) never recovers: fail closed after a few
-                // strikes instead of retrying every 400ms for 5 minutes.
+                // strikes instead of retrying every tick for 5 minutes.
                 lastContent = null;
                 // Init still in flight (or failed — its own path fail-closes):
                 // a not-yet-ready key is not a malformed key, don't strike.
@@ -1204,7 +1383,12 @@ export const handleStreamControl = (
             // ~1.4× the plaintext; base fields now count too, so plaintext
             // streams read slightly higher than the pre-E2EE content-only
             // metric) — this feeds the R2 cost instrumentation.
-            stats.bytes += Buffer.byteLength(JSON.stringify(frame), 'utf-8');
+            const bytes = Buffer.byteLength(JSON.stringify(frame), 'utf-8');
+            stats.bytes += bytes;
+            if (inBurst) {
+                stats.framesBurst++;
+                stats.bytesBurst += bytes;
+            }
             // seq = capture order; epoch = this stream incarnation, so the
             // receiver's ordering guard resets across daemon-side restarts.
             send({ ...frame, seq, epoch: stats.startedAt });
@@ -1214,7 +1398,40 @@ export const handleStreamControl = (
             // from send()/logging — report and let the next tick carry on.
             log(`⧉ stream ${sessionName}: frame send failed (${err instanceof Error ? err.message : err})`);
         });
-    }, STREAM_INTERVAL_MS);
+        return true;
+    };
+    /** Arm the next tick. A chain that outlived its incarnation (restart, or a
+     *  stop racing this tick) must die here instead of capturing forever into
+     *  a stream nobody can cancel — `stats` is the incarnation token. */
+    let armedDelay = STREAM_INTERVAL_MS;
+    const arm = (delay: number): void => {
+        const entry = activeStreams.get(sessionName);
+        if (entry?.stats !== stats) return;
+        if (delay === BURST_INTERVAL_MS) stats.burstMs += delay;
+        armedDelay = delay;
+        const next = setTimeout(runTick, delay);
+        next.unref?.();
+        entry.timer = next;
+    };
+    const runTick = (): void => {
+        const entry = activeStreams.get(sessionName);
+        if (entry?.stats !== stats) return;
+        if (!captureTick(entry)) return;
+        // The cadence is re-read every tick, so input that lands mid-stream
+        // tightens the NEXT gap rather than the current one.
+        arm(streamCadence(entry.lastInputAt, Date.now()));
+    };
+    /** Swap an idle-armed tick for an immediate burst tick (see ActiveStream.wake).
+     *  Only when the armed gap is the idle one: replacing an armed burst tick
+     *  on every keystroke would push the next capture away indefinitely. */
+    const wake = (): void => {
+        const entry = activeStreams.get(sessionName);
+        if (entry?.stats !== stats) return;
+        if (armedDelay === BURST_INTERVAL_MS) return;
+        clearTimeout(entry.timer);
+        arm(BURST_INTERVAL_MS);
+    };
+    const timer = setTimeout(runTick, STREAM_INTERVAL_MS);
     timer.unref?.();
     // A renewing subscriber gets the short lease; anything older keeps the
     // 5-minute orphan guard so a version-skewed client isn't cut off mid-view.
@@ -1222,9 +1439,390 @@ export const handleStreamControl = (
     activeStreams.set(sessionName, {
         timer,
         stats,
+        lastInputAt: null,
+        inputDecryptFailures: 0,
         expiresAt: Date.now() + leaseFor(renewing),
         renewing,
+        subscriberPublicKey,
+        wake,
     });
+    return true;
+};
+
+// ─── Ephemeral key input (agent.command.input) ───────────────────────
+// Same end result as an `agent.command` push — keys or text into a tmux pane
+// — but carried on the ephemeral relay instead of REST, which is one
+// persisted hop shorter. Latency is the only reason it exists, so it must not
+// buy that with a weaker posture: the tmux-side guards are the SAME code as
+// the REST path (passesInjectGuards → shell-pane refusal + the one per-session
+// token bucket, ALLOWED_KEYS via resolveKeys). A private counter here would
+// double the effective 30/min cap.
+
+/** Wire shape of one inbound injection. Every field is optional, and none of
+ *  them is proven: this shape is an unchecked cast over relay JSON, so
+ *  validateInputMessage re-checks the types it acts on rather than trusting
+ *  the declaration. */
+export interface AgentCommandInput {
+    subtype?: string;
+    targetDeviceId?: string;
+    sessionName?: string;
+    /** Which device's seq/epoch run this is. Current relays stamp it from the
+     *  sending connection unconditionally; relays older than that overwrite
+     *  only a missing value, so a sender there can claim another device's id.
+     *  Treat it as an ordering namespace, never as authentication — the worst
+     *  a forged id buys is a different reorder lane for its own keystrokes. */
+    deviceId?: string;
+    /** Named keys, ALLOWED_KEYS-validated. Mutually exclusive with `body`. */
+    keys?: string[];
+    /** Literal text; the injector appends the Enter, as on the REST path. */
+    body?: string;
+    /** Sender's monotonic counter, and the incarnation it counts within. */
+    seq?: number;
+    epoch?: number;
+    /** E2EE envelope sealing `{ keys | body }` plus a copy of the
+     *  `sessionName`/`seq`/`epoch` stamp as JSON — the only way in on an
+     *  encrypted stream, where `keys`/`body` above are refused. Present means
+     *  the plaintext pair is ignored entirely: on a message the relay can
+     *  append to, only the ciphertext decides what gets typed, and the sealed
+     *  stamp is what proves the plaintext one was not re-written for a replay. */
+    encrypted?: unknown;
+}
+
+/** Parity with the REST path, which refuses more than MAX_KEYS_PER_COMMAND per
+ *  agent.command (zeph apps/server/src/functions/pushes.ts). The lower-latency
+ *  door into the same pane must not also be the wider one. */
+export const MAX_INPUT_KEYS = 10;
+/** The REST path caps no body length, so this bound is ours alone: an
+ *  unbounded body is one tmux send-keys argv of unbounded size, and what it
+ *  lands in is an agent prompt, not a paste buffer. */
+export const MAX_INPUT_BODY_CHARS = 4096;
+
+/** The relay socket a message arrived on, and the only way back to its sender. */
+type SendEphemeral = (data: Record<string, unknown>) => void;
+
+/** One validated injection. */
+type ValidatedInput = SequencedInput & {
+    sessionName: string;
+    /** Sender's device, when the relay stamped one — rides along so a refusal
+     *  frame can name whose input was refused (inputDeviceId). */
+    deviceId?: string;
+    /** Exactly one of these is set. */
+    tokens: string[] | null;
+    text: string | null;
+};
+
+/** A validated injection queued for delivery in seq order, carrying the socket
+ *  it arrived on: the reorder hold outlives the call that accepted it, and a
+ *  refusal at delivery time still has to reach the sender that is waiting. */
+type PendingInput = ValidatedInput & { send: SendEphemeral };
+
+type InputCheck = { ok: true; input: ValidatedInput } | { ok: false; reason: string };
+
+// Both fields are relay JSON, so both are attacker-shaped. Number.isFinite
+// admits 1e21 — which parks the high-water mark past anything a sender can
+// count back to — and 1.5, which no later integer can ever equal, so every
+// following key would sit out the hold before being typed out of order.
+const isSeqNumber = (v: unknown): v is number =>
+    typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+
+// A malformed `keys` would throw where it is consumed (resolveKeys iterates
+// it, tmux args must be strings), and a throw inside the WebSocket message
+// handler takes the whole daemon down. Type-check before acting.
+const isKeyList = (v: unknown): v is string[] =>
+    Array.isArray(v) && v.length > 0 && v.every((k) => typeof k === 'string');
+
+/** Every field of an inbound envelope, all of them relay JSON. A missing or
+ *  ill-typed one would reach WebCrypto as a string it cannot Base64-decode;
+ *  refusing here keeps the failure a refusal rather than a thrown rejection. */
+const isInputEnvelope = (v: unknown): v is EncryptedEphemeralPayload =>
+    typeof v === 'object' && v !== null && !Array.isArray(v)
+    && (['ciphertext', 'iv', 'encryptedKey', 'keyIv', 'senderPublicKey'] as const)
+        .every((field) => typeof (v as Record<string, unknown>)[field] === 'string');
+
+/** The decrypted payload, under the same stance as the outer message: an
+ *  unchecked cast that validateInputMessage re-checks field by field. Only the
+ *  envelope's authenticity is proven at this point, never its contents —
+ *  a subscriber can seal anything, including 400 keys. */
+const parseSealedInput = (
+    json: string,
+): Pick<AgentCommandInput, 'keys' | 'body' | 'seq' | 'epoch' | 'sessionName'> | null => {
+    try {
+        const parsed: unknown = JSON.parse(json);
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+        return parsed as Pick<AgentCommandInput, 'keys' | 'body' | 'seq' | 'epoch' | 'sessionName'>;
+    } catch {
+        return null;
+    }
+};
+
+/**
+ * Parse and whitelist an inbound input message. Pure — the lease gate and the
+ * tmux-side guards stay in the caller, so this is testable on its own.
+ */
+export const validateInputMessage = (msg: AgentCommandInput): InputCheck => {
+    const { sessionName, seq, epoch } = msg;
+    if (typeof sessionName !== 'string' || !sessionName) return { ok: false, reason: 'no sessionName' };
+    // This function reads plaintext `keys`/`body` and nothing else, so it must
+    // never see a message that still carries an envelope: the encrypted path
+    // opens one and hands the decrypted fields back through here with the
+    // envelope stripped. A message arriving with both would otherwise get the
+    // plaintext half injected while its sender believed the sealed half was
+    // what landed. Fail closed instead.
+    if (msg.encrypted !== undefined) return { ok: false, reason: 'envelope reached the plaintext validator' };
+    if (!isSeqNumber(seq) || !isSeqNumber(epoch)) return { ok: false, reason: 'missing seq/epoch' };
+    const base = {
+        sessionName,
+        seq,
+        epoch,
+        ...(typeof msg.deviceId === 'string' && msg.deviceId ? { deviceId: msg.deviceId } : {}),
+    };
+    if (msg.keys !== undefined) {
+        if (!isKeyList(msg.keys)) return { ok: false, reason: 'malformed keys' };
+        if (msg.keys.length > MAX_INPUT_KEYS) return { ok: false, reason: `too many keys (${msg.keys.length})` };
+        if (msg.body !== undefined) return { ok: false, reason: 'keys and body are mutually exclusive' };
+        const tokens = resolveKeys(msg.keys);
+        if (!tokens) return { ok: false, reason: `unknown key(s) [${msg.keys.join(' ')}]` };
+        return { ok: true, input: { ...base, tokens, text: null } };
+    }
+    if (typeof msg.body !== 'string' || !msg.body) return { ok: false, reason: 'empty input' };
+    if (msg.body.length > MAX_INPUT_BODY_CHARS) return { ok: false, reason: `body too long (${msg.body.length})` };
+    return { ok: true, input: { ...base, tokens: null, text: msg.body } };
+};
+
+/**
+ * Type one ordered message into the pane. Unlike the REST key path this
+ * schedules no follow-up snapshot: the message only got this far because a
+ * live stream is already repainting the pane at frame rate.
+ */
+const deliverInput = (input: PendingInput): void => {
+    // The reorder hold can outlive the lease that admitted the message.
+    const injected = activeStreams.has(input.sessionName)
+        && (input.tokens
+            ? tryInjectKeys(input.sessionName, input.tokens, {})
+            : tryInject(input.sessionName, input.text ?? '', {}));
+    // Every refusal reachable from here — dead lease, shell pane, rate limit,
+    // a failed send-keys — used to be silent, which contradicts the contract
+    // above: the sender would keep waiting on a keystroke that never lands
+    // instead of falling back to the REST push path.
+    if (!injected) input.send(streamErrorFrame(input.sessionName, 'input_rejected', input));
+};
+
+/** Ceiling on concurrent sender lanes. The lane key includes a relay-stamped
+ *  deviceId, but a relay older than the unconditional stamp lets a sender vary
+ *  it per message — without a cap that grows the map for the lease's whole
+ *  life. Real senders are one per device; 16 is generous. */
+export const MAX_INPUT_LANES = 16;
+
+const inputSequencerFor = (key: string): InputSequencer<PendingInput> | null => {
+    const existing = inputSequencers.get(key);
+    if (existing) return existing;
+    if (inputSequencers.size >= MAX_INPUT_LANES) return null;
+    const created = createInputSequencer<PendingInput>(deliverInput, {
+        // Held keys swept out by an epoch change or stream stop are keystrokes
+        // their sender still waits on — refuse them so it can fall back.
+        onDiscard: (input) => input.send(streamErrorFrame(input.sessionName, 'input_rejected', input)),
+    });
+    inputSequencers.set(key, created);
+    return created;
+};
+
+/** Hand a validated injection to its sender's ordering lane. Shared by both
+ *  inbound paths — plaintext and decrypted input order against each other. */
+const enqueueInput = (input: ValidatedInput, send: SendEphemeral): void => {
+    // One ordering run per sender, not per session: two devices typing into
+    // the same pane each carry their own seq/epoch, and a shared sequencer
+    // would let the higher epoch supersede the other and silence it.
+    const senderKey = input.deviceId ? `${input.sessionName}#${input.deviceId}` : input.sessionName;
+    const sequencer = inputSequencerFor(senderKey);
+    if (!sequencer) {
+        log(`! input ${input.sessionName}: sender lane cap reached — drop`);
+        send(streamErrorFrame(input.sessionName, 'input_rejected', input));
+        return;
+    }
+    const accepted = sequencer.accept({ ...input, send });
+    if (accepted !== 'ok') {
+        // overflow / superseded / stale — the message was dropped, and the
+        // sender must hear so instead of waiting on a keystroke that never
+        // lands (the sequencer reports swept HELD messages via onDiscard).
+        log(`! input ${input.sessionName}: ${accepted} — drop`);
+        send(streamErrorFrame(input.sessionName, 'input_rejected', input));
+    }
+};
+
+/**
+ * Tail of the encrypted-input decrypt chain.
+ *
+ * Encrypted inputs are opened one at a time rather than concurrently. That
+ * bounds the ECDH work one socket can have in flight, and it keeps arrival
+ * order into the sequencer — two keystrokes whose decrypts race would
+ * otherwise reach it in whichever order WebCrypto finished, turning an
+ * in-order pair into a gap and a 500 ms hold.
+ */
+let inputDecryptChain: Promise<void> = Promise.resolve();
+let inputDecryptDepth = 0;
+
+/** Ceiling on queued decrypts. The subscriber-key binding is a string compare
+ *  against a public key the relay fanned out to every same-account connection,
+ *  so it gates WHO can enqueue an ECDH derive, not how many — a flooding
+ *  client would otherwise grow the chain without bound. Mirrors
+ *  MAX_PENDING_INPUTS' role on the plaintext side. */
+export const MAX_PENDING_DECRYPTS = 32;
+
+/** Resolves once every encrypted input accepted so far has been routed. */
+export const pendingInputDecrypts = (): Promise<void> => inputDecryptChain;
+
+/**
+ * Open an E2EE input envelope and route what was inside it.
+ *
+ * Every cheap guard runs synchronously, before any crypto: an envelope from
+ * anyone but the subscriber costs a string compare, not an ECDH derive. What
+ * comes out of the decrypt is then re-validated by exactly the checks the
+ * plaintext path runs — the envelope hides the payload from the relay, never
+ * from the whitelist or the caps.
+ */
+const handleEncryptedInput = (msg: AgentCommandInput, send: SendEphemeral): void => {
+    const { sessionName } = msg;
+    const refuse = (reason: string): void => {
+        log(`! input ${sessionName ?? '(no session)'}: ${reason} — drop`);
+        // No sessionName means the sender can't match the error to anything.
+        // The reason never rides along: it is derived from plaintext the relay
+        // must not learn, so it stays in this host's log.
+        if (typeof sessionName === 'string' && sessionName) {
+            send(streamErrorFrame(sessionName, 'input_rejected', msg));
+        }
+    };
+    if (typeof sessionName !== 'string' || !sessionName) return refuse('no sessionName');
+    const stream = activeStreams.get(sessionName);
+    if (!stream) return refuse('encrypted input with no live stream');
+    // A stream that handshook no subscriber key has no key to bind this
+    // envelope against — and its own frames go out in the clear, so there is
+    // nothing here worth protecting and no way to prove who sent it.
+    const { subscriberPublicKey } = stream;
+    if (!subscriberPublicKey) return refuse('encrypted input on a plaintext stream');
+    if (!isInputEnvelope(msg.encrypted)) return refuse('malformed encrypted envelope');
+    // THE binding. Opening an envelope proves only that its sender holds some
+    // private key; it is this comparison that makes it the key the subscriber
+    // handshook with, and so makes ephemeral input exclusive to the device
+    // actually watching the pane. Without it, anyone who learned this host's
+    // public key could type into it.
+    const envelope = msg.encrypted;
+    if (envelope.senderPublicKey !== subscriberPublicKey) {
+        return refuse('envelope not sealed by the stream subscriber');
+    }
+    // The incarnation this message was admitted under. A stream can stop and
+    // restart — with a different subscriber key — while the decrypt is in
+    // flight, and the lease check inside deliverInput only asks whether SOME
+    // stream of this name exists.
+    const incarnation = stream.stats;
+    if (inputDecryptDepth >= MAX_PENDING_DECRYPTS) {
+        return refuse('decrypt queue full');
+    }
+    // The binding compares against a public key the relay has seen, so it says
+    // who MAY enqueue an ECDH derive, not that they can produce an openable
+    // envelope. Sustained garbage would otherwise spend the one shared decrypt
+    // chain on every stream at once. Same fail-closed shape as the outbound
+    // half (STREAM_MAX_ENCRYPT_FAILURES): after a few consecutive failures this
+    // stream takes no more sealed input until it is re-subscribed.
+    if (stream.inputDecryptFailures >= STREAM_MAX_ENCRYPT_FAILURES) {
+        return refuse('too many failed decrypts on this stream');
+    }
+    inputDecryptDepth++;
+    inputDecryptChain = inputDecryptChain.then(async () => {
+        inputDecryptDepth--;
+        let opened: string;
+        try {
+            opened = await decryptEphemeral(envelope);
+        } catch (err) {
+            // AES-GCM is authenticated, so this is a forged, truncated or
+            // misaddressed envelope — never a partially readable one.
+            const live = activeStreams.get(sessionName);
+            if (live?.stats === incarnation) live.inputDecryptFailures++;
+            return refuse(`decrypt failed (${err instanceof Error ? err.message : err})`);
+        }
+        // A real envelope clears the strikes: the cap is there to stop a flood,
+        // not to retire a stream that saw one corrupted message.
+        const live = activeStreams.get(sessionName);
+        if (live?.stats === incarnation) live.inputDecryptFailures = 0;
+        if (activeStreams.get(sessionName)?.stats !== incarnation) {
+            return refuse('stream replaced while decrypting');
+        }
+        const payload = parseSealedInput(opened);
+        if (!payload) return refuse('sealed payload is not an input object');
+        // Replay binding: the ciphertext must vouch for the plaintext stamps.
+        // AES-GCM stops the relay from forging content, but without this check
+        // it could replay a captured envelope under a fresh seq and type a
+        // real keystroke twice — the relay is exactly the party E2EE distrusts.
+        if (payload.seq !== msg.seq || payload.epoch !== msg.epoch || payload.sessionName !== sessionName) {
+            return refuse('sealed stamps do not match the plaintext ones (replay?)');
+        }
+        const checked = validateInputMessage({
+            sessionName,
+            seq: msg.seq,
+            epoch: msg.epoch,
+            deviceId: msg.deviceId,
+            keys: payload.keys,
+            body: payload.body,
+        });
+        if (!checked.ok) return refuse(checked.reason);
+        enqueueInput(checked.input, send);
+    }).catch((err) => {
+        // Nothing above should throw outside the decrypt, but one broken link
+        // must not stall every keystroke queued behind it.
+        log(`! input ${sessionName}: encrypted routing failed (${err instanceof Error ? err.message : err})`);
+    });
+};
+
+/**
+ * Handle agent.command.input. Returns true when the message was ours to
+ * answer, so the caller stops routing it. Encrypted messages finish
+ * asynchronously — the return value reports routing, not delivery, exactly as
+ * it already did for a message the sequencer holds.
+ */
+export const handleCommandInput = (
+    msg: AgentCommandInput,
+    send: SendEphemeral,
+): boolean => {
+    if (msg.subtype !== 'agent.command.input') return false;
+    // Addressing gate, as on stream control: the relay fans every ephemeral
+    // message out to all of this user's connections, and two machines can run
+    // the same tmux session name — an unaddressed inject would type into both.
+    if (msg.targetDeviceId !== computeListenerDeviceId()) return false;
+    // An envelope decides the message on its own. Branching here rather than
+    // inside the validator is what keeps the plaintext `keys`/`body` a relay
+    // could staple alongside it out of reach.
+    if (msg.encrypted !== undefined) {
+        handleEncryptedInput(msg, send);
+        return true;
+    }
+    const checked = validateInputMessage(msg);
+    if (!checked.ok) {
+        log(`! input ${msg.sessionName ?? '(no session)'}: ${checked.reason} — drop`);
+        // No sessionName means the sender can't match the error to anything.
+        if (typeof msg.sessionName === 'string' && msg.sessionName) {
+            send(streamErrorFrame(msg.sessionName, 'input_rejected', msg));
+        }
+        return true;
+    }
+    const { input } = checked;
+    // Input rides the stream lease: without one, nobody is watching the pane
+    // this would type into, and seq/epoch have no incarnation to order
+    // against. The sender learns in one hop and falls back to a REST push.
+    const stream = activeStreams.get(input.sessionName);
+    if (!stream) {
+        log(`! input ${input.sessionName}: no live stream — drop`);
+        send(streamErrorFrame(input.sessionName, 'input_rejected', input));
+        return true;
+    }
+    // This stream's outbound half is E2EE for that subscriber, so accepting a
+    // plaintext keystroke would leave the inbound leg the only one in clear —
+    // and nothing about it proves the subscriber sent it. An encrypted stream
+    // takes sealed input (above) or none.
+    if (stream.subscriberPublicKey) {
+        log(`! input ${input.sessionName}: stream is E2EE, plaintext input refused — drop`);
+        send(streamErrorFrame(input.sessionName, 'input_rejected', input));
+        return true;
+    }
+    enqueueInput(input, send);
     return true;
 };
 
@@ -1372,6 +1970,13 @@ interface HandlePushDeps {
  * prefix path route through here so the defense layers can't diverge.
  */
 const passesInjectGuards = (session: string, deps: HandlePushDeps): boolean => {
+    // Rate bucket first: the pane probe below is a blocking tmux spawnSync,
+    // and the sequencer can flush several held messages back-to-back — an
+    // empty bucket must refuse before paying that probe N times, not after.
+    if (!(deps.rateLimit ?? checkRateLimit)(session)) {
+        log(`! ${session}: rate-limited — drop`);
+        return false;
+    }
     const cmd = (deps.paneCommand ?? paneCurrentCommand)(session);
     if (cmd === null) {
         log(`! ${session}: no such tmux session — drop`);
@@ -1379,10 +1984,6 @@ const passesInjectGuards = (session: string, deps: HandlePushDeps): boolean => {
     }
     if (isShellPane(cmd)) {
         log(`! ${session}: pane is at shell (${cmd}) — refusing (would be RCE)`);
-        return false;
-    }
-    if (!(deps.rateLimit ?? checkRateLimit)(session)) {
-        log(`! ${session}: rate-limited — drop`);
         return false;
     }
     return true;
@@ -1424,6 +2025,7 @@ const tryInject = (session: string, text: string, deps: HandlePushDeps): boolean
     const preview = text.length > 60 ? text.slice(0, 60) + '…' : text;
     log(`${ok ? '→' : '✗'} ${session}: ${preview}`);
     if (ok) {
+        noteStreamInput(session);
         const cwd = (deps.paneCwd ?? defaultPaneCwd)(session);
         if (cwd) writeRemoteMarker(cwd, text);
     }
@@ -1435,6 +2037,7 @@ const tryInject = (session: string, text: string, deps: HandlePushDeps): boolean
 const tryInjectKeys = (session: string, tokens: string[], deps: HandlePushDeps): boolean => {
     if (!passesInjectGuards(session, deps)) return false;
     const ok = (deps.sendKeys ?? injectNamedKeys)(session, tokens);
+    if (ok) noteStreamInput(session);
     log(`${ok ? '⌨' : '✗'} ${session}: [${tokens.join(' ')}]`);
     return ok;
 };
@@ -1920,7 +2523,13 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                 // Live mirror (PoC): agent.stream.start/stop drives a
                 // continuous, diff-gated frame loop; falls through to the
                 // one-shot screen-peek when it isn't a stream-control message.
-                if (!handleStreamControl(m.data as StreamControl, sendEphemeral)) {
+                // agent.command.input types into a streamed pane without the
+                // REST round-trip; it is only accepted while that stream's
+                // lease is live, so it sits behind the same routing chain.
+                if (
+                    !handleCommandInput(m.data as AgentCommandInput, sendEphemeral) &&
+                    !handleStreamControl(m.data as StreamControl, sendEphemeral)
+                ) {
                     const reply = handleScreenRequest(m.data as ScreenRequest);
                     if (reply) sendEphemeral(reply);
                 }
