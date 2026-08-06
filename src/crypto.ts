@@ -116,6 +116,8 @@ const encrypt = async (
   plaintext: string,
   senderPrivateKey: CryptoKey,
   recipientPublicKey: CryptoKey,
+  /** Pre-derived ECDH secret for this pair, when the caller keeps one. */
+  shared?: CryptoKey,
 ): Promise<EncryptedPayload> => {
   const messageKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -124,7 +126,7 @@ const encrypt = async (
     messageKey,
     new TextEncoder().encode(plaintext),
   );
-  const sharedKey = await deriveAesKey(senderPrivateKey, recipientPublicKey);
+  const sharedKey = shared ?? await deriveAesKey(senderPrivateKey, recipientPublicKey);
   const rawMessageKey = await crypto.subtle.exportKey('raw', messageKey);
   const keyIv = crypto.getRandomValues(new Uint8Array(12));
   const encryptedKey = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: keyIv }, sharedKey, rawMessageKey);
@@ -141,8 +143,10 @@ const decrypt = async (
   payload: EncryptedPayload,
   recipientPrivateKey: CryptoKey,
   senderPublicKey: CryptoKey,
+  /** Pre-derived ECDH secret for this pair, when the caller keeps one. */
+  shared?: CryptoKey,
 ): Promise<string> => {
-  const sharedKey = await deriveAesKey(recipientPrivateKey, senderPublicKey);
+  const sharedKey = shared ?? await deriveAesKey(recipientPrivateKey, senderPublicKey);
   const rawMessageKey = await crypto.subtle.decrypt(
     { name: 'AES-GCM', iv: new Uint8Array(fromBase64(payload.keyIv)) },
     sharedKey,
@@ -480,13 +484,32 @@ export const getDevicePublicKey = (): string | null => deviceExportedPublicKey;
  * Encrypt an ephemeral payload (e.g. a stream frame) for one recipient
  * device. Requires initDeviceCrypto() to have completed.
  */
+/**
+ * One imported peer key plus the ECDH secret derived with it. A stream talks to
+ * exactly one subscriber, and the input half binds to that same key, so both
+ * directions reuse one entry for the stream's life — deriving per frame AND per
+ * keystroke was two WebCrypto operations repeating the same answer.
+ */
+let peerCache: { b64: string; key: CryptoKey; shared: CryptoKey } | null = null;
+
+const peerFor = async (
+  raw: string,
+  privateKey: CryptoKey,
+): Promise<{ key: CryptoKey; shared: CryptoKey }> => {
+  if (peerCache?.b64 === raw) return peerCache;
+  const key = await importPublicKey(raw);
+  const shared = await deriveAesKey(privateKey, key);
+  peerCache = { b64: raw, key, shared };
+  return peerCache;
+};
+
 export const encryptEphemeral = async (
   plaintext: string,
   recipientPublicKeyRaw: string,
 ): Promise<EncryptedEphemeralPayload> => {
   if (!deviceKeyPair || !deviceExportedPublicKey) throw new Error('Device crypto not initialized');
-  const recipientKey = await importPublicKey(recipientPublicKeyRaw);
-  const payload = await encrypt(plaintext, deviceKeyPair.privateKey, recipientKey);
+  const peer = await peerFor(recipientPublicKeyRaw, deviceKeyPair.privateKey);
+  const payload = await encrypt(plaintext, deviceKeyPair.privateKey, peer.key, peer.shared);
   return { ...payload, senderPublicKey: deviceExportedPublicKey };
 };
 
@@ -509,6 +532,6 @@ export const decryptEphemeral = async (
   payload: EncryptedEphemeralPayload,
 ): Promise<string> => {
   if (!deviceKeyPair) throw new Error('Device crypto not initialized');
-  const senderKey = await importPublicKey(payload.senderPublicKey);
-  return decrypt(payload, deviceKeyPair.privateKey, senderKey);
+  const peer = await peerFor(payload.senderPublicKey, deviceKeyPair.privateKey);
+  return decrypt(payload, deviceKeyPair.privateKey, peer.key, peer.shared);
 };

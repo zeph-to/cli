@@ -9,7 +9,7 @@
  *
  * - in-order seq delivers immediately (typing latency is the whole point of
  *   this path; nothing is buffered on the happy path)
- * - a gap holds later keys for `holdMs`, then delivers what arrived anyway.
+ * - a gap holds later keys for INPUT_HOLD_MS, then delivers what arrived anyway.
  *   Approximate order beats dropped keys: the relay is at-most-once, so a
  *   never-arriving seq must not wedge everything behind it forever.
  * - a new epoch (sender restart) resets the high-water mark, and the old
@@ -55,7 +55,6 @@ export type SequencedInput = {
 };
 
 export type InputSequencerOptions<T> = {
-    holdMs?: number;
     schedule?: ScheduleFlush;
     /** Called for each HELD message dropped without delivery — an epoch change
      *  or reset() sweeping the buffer. Accept-time drops are reported via the
@@ -81,7 +80,6 @@ export const createInputSequencer = <T extends SequencedInput>(
     deliver: (msg: T) => void,
     opts: InputSequencerOptions<T> = {},
 ): InputSequencer<T> => {
-    const holdMs = opts.holdMs ?? INPUT_HOLD_MS;
     const schedule = opts.schedule ?? defaultSchedule;
 
     let epoch: number | null = null;
@@ -151,7 +149,7 @@ export const createInputSequencer = <T extends SequencedInput>(
         pending.set(msg.seq, msg);
         // One deadline per gap: it dates from when the hole opened, so a
         // steady stream of later keys can't extend the wait indefinitely.
-        if (!cancelFlush) cancelFlush = schedule(flush, holdMs);
+        if (!cancelFlush) cancelFlush = schedule(flush, INPUT_HOLD_MS);
         return 'ok';
     };
 
