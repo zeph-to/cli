@@ -826,6 +826,54 @@ const capturePane = (
     return { content, truncated };
 };
 
+/**
+ * Where the cursor sits, in the coordinates of a captured frame.
+ *
+ * `capture-pane` gives cells and colors but no cursor, so the mirror has never
+ * drawn one — which makes an arrow key indistinguishable from a dropped one.
+ * tmux reports the position separately; `pane_height` is what turns a
+ * pane-relative row into a row of the captured text, since the capture reaches
+ * back into scrollback and the visible pane is only its last `pane_height`
+ * lines.
+ *
+ * Read only for frames that are actually about to be sent — one extra tmux
+ * spawn per SENT frame rather than per tick.
+ */
+const capturePaneCursor = (
+    sessionName: string,
+): { x: number; y: number; height: number } | null => {
+    const r = spawnSync(
+        'tmux',
+        tmuxArgs(['display-message', '-p', '-t', sessionName, '#{cursor_x},#{cursor_y},#{pane_height}']),
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    if (r.status !== 0) return null;
+    const [x, y, height] = (r.stdout ?? '').trim().split(',').map(Number);
+    if (![x, y, height].every((n) => Number.isSafeInteger(n) && n >= 0)) return null;
+    return { x, y, height };
+};
+
+/**
+ * Translate the cursor into an index into the lines the frame carries.
+ *
+ * The visible pane is the tail of the capture, so the cursor's row counts back
+ * from the end — which also makes this correct after the byte cap has cut lines
+ * off the top. A cursor that falls outside what the frame carries returns null
+ * and simply is not drawn.
+ */
+export const cursorLineFor = (
+    content: string,
+    cursor: { x: number; y: number; height: number },
+): { line: number; col: number } | null => {
+    // capture-pane ends the last row with a newline, which split() turns into a
+    // trailing empty element that is not a pane row.
+    const lines = content.split('\n');
+    const rows = lines.length > 0 && lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
+    const line = rows - cursor.height + cursor.y;
+    if (line < 0 || line >= rows) return null;
+    return { line, col: cursor.x };
+};
+
 /** Delays after a key injection at which the pane is re-captured and pushed
  *  to the phone unsolicited. The first frame lands right after most TUI
  *  redraws; the second catches slow animations and is skipped when nothing
@@ -1138,6 +1186,15 @@ export type StreamFramePayload = {
     /** Stream incarnation (stats.startedAt) — lets the receiver reset its
      *  seq high-water mark when the daemon restarts the stream. */
     epoch?: number;
+    /** Where to draw the cursor: a 0-based index into the lines this frame
+     *  carries, and a 0-based CELL column (not a string index — a wide glyph
+     *  spans two cells, which is what the viewer positions by). Absent when the
+     *  cursor is outside the captured region. Deliberately outside the E2EE
+     *  envelope, like sessionName and seq: a coordinate without the text it
+     *  points into says nothing, and keeping it in the clear means the viewer
+     *  can place the cursor before the pane content finishes decrypting. */
+    cursorLine?: number;
+    cursorCol?: number;
     /** Plaintext pane content — only on unencrypted streams. */
     content?: string;
     /** E2EE envelope — replaces `content` on encrypted streams. */
@@ -1215,12 +1272,14 @@ export const buildStreamFrame = async (
     captured: { content: string; truncated: boolean },
     sessionName: string,
     subscriberPublicKey?: string,
+    cursor?: { line: number; col: number } | null,
 ): Promise<StreamFramePayload | null> => {
     const base = {
         subtype: 'agent.stream.frame' as const,
         sessionName,
         capturedAt: new Date().toISOString(),
         truncated: captured.truncated,
+        ...(cursor ? { cursorLine: cursor.line, cursorCol: cursor.col } : {}),
     };
     if (!subscriberPublicKey) return { ...base, content: captured.content };
     try {
@@ -1379,7 +1438,11 @@ export const handleStreamControl = (
         // guaranteed under load; the receiver drops any seq it has already
         // painted past.
         const seq = ++wireSeq;
-        void buildStreamFrame(captured, sessionName, subscriberPublicKey).then((frame) => {
+        // Only for frames that go out: one tmux spawn per sent frame, not per
+        // tick. A pane that refuses to report simply ships without a cursor.
+        const cursorAt = capturePaneCursor(sessionName);
+        const cursor = cursorAt ? cursorLineFor(captured.content, cursorAt) : null;
+        void buildStreamFrame(captured, sessionName, subscriberPublicKey, cursor).then((frame) => {
             // Stream stopped or restarted while this frame was in flight —
             // `stats` is unique per start, so it doubles as the identity
             // token. Don't send into a dead/replaced stream or skew its stats.

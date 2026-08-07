@@ -332,3 +332,39 @@ describe('capture chain — cadence around a keystroke', () => {
         expect(tickTimes()).toHaveLength(afterStop);
     });
 });
+
+describe('cursorLineFor — placing the cursor in a captured frame', () => {
+    // The capture reaches into scrollback, so the visible pane is its TAIL —
+    // the cursor's row has to count back from the end, not forward from 0.
+    const capture = (rows: number) => `${Array.from({ length: rows }, (_, i) => `row${i}`).join('\n')}\n`;
+
+    it('counts the pane back from the end of the capture', async () => {
+        const { cursorLineFor } = await import('./listener.js');
+        // 10 captured rows, a 4-row pane: pane row 0 is captured row 6.
+        expect(cursorLineFor(capture(10), { x: 3, y: 0, height: 4 })).toEqual({ line: 6, col: 3 });
+        expect(cursorLineFor(capture(10), { x: 0, y: 3, height: 4 })).toEqual({ line: 9, col: 0 });
+    });
+
+    it('places the cursor correctly when the capture is only the visible pane', async () => {
+        const { cursorLineFor } = await import('./listener.js');
+        expect(cursorLineFor(capture(4), { x: 7, y: 2, height: 4 })).toEqual({ line: 2, col: 7 });
+    });
+
+    it('reports nothing when the byte cap cut the cursor off the top', async () => {
+        const { cursorLineFor } = await import('./listener.js');
+        // Two rows survived a 40-row pane — the cursor near its top is gone.
+        expect(cursorLineFor(capture(2), { x: 0, y: 1, height: 40 })).toBeNull();
+    });
+
+    it('reports nothing for a row past the captured text', async () => {
+        const { cursorLineFor } = await import('./listener.js');
+        expect(cursorLineFor(capture(4), { x: 0, y: 9, height: 4 })).toBeNull();
+    });
+
+    it('does not count the trailing newline as a pane row', async () => {
+        const { cursorLineFor } = await import('./listener.js');
+        // Same rows, with and without the trailing newline capture-pane emits.
+        expect(cursorLineFor('a\nb\nc\n', { x: 1, y: 2, height: 3 })).toEqual({ line: 2, col: 1 });
+        expect(cursorLineFor('a\nb\nc', { x: 1, y: 2, height: 3 })).toEqual({ line: 2, col: 1 });
+    });
+});
