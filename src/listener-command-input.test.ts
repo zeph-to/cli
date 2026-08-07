@@ -12,6 +12,9 @@ const SESSIONS = ['zeph-a', 'zeph-shell', 'zeph-rate', 'zeph-cost'];
 /** Every tmux call the code made, in order — the injection evidence. */
 let tmuxCalls: string[][] = [];
 
+let bufferFails = false;
+let pasteFails = false;
+
 const fakeTmux = (args: readonly string[]) => {
     // Drop the optional `-S <socket>` prefix tmuxArgs() prepends.
     const a = args[0] === '-S' ? args.slice(2) : args;
@@ -29,6 +32,11 @@ const fakeTmux = (args: readonly string[]) => {
     }
     if (a[0] === 'capture-pane') return { status: 0, stdout: 'idle pane\n', stderr: '' };
     if (a[0] === 'send-keys') return { status: 0, stdout: '', stderr: '' };
+    // Text is delivered as a paste, not as typing (see pasteText). `bufferFails`
+    // / `pasteFails` let a test drive the fallback back onto `send-keys -l`.
+    if (a[0] === 'set-buffer') return { status: bufferFails ? 1 : 0, stdout: '', stderr: '' };
+    if (a[0] === 'paste-buffer') return { status: pasteFails ? 1 : 0, stdout: '', stderr: '' };
+    if (a[0] === 'delete-buffer') return { status: 0, stdout: '', stderr: '' };
     return { status: 1, stdout: '', stderr: '' };
 };
 
@@ -72,6 +80,8 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         vi.spyOn(console, 'log').mockImplementation(() => {});
         tmuxCalls = [];
         sent = [];
+        bufferFails = false;
+        pasteFails = false;
     });
     afterEach(() => {
         stopAllStreams();
@@ -100,6 +110,9 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
     });
 
     const injections = () => tmuxCalls.filter((c) => c[0] === 'send-keys').map((c) => c.slice(1).join(' '));
+    /** Every tmux call the delivery made, in order — the paste path spans three. */
+    const tmuxInvocations = () =>
+        tmuxCalls.filter((c) => ['send-keys', 'set-buffer', 'paste-buffer', 'delete-buffer'].includes(c[0])).map((c) => c.join(' '));
     const rejections = () => sent.filter((f) => f.error === 'input_rejected');
 
     it('injects whitelisted keys into a session with a live stream', () => {
@@ -109,10 +122,38 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         expect(rejections()).toEqual([]);
     });
 
-    it('injects literal text with -l so tmux cannot read it as commands', () => {
+    it('delivers text as a paste, then Enter — never as a burst of typing', () => {
+        // A TUI that re-renders per character cannot keep up with a whole
+        // Hangul message arriving as keystrokes: characters go missing and the
+        // wrapped line is painted twice. `-p` brackets the paste only when the
+        // application asked for it, so this is safe against one that did not.
         openStream('zeph-a');
         handleCommandInput(input({ keys: undefined, body: 'hello; rm -rf /' }), send);
-        expect(injections()).toEqual(['-l -t zeph-a hello; rm -rf /', '-t zeph-a Enter']);
+        expect(tmuxInvocations()).toEqual([
+            // `--` so a message beginning with a dash stays data, and the
+            // buffer contents are data to paste-buffer — same property `-l`
+            // had: no escape inside a message can drive another tmux command.
+            'set-buffer -b zeph-inject -- hello; rm -rf /',
+            'paste-buffer -d -p -b zeph-inject -t zeph-a',
+            'send-keys -t zeph-a Enter',
+        ]);
+    });
+
+    it('falls back to typing when the buffer cannot be set', () => {
+        // Delivered imperfectly beats not delivered.
+        bufferFails = true;
+        openStream('zeph-a');
+        handleCommandInput(input({ keys: undefined, body: 'hello' }), send);
+        expect(injections()).toEqual(['-l -t zeph-a hello', '-t zeph-a Enter']);
+    });
+
+    it('drops the buffer it filled when the paste fails, then falls back', () => {
+        // `-d` never ran, so the message would otherwise sit in a tmux buffer.
+        pasteFails = true;
+        openStream('zeph-a');
+        handleCommandInput(input({ keys: undefined, body: 'hello' }), send);
+        expect(tmuxInvocations()).toContain('delete-buffer -b zeph-inject');
+        expect(injections()).toEqual(['-l -t zeph-a hello', '-t zeph-a Enter']);
     });
 
     it('refuses input for a session with no live stream', () => {
@@ -222,7 +263,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         expect(injections()).toEqual([]);
         expect(rejections()).toHaveLength(1);
         handleCommandInput(input({ seq: 2, keys: undefined, body: 'x'.repeat(MAX_INPUT_BODY_CHARS) }), send);
-        expect(injections()).toHaveLength(2); // text + Enter
+        expect(tmuxInvocations()).toHaveLength(3); // set-buffer + paste-buffer + Enter
     });
 
     it('lets a burst of key taps through, and still caps command submits at 30', () => {
@@ -531,7 +572,11 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
             handleCommandInput(input({ keys: undefined, encrypted: await seal({ body: 'hello; rm -rf /' }) }), send);
             await pendingInputDecrypts();
 
-            expect(injections()).toEqual(['-l -t zeph-a hello; rm -rf /', '-t zeph-a Enter']);
+            expect(tmuxInvocations()).toEqual([
+                'set-buffer -b zeph-inject -- hello; rm -rf /',
+                'paste-buffer -d -p -b zeph-inject -t zeph-a',
+                'send-keys -t zeph-a Enter',
+            ]);
         });
 
         it('never puts the decrypted payload back on the wire', async () => {

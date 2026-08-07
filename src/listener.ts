@@ -200,14 +200,55 @@ const isShellPane = (command: string | null): boolean => {
     return SHELL_COMMANDS.has(command);
 };
 
+/** Where a message is parked between `set-buffer` and `paste-buffer`. Named,
+ *  so the user's own paste stack is never pushed onto, and `-d` drops it
+ *  again the moment it has been delivered. */
+const INJECT_BUFFER = 'zeph-inject';
+
+const sendLiteral = (session: string, text: string): boolean =>
+    spawnSync('tmux', tmuxArgs(['send-keys', '-l', '-t', session, text]), { stdio: ['ignore', 'ignore', 'pipe'] })
+        .status === 0;
+
 /**
- * Inject text into a tmux session: literal text via `-l`, then a
- * separate `Enter`. `-l` takes the text as data, so tmux escape
- * sequences inside the message can't drive other tmux commands.
+ * Put the message in the pane as a PASTE rather than as typing.
+ *
+ * `send-keys -l` hands the whole string to the application as if it had been
+ * typed at once, and a TUI that re-renders per character has to keep up with a
+ * burst it never sees from a human. With Hangul — three bytes and two columns
+ * per character — it does not: characters go missing and the wrapped line is
+ * painted twice. A phone message is a paste, so send it as one.
+ *
+ * `paste-buffer -p` brackets it only when the application has actually asked
+ * for bracketed paste (DECSET 2004); against one that has not, tmux sends the
+ * plain text and nothing changes. That gating is why this is safe to do
+ * unconditionally — the markers can never leak into an app that would show
+ * them as literal `[200~`.
+ *
+ * Falls back to the old path if either tmux call fails, because a message
+ * delivered imperfectly still beats one not delivered.
+ */
+const pasteText = (session: string, text: string): boolean => {
+    // `--` so a message that begins with a dash is data, not an option. The
+    // buffer contents are data to paste-buffer as well, which preserves the
+    // property `send-keys -l` had: no escape sequence inside a message can
+    // drive another tmux command.
+    const set = spawnSync('tmux', tmuxArgs(['set-buffer', '-b', INJECT_BUFFER, '--', text]), { stdio: ['ignore', 'ignore', 'pipe'] });
+    if (set.status !== 0) return sendLiteral(session, text);
+    const paste = spawnSync('tmux', tmuxArgs(['paste-buffer', '-d', '-p', '-b', INJECT_BUFFER, '-t', session]), { stdio: ['ignore', 'ignore', 'pipe'] });
+    if (paste.status === 0) return true;
+    // `-d` never ran, so the buffer is still there holding the message.
+    spawnSync('tmux', tmuxArgs(['delete-buffer', '-b', INJECT_BUFFER]), { stdio: ['ignore', 'ignore', 'pipe'] });
+    return sendLiteral(session, text);
+};
+
+/**
+ * Inject text into a tmux session: the message as a paste, then a separate
+ * `Enter` to submit it. The two stay separate because a bracketed paste is
+ * text and only text — newlines inside it must not submit early, and the
+ * submit has to be a real key press.
  */
 const injectKeys = (session: string, text: string): boolean => {
-    const a = spawnSync('tmux', tmuxArgs(['send-keys', '-l', '-t', session, text]), { stdio: ['ignore', 'ignore', 'pipe'] });
-    if (a.status !== 0) return false;
+    if (!pasteText(session, text)) return false;
     const b = spawnSync('tmux', tmuxArgs(['send-keys', '-t', session, 'Enter']), { stdio: ['ignore', 'ignore', 'pipe'] });
     return b.status === 0;
 };
