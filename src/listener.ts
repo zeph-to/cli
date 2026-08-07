@@ -129,10 +129,19 @@ export const sessionsReportDue = (
     fingerprint !== lastSentFingerprint ||
     nowMs - lastSentAtMs >= SESSION_REPORT_HEARTBEAT_MS;
 
-// Per-session token bucket — caps a runaway/compromised sender. 30/min
-// is generous for human-driven phone use, tight enough to block flooding.
-const RATE_LIMIT_TOKENS = 30;
+// Per-session token bucket — caps a runaway/compromised sender.
+//
+// Weighted rather than flat, because the two things that pass through it are
+// not the same size. A command submit is one whole instruction to the agent;
+// 30 a minute has always been the ceiling for that, and it stays exactly that
+// (120 / SUBMIT_COST). A named key is a keystroke — arrowing through a menu or
+// holding Backspace is ordinary human speed, and charging it as if it were an
+// instruction made the phone's key row refuse a normal burst of taps after a
+// couple of seconds.
+const RATE_LIMIT_TOKENS = 120;
 const RATE_LIMIT_WINDOW_MS = 60_000;
+/** What one command submit costs, keeping its ceiling at the old 30/min. */
+const SUBMIT_COST = 4;
 
 // Shells are refused: a shell prompt + send-keys = arbitrary command exec.
 const SHELL_COMMANDS = new Set(['bash', 'zsh', 'fish', 'sh', 'dash', 'ksh', 'tcsh', 'csh', 'pwsh']);
@@ -154,7 +163,11 @@ const pruneStaleBuckets = (now: number): void => {
     }
 };
 
-export const checkRateLimit = (session: string, now: number = Date.now()): boolean => {
+export const checkRateLimit = (
+    session: string,
+    now: number = Date.now(),
+    cost: number = 1,
+): boolean => {
     pruneStaleBuckets(now);
     const b = buckets.get(session) ?? { tokens: RATE_LIMIT_TOKENS, lastRefillAt: now };
     const elapsed = Math.max(0, now - b.lastRefillAt);
@@ -164,11 +177,11 @@ export const checkRateLimit = (session: string, now: number = Date.now()): boole
         RATE_LIMIT_TOKENS,
         b.tokens + (elapsed / RATE_LIMIT_WINDOW_MS) * RATE_LIMIT_TOKENS,
     );
-    if (refilled < 1) {
+    if (refilled < cost) {
         buckets.set(session, { tokens: refilled, lastRefillAt: now });
         return false;
     }
-    buckets.set(session, { tokens: refilled - 1, lastRefillAt: now });
+    buckets.set(session, { tokens: refilled - cost, lastRefillAt: now });
     return true;
 };
 
@@ -187,14 +200,55 @@ const isShellPane = (command: string | null): boolean => {
     return SHELL_COMMANDS.has(command);
 };
 
+/** Where a message is parked between `set-buffer` and `paste-buffer`. Named,
+ *  so the user's own paste stack is never pushed onto, and `-d` drops it
+ *  again the moment it has been delivered. */
+const INJECT_BUFFER = 'zeph-inject';
+
+const sendLiteral = (session: string, text: string): boolean =>
+    spawnSync('tmux', tmuxArgs(['send-keys', '-l', '-t', session, text]), { stdio: ['ignore', 'ignore', 'pipe'] })
+        .status === 0;
+
 /**
- * Inject text into a tmux session: literal text via `-l`, then a
- * separate `Enter`. `-l` takes the text as data, so tmux escape
- * sequences inside the message can't drive other tmux commands.
+ * Put the message in the pane as a PASTE rather than as typing.
+ *
+ * `send-keys -l` hands the whole string to the application as if it had been
+ * typed at once, and a TUI that re-renders per character has to keep up with a
+ * burst it never sees from a human. With Hangul — three bytes and two columns
+ * per character — it does not: characters go missing and the wrapped line is
+ * painted twice. A phone message is a paste, so send it as one.
+ *
+ * `paste-buffer -p` brackets it only when the application has actually asked
+ * for bracketed paste (DECSET 2004); against one that has not, tmux sends the
+ * plain text and nothing changes. That gating is why this is safe to do
+ * unconditionally — the markers can never leak into an app that would show
+ * them as literal `[200~`.
+ *
+ * Falls back to the old path if either tmux call fails, because a message
+ * delivered imperfectly still beats one not delivered.
+ */
+const pasteText = (session: string, text: string): boolean => {
+    // `--` so a message that begins with a dash is data, not an option. The
+    // buffer contents are data to paste-buffer as well, which preserves the
+    // property `send-keys -l` had: no escape sequence inside a message can
+    // drive another tmux command.
+    const set = spawnSync('tmux', tmuxArgs(['set-buffer', '-b', INJECT_BUFFER, '--', text]), { stdio: ['ignore', 'ignore', 'pipe'] });
+    if (set.status !== 0) return sendLiteral(session, text);
+    const paste = spawnSync('tmux', tmuxArgs(['paste-buffer', '-d', '-p', '-b', INJECT_BUFFER, '-t', session]), { stdio: ['ignore', 'ignore', 'pipe'] });
+    if (paste.status === 0) return true;
+    // `-d` never ran, so the buffer is still there holding the message.
+    spawnSync('tmux', tmuxArgs(['delete-buffer', '-b', INJECT_BUFFER]), { stdio: ['ignore', 'ignore', 'pipe'] });
+    return sendLiteral(session, text);
+};
+
+/**
+ * Inject text into a tmux session: the message as a paste, then a separate
+ * `Enter` to submit it. The two stay separate because a bracketed paste is
+ * text and only text — newlines inside it must not submit early, and the
+ * submit has to be a real key press.
  */
 const injectKeys = (session: string, text: string): boolean => {
-    const a = spawnSync('tmux', tmuxArgs(['send-keys', '-l', '-t', session, text]), { stdio: ['ignore', 'ignore', 'pipe'] });
-    if (a.status !== 0) return false;
+    if (!pasteText(session, text)) return false;
     const b = spawnSync('tmux', tmuxArgs(['send-keys', '-t', session, 'Enter']), { stdio: ['ignore', 'ignore', 'pipe'] });
     return b.status === 0;
 };
@@ -826,6 +880,54 @@ const capturePane = (
     return { content, truncated };
 };
 
+/**
+ * Where the cursor sits, in the coordinates of a captured frame.
+ *
+ * `capture-pane` gives cells and colors but no cursor, so the mirror has never
+ * drawn one — which makes an arrow key indistinguishable from a dropped one.
+ * tmux reports the position separately; `pane_height` is what turns a
+ * pane-relative row into a row of the captured text, since the capture reaches
+ * back into scrollback and the visible pane is only its last `pane_height`
+ * lines.
+ *
+ * Read only for frames that are actually about to be sent — one extra tmux
+ * spawn per SENT frame rather than per tick.
+ */
+const capturePaneCursor = (
+    sessionName: string,
+): { x: number; y: number; height: number } | null => {
+    const r = spawnSync(
+        'tmux',
+        tmuxArgs(['display-message', '-p', '-t', sessionName, '#{cursor_x},#{cursor_y},#{pane_height}']),
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    if (r.status !== 0) return null;
+    const [x, y, height] = (r.stdout ?? '').trim().split(',').map(Number);
+    if (![x, y, height].every((n) => Number.isSafeInteger(n) && n >= 0)) return null;
+    return { x, y, height };
+};
+
+/**
+ * Translate the cursor into an index into the lines the frame carries.
+ *
+ * The visible pane is the tail of the capture, so the cursor's row counts back
+ * from the end — which also makes this correct after the byte cap has cut lines
+ * off the top. A cursor that falls outside what the frame carries returns null
+ * and simply is not drawn.
+ */
+export const cursorLineFor = (
+    content: string,
+    cursor: { x: number; y: number; height: number },
+): { line: number; col: number } | null => {
+    // capture-pane ends the last row with a newline, which split() turns into a
+    // trailing empty element that is not a pane row.
+    const lines = content.split('\n');
+    const rows = lines.length > 0 && lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
+    const line = rows - cursor.height + cursor.y;
+    if (line < 0 || line >= rows) return null;
+    return { line, col: cursor.x };
+};
+
 /** Delays after a key injection at which the pane is re-captured and pushed
  *  to the phone unsolicited. The first frame lands right after most TUI
  *  redraws; the second catches slow animations and is skipped when nothing
@@ -1138,6 +1240,15 @@ export type StreamFramePayload = {
     /** Stream incarnation (stats.startedAt) — lets the receiver reset its
      *  seq high-water mark when the daemon restarts the stream. */
     epoch?: number;
+    /** Where to draw the cursor: a 0-based index into the lines this frame
+     *  carries, and a 0-based CELL column (not a string index — a wide glyph
+     *  spans two cells, which is what the viewer positions by). Absent when the
+     *  cursor is outside the captured region. Deliberately outside the E2EE
+     *  envelope, like sessionName and seq: a coordinate without the text it
+     *  points into says nothing, and keeping it in the clear means the viewer
+     *  can place the cursor before the pane content finishes decrypting. */
+    cursorLine?: number;
+    cursorCol?: number;
     /** Plaintext pane content — only on unencrypted streams. */
     content?: string;
     /** E2EE envelope — replaces `content` on encrypted streams. */
@@ -1215,12 +1326,14 @@ export const buildStreamFrame = async (
     captured: { content: string; truncated: boolean },
     sessionName: string,
     subscriberPublicKey?: string,
+    cursor?: { line: number; col: number } | null,
 ): Promise<StreamFramePayload | null> => {
     const base = {
         subtype: 'agent.stream.frame' as const,
         sessionName,
         capturedAt: new Date().toISOString(),
         truncated: captured.truncated,
+        ...(cursor ? { cursorLine: cursor.line, cursorCol: cursor.col } : {}),
     };
     if (!subscriberPublicKey) return { ...base, content: captured.content };
     try {
@@ -1296,6 +1409,12 @@ export const handleStreamControl = (
         return true;
     }
     let lastContent: string | null = null;
+    // The cursor's last reported place, as `line,col`. Part of the diff-gate
+    // because moving the cursor is a change the CAPTURE cannot show: an arrow
+    // key inside a prompt leaves every character where it was, so gating on the
+    // text alone means the mirror's cursor never moves — which is precisely the
+    // feedback the cursor exists to give.
+    let lastCursor: string | null = null;
     const stats: StreamStats = {
         startedAt: Date.now(),
         frames: 0,
@@ -1355,7 +1474,18 @@ export const handleStreamControl = (
             return true;
         }
         const captured = capturePane(sessionName, true, STREAM_CAPTURE_LINES);
-        if (!captured || captured.content === lastContent) {
+        if (!captured) {
+            stats.skipped++;
+            return true;
+        }
+        // Read per tick, not per sent frame: the gate below has to know whether
+        // the cursor moved, and by the time a frame is being built the tick
+        // that would have carried the move has already been skipped. One extra
+        // tmux spawn on ticks that go on to send nothing is what that costs.
+        const cursorAt = capturePaneCursor(sessionName);
+        const cursor = cursorAt ? cursorLineFor(captured.content, cursorAt) : null;
+        const cursorKey = cursor ? `${cursor.line},${cursor.col}` : '';
+        if (captured.content === lastContent && cursorKey === lastCursor) {
             stats.skipped++;
             return true; // diff-gate
         }
@@ -1374,12 +1504,13 @@ export const handleStreamControl = (
         // fps by one frame per episode in the R2 numbers.
         const inBurst = armedDelay === BURST_INTERVAL_MS;
         lastContent = captured.content;
+        lastCursor = cursorKey;
         // Stamp the sequence in CAPTURE order, synchronously — frame assembly
         // is async (encryption) and fire-and-forget, so resolve order is not
         // guaranteed under load; the receiver drops any seq it has already
         // painted past.
         const seq = ++wireSeq;
-        void buildStreamFrame(captured, sessionName, subscriberPublicKey).then((frame) => {
+        void buildStreamFrame(captured, sessionName, subscriberPublicKey, cursor).then((frame) => {
             // Stream stopped or restarted while this frame was in flight —
             // `stats` is unique per start, so it doubles as the identity
             // token. Don't send into a dead/replaced stream or skew its stats.
@@ -1390,6 +1521,7 @@ export const handleStreamControl = (
                 // subscriber key) never recovers: fail closed after a few
                 // strikes instead of retrying every tick for 5 minutes.
                 lastContent = null;
+                lastCursor = null;
                 // Init still in flight (or failed — its own path fail-closes):
                 // a not-yet-ready key is not a malformed key, don't strike.
                 if (getDevicePublicKey() === null) return;
@@ -1970,7 +2102,7 @@ interface HandlePushDeps {
     paneCommand?: (session: string) => string | null;
     inject?: (session: string, text: string) => boolean;
     sendKeys?: (session: string, tokens: string[]) => boolean;
-    rateLimit?: (session: string) => boolean;
+    rateLimit?: (session: string, now?: number, cost?: number) => boolean;
     now?: () => number;
     /** Injectable for tests; defaults to the REST-backed downloader. */
     downloadAttachments?: (pushId: string, files: PushFileAttachment[]) => Promise<string[]>;
@@ -1986,11 +2118,11 @@ interface HandlePushDeps {
  * the structured `agent.command` push type and the legacy `@<session>`
  * prefix path route through here so the defense layers can't diverge.
  */
-const passesInjectGuards = (session: string, deps: HandlePushDeps): boolean => {
+const passesInjectGuards = (session: string, deps: HandlePushDeps, cost = 1): boolean => {
     // Rate bucket first: the pane probe below is a blocking tmux spawnSync,
     // and the sequencer can flush several held messages back-to-back — an
     // empty bucket must refuse before paying that probe N times, not after.
-    if (!(deps.rateLimit ?? checkRateLimit)(session)) {
+    if (!(deps.rateLimit ?? checkRateLimit)(session, Date.now(), cost)) {
         log(`! ${session}: rate-limited — drop`);
         return false;
     }
@@ -2037,7 +2169,7 @@ const tryInject = (session: string, text: string, deps: HandlePushDeps): boolean
         log(`! ${session}: empty text — drop`);
         return false;
     }
-    if (!passesInjectGuards(session, deps)) return false;
+    if (!passesInjectGuards(session, deps, SUBMIT_COST)) return false;
     const ok = (deps.inject ?? injectKeys)(session, text);
     const preview = text.length > 60 ? text.slice(0, 60) + '…' : text;
     log(`${ok ? '→' : '✗'} ${session}: ${preview}`);

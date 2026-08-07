@@ -40,31 +40,43 @@ describe('checkRateLimit', () => {
     it('allows up to the bucket size, then drops', () => {
         const s = `s-${Date.now()}-${Math.random()}`;
         const now = 1_000_000;
-        // First 30 succeed
-        for (let i = 0; i < 30; i++) expect(checkRateLimit(s, now)).toBe(true);
-        // 31st without time advancing is dropped
+        // 120 keystrokes' worth: the bucket is sized for tapping, not for
+        // instructions — a submit costs four of these.
+        for (let i = 0; i < 120; i++) expect(checkRateLimit(s, now)).toBe(true);
         expect(checkRateLimit(s, now)).toBe(false);
+    });
+
+    it('charges an expensive action more, and refuses it while a cheap one still fits', () => {
+        // Weighting is what keeps the command ceiling at its old 30/min while
+        // the key row gets room to be tapped.
+        const s = `s-${Date.now()}-${Math.random()}`;
+        const now = 1_000_000;
+        for (let i = 0; i < 30; i++) expect(checkRateLimit(s, now, 4)).toBe(true);
+        expect(checkRateLimit(s, now, 4)).toBe(false);
+        // Empty for submits is empty for everything — the two share one budget
+        // on purpose, so a flood of one cannot be laundered through the other.
+        expect(checkRateLimit(s, now, 1)).toBe(false);
     });
 
     it('refills proportionally over the window', () => {
         const s = `s-${Date.now()}-${Math.random()}`;
         const t0 = 1_000_000;
         // Drain the bucket
-        for (let i = 0; i < 30; i++) checkRateLimit(s, t0);
+        for (let i = 0; i < 120; i++) checkRateLimit(s, t0);
         expect(checkRateLimit(s, t0)).toBe(false);
         // Half a window later → ~half the tokens back → many succeed before drop
         const t1 = t0 + 30_000;
         let succeeded = 0;
-        for (let i = 0; i < 30; i++) if (checkRateLimit(s, t1)) succeeded++;
-        expect(succeeded).toBeGreaterThanOrEqual(14);
-        expect(succeeded).toBeLessThanOrEqual(16);
+        for (let i = 0; i < 120; i++) if (checkRateLimit(s, t1)) succeeded++;
+        expect(succeeded).toBeGreaterThanOrEqual(59);
+        expect(succeeded).toBeLessThanOrEqual(61);
     });
 
     it('tracks buckets per-session independently', () => {
         const a = `a-${Date.now()}-${Math.random()}`;
         const b = `b-${Date.now()}-${Math.random()}`;
         const now = 1_000_000;
-        for (let i = 0; i < 30; i++) checkRateLimit(a, now);
+        for (let i = 0; i < 120; i++) checkRateLimit(a, now);
         expect(checkRateLimit(a, now)).toBe(false);
         // Session b is untouched
         expect(checkRateLimit(b, now)).toBe(true);
