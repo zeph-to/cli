@@ -1355,6 +1355,12 @@ export const handleStreamControl = (
         return true;
     }
     let lastContent: string | null = null;
+    // The cursor's last reported place, as `line,col`. Part of the diff-gate
+    // because moving the cursor is a change the CAPTURE cannot show: an arrow
+    // key inside a prompt leaves every character where it was, so gating on the
+    // text alone means the mirror's cursor never moves — which is precisely the
+    // feedback the cursor exists to give.
+    let lastCursor: string | null = null;
     const stats: StreamStats = {
         startedAt: Date.now(),
         frames: 0,
@@ -1414,7 +1420,18 @@ export const handleStreamControl = (
             return true;
         }
         const captured = capturePane(sessionName, true, STREAM_CAPTURE_LINES);
-        if (!captured || captured.content === lastContent) {
+        if (!captured) {
+            stats.skipped++;
+            return true;
+        }
+        // Read per tick, not per sent frame: the gate below has to know whether
+        // the cursor moved, and by the time a frame is being built the tick
+        // that would have carried the move has already been skipped. One extra
+        // tmux spawn on ticks that go on to send nothing is what that costs.
+        const cursorAt = capturePaneCursor(sessionName);
+        const cursor = cursorAt ? cursorLineFor(captured.content, cursorAt) : null;
+        const cursorKey = cursor ? `${cursor.line},${cursor.col}` : '';
+        if (captured.content === lastContent && cursorKey === lastCursor) {
             stats.skipped++;
             return true; // diff-gate
         }
@@ -1433,15 +1450,12 @@ export const handleStreamControl = (
         // fps by one frame per episode in the R2 numbers.
         const inBurst = armedDelay === BURST_INTERVAL_MS;
         lastContent = captured.content;
+        lastCursor = cursorKey;
         // Stamp the sequence in CAPTURE order, synchronously — frame assembly
         // is async (encryption) and fire-and-forget, so resolve order is not
         // guaranteed under load; the receiver drops any seq it has already
         // painted past.
         const seq = ++wireSeq;
-        // Only for frames that go out: one tmux spawn per sent frame, not per
-        // tick. A pane that refuses to report simply ships without a cursor.
-        const cursorAt = capturePaneCursor(sessionName);
-        const cursor = cursorAt ? cursorLineFor(captured.content, cursorAt) : null;
         void buildStreamFrame(captured, sessionName, subscriberPublicKey, cursor).then((frame) => {
             // Stream stopped or restarted while this frame was in flight —
             // `stats` is unique per start, so it doubles as the identity
@@ -1453,6 +1467,7 @@ export const handleStreamControl = (
                 // subscriber key) never recovers: fail closed after a few
                 // strikes instead of retrying every tick for 5 minutes.
                 lastContent = null;
+                lastCursor = null;
                 // Init still in flight (or failed — its own path fail-closes):
                 // a not-yet-ready key is not a malformed key, don't strike.
                 if (getDevicePublicKey() === null) return;

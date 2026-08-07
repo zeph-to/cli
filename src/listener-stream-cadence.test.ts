@@ -11,6 +11,11 @@ const FIELD_SEP = '␟';
 const SESSIONS = ['zeph-a', 'zeph-b'];
 
 let captureCount = 0;
+// Pinning these makes a pane that holds still — which is the only way to see
+// the cursor half of the diff-gate, since a changing capture would send frames
+// no matter what the cursor did.
+let paneText: string | null = null;
+let cursorProbe = '';
 
 const fakeTmux = (args: readonly string[]) => {
     // Drop the optional `-S <socket>` prefix tmuxArgs() prepends.
@@ -21,9 +26,17 @@ const fakeTmux = (args: readonly string[]) => {
     }
     if (a[0] === 'display-message') {
         if (a[4] === '#{pane_current_command}') return { status: 0, stdout: 'node', stderr: '' };
+        // Unset by default, which fails to parse — the same "pane reports no
+        // cursor" path every other test in this file runs on.
+        if (a[4] === '#{cursor_x},#{cursor_y},#{pane_height}') {
+            return { status: 0, stdout: cursorProbe, stderr: '' };
+        }
         return { status: 0, stdout: ['node', 'claude', '/tmp/proj', '1234'].join(FIELD_SEP), stderr: '' };
     }
-    if (a[0] === 'capture-pane') return { status: 0, stdout: `pane ${++captureCount}\n`, stderr: '' };
+    if (a[0] === 'capture-pane') {
+        captureCount++;
+        return { status: 0, stdout: paneText ?? `pane ${captureCount}\n`, stderr: '' };
+    }
     if (a[0] === 'send-keys') return { status: 0, stdout: '', stderr: '' };
     return { status: 1, stdout: '', stderr: '' };
 };
@@ -124,6 +137,8 @@ describe('capture chain — cadence around a keystroke', () => {
         vi.useFakeTimers();
         vi.spyOn(console, 'log').mockImplementation(() => {});
         captureCount = 0;
+        paneText = null;
+        cursorProbe = '';
         sent = [];
     });
     afterEach(() => {
@@ -154,6 +169,34 @@ describe('capture chain — cadence around a keystroke', () => {
             { subtype: 'agent.command.input', targetDeviceId: device, sessionName, keys: ['down'], seq, epoch: 1 },
             send,
         );
+
+    it('sends a frame when only the cursor moved', async () => {
+        // An arrow key inside a prompt moves the cursor and leaves every
+        // character where it was, so a capture-only diff-gate suppresses the
+        // tick — and the mirror's cursor sits still while the real one moves,
+        // which is exactly the feedback it exists to give.
+        paneText = 'a steady pane\n';
+        cursorProbe = '0,0,1';
+        openStream('zeph-a');
+        await vi.advanceTimersByTimeAsync(STREAM_INTERVAL_MS);
+        expect(tickTimes()).toHaveLength(1);
+        expect(sent.at(-1)).toMatchObject({ cursorLine: 0, cursorCol: 0 });
+
+        cursorProbe = '5,0,1';
+        await vi.advanceTimersByTimeAsync(STREAM_INTERVAL_MS);
+        expect(tickTimes()).toHaveLength(2);
+        expect(sent.at(-1)).toMatchObject({ cursorLine: 0, cursorCol: 5 });
+    });
+
+    it('still says nothing when neither the pane nor the cursor moved', async () => {
+        // The gate is what keeps an idle pane off the wire; widening it must
+        // not turn every tick into a frame.
+        paneText = 'a steady pane\n';
+        cursorProbe = '2,0,1';
+        openStream('zeph-a');
+        await vi.advanceTimersByTimeAsync(STREAM_INTERVAL_MS * 4);
+        expect(tickTimes()).toHaveLength(1);
+    });
 
     it('captures at the idle cadence until something is typed', async () => {
         openStream('zeph-a');
