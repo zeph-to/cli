@@ -59,6 +59,13 @@ describe('validateManifest', () => {
         ['bad rule state', { ...VALID_MANIFEST, agents: { claude: [{ id: 'x', state: 'busy', priority: 1 }] } }],
         ['rule without id', { ...VALID_MANIFEST, agents: { claude: [{ state: 'idle', priority: 1 }] } }],
         ['tailLines out of range', { ...VALID_MANIFEST, agents: { claude: [{ id: 'x', state: 'idle', priority: 1, tailLines: 999 }] } }],
+        // The manifest is fetched from the server, so its numbers are as
+        // attacker-shaped as any other wire field: a fractional priority makes
+        // rule ordering depend on values no author can reason about, and 1e21
+        // outranks every rule ever written including the kill-switch.
+        ['fractional priority', { ...VALID_MANIFEST, agents: { claude: [{ id: 'x', state: 'idle', priority: 1.5 }] } }],
+        ['priority past the safe-integer range', { ...VALID_MANIFEST, agents: { claude: [{ id: 'x', state: 'idle', priority: 1e21 }] } }],
+        ['fractional tailLines', { ...VALID_MANIFEST, agents: { claude: [{ id: 'x', state: 'idle', priority: 1, tailLines: 10.5 }] } }],
         ['non-object', 'not a manifest'],
         ['null', null],
     ])('rejects %s', async (_name, bad) => {

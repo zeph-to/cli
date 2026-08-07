@@ -62,9 +62,14 @@ const isRule = (v: unknown): v is DetectionRule => {
     const r = v as Record<string, unknown>;
     if (typeof r.id !== 'string' || r.id.length === 0) return false;
     if (typeof r.state !== 'string' || !VALID_STATES.has(r.state)) return false;
-    if (typeof r.priority !== 'number' || !Number.isFinite(r.priority)) return false;
+    // Safe integers, not merely finite. These numbers arrive from the server
+    // and decide behavior: a fractional priority orders rules by values no
+    // author can reason about, 1e21 outranks every rule ever written including
+    // the kill-switch, and a fractional tailLines slices a capture at a
+    // fraction of a line.
+    if (!Number.isSafeInteger(r.priority)) return false;
     if (r.region !== undefined && r.region !== 'tail' && r.region !== 'whole') return false;
-    if (r.tailLines !== undefined && (typeof r.tailLines !== 'number' || r.tailLines < 1 || r.tailLines > 200)) return false;
+    if (r.tailLines !== undefined && (!Number.isSafeInteger(r.tailLines) || (r.tailLines as number) < 1 || (r.tailLines as number) > 200)) return false;
     if (r.contains !== undefined && !isStringArray(r.contains)) return false;
     if (r.regex !== undefined && !isStringArray(r.regex)) return false;
     if (r.any !== undefined && (!Array.isArray(r.any) || !r.any.every(isCondition))) return false;

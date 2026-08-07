@@ -28,11 +28,10 @@ const createFakeClock = () => {
     };
 };
 
-const setup = (holdMs = INPUT_HOLD_MS) => {
+const setup = () => {
     const clock = createFakeClock();
     const delivered: string[] = [];
     const seq = createInputSequencer<Key>((msg) => delivered.push(msg.key), {
-        holdMs,
         schedule: clock.schedule,
     });
     return { clock, delivered, seq };

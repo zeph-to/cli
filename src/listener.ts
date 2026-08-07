@@ -848,6 +848,12 @@ export const scheduleInjectSnapshots = (
     send: (data: Record<string, unknown>) => void,
     delays: number[] = INJECT_SNAPSHOT_DELAYS_MS,
 ): void => {
+    // These snapshots exist to show the phone what a keystroke did when nobody
+    // is mirroring the pane. A live stream already repaints it at the burst
+    // cadence, so scheduling them there is two extra blocking captures and two
+    // extra sends per keystroke — outside the stream's own send budget, which
+    // is exactly the cost the budget exists to bound.
+    if (activeStreams.has(sessionName)) return;
     for (const t of pendingInjectSnapshots.get(sessionName) ?? []) clearTimeout(t);
     let lastContent: string | null = null;
     const timers = delays.map((delay) =>
@@ -935,6 +941,14 @@ export interface FrameBudget {
  * passed. False means this tick must skip WITHOUT marking the frame as sent —
  * the diff-gate would otherwise swallow that content for good.
  */
+/** Is there budget left this second? A peek, so a tick can decline to pay for a
+ *  blocking capture it could not send anyway — spending the token here instead
+ *  would burn budget on ticks the diff-gate goes on to skip. */
+export const hasFrameBudget = (budget: FrameBudget, now: number): boolean =>
+    now - budget.windowStartedAt >= 1_000 || now < budget.windowStartedAt
+        ? true
+        : budget.sent < MAX_FRAMES_PER_SEC;
+
 export const claimFrameSend = (budget: FrameBudget, now: number): boolean => {
     // `now < windowStartedAt` = the clock ran backwards (NTP step, resume).
     // Without the guard the window never rolls again and a spent budget
@@ -1331,6 +1345,15 @@ export const handleStreamControl = (
             stopStream(sessionName);
             return false;
         }
+        // capturePane is a blocking tmux spawn. Asking the budget first means a
+        // second that is already full costs nothing rather than paying for a
+        // capture whose frame could not go out — a peek, not a claim, so a tick
+        // the diff-gate goes on to skip does not spend the token.
+        if (!hasFrameBudget(budget, Date.now())) {
+            stats.skipped++;
+            stats.rateCapped++;
+            return true;
+        }
         const captured = capturePane(sessionName, true, STREAM_CAPTURE_LINES);
         if (!captured || captured.content === lastContent) {
             stats.skipped++;
@@ -1634,18 +1657,13 @@ const enqueueInput = (input: ValidatedInput, send: SendEphemeral): void => {
     // would let the higher epoch supersede the other and silence it.
     const senderKey = input.deviceId ? `${input.sessionName}#${input.deviceId}` : input.sessionName;
     const sequencer = inputSequencerFor(senderKey);
-    if (!sequencer) {
-        log(`! input ${input.sessionName}: sender lane cap reached — drop`);
-        send(streamErrorFrame(input.sessionName, 'input_rejected', input));
-        return;
-    }
+    if (!sequencer) return refuseInput(input, send, 'sender lane cap reached');
     const accepted = sequencer.accept({ ...input, send });
     if (accepted !== 'ok') {
         // overflow / superseded / stale — the message was dropped, and the
         // sender must hear so instead of waiting on a keystroke that never
         // lands (the sequencer reports swept HELD messages via onDiscard).
-        log(`! input ${input.sessionName}: ${accepted} — drop`);
-        send(streamErrorFrame(input.sessionName, 'input_rejected', input));
+        refuseInput(input, send, accepted);
     }
 };
 
@@ -1680,17 +1698,22 @@ export const pendingInputDecrypts = (): Promise<void> => inputDecryptChain;
  * plaintext path runs — the envelope hides the payload from the relay, never
  * from the whitelist or the caps.
  */
+/**
+ * Refuse one input message: log why here, tell the sender only THAT it was
+ * refused. The reason is derived from plaintext the relay must not learn, so it
+ * never rides the frame; a message with no sessionName gets no frame at all,
+ * since the sender would have nothing to match it against.
+ */
+const refuseInput = (msg: AgentCommandInput, send: SendEphemeral, reason: string): void => {
+    log(`! input ${msg.sessionName ?? '(no session)'}: ${reason} — drop`);
+    if (typeof msg.sessionName === 'string' && msg.sessionName) {
+        send(streamErrorFrame(msg.sessionName, 'input_rejected', msg));
+    }
+};
+
 const handleEncryptedInput = (msg: AgentCommandInput, send: SendEphemeral): void => {
     const { sessionName } = msg;
-    const refuse = (reason: string): void => {
-        log(`! input ${sessionName ?? '(no session)'}: ${reason} — drop`);
-        // No sessionName means the sender can't match the error to anything.
-        // The reason never rides along: it is derived from plaintext the relay
-        // must not learn, so it stays in this host's log.
-        if (typeof sessionName === 'string' && sessionName) {
-            send(streamErrorFrame(sessionName, 'input_rejected', msg));
-        }
-    };
+    const refuse = (reason: string): void => refuseInput(msg, send, reason);
     if (typeof sessionName !== 'string' || !sessionName) return refuse('no sessionName');
     const stream = activeStreams.get(sessionName);
     if (!stream) return refuse('encrypted input with no live stream');
@@ -1742,10 +1765,10 @@ const handleEncryptedInput = (msg: AgentCommandInput, send: SendEphemeral): void
         // A real envelope clears the strikes: the cap is there to stop a flood,
         // not to retire a stream that saw one corrupted message.
         const live = activeStreams.get(sessionName);
-        if (live?.stats === incarnation) live.inputDecryptFailures = 0;
-        if (activeStreams.get(sessionName)?.stats !== incarnation) {
+        if (live?.stats !== incarnation) {
             return refuse('stream replaced while decrypting');
         }
+        live.inputDecryptFailures = 0;
         const payload = parseSealedInput(opened);
         if (!payload) return refuse('sealed payload is not an input object');
         // Replay binding: the ciphertext must vouch for the plaintext stamps.
@@ -1796,11 +1819,7 @@ export const handleCommandInput = (
     }
     const checked = validateInputMessage(msg);
     if (!checked.ok) {
-        log(`! input ${msg.sessionName ?? '(no session)'}: ${checked.reason} — drop`);
-        // No sessionName means the sender can't match the error to anything.
-        if (typeof msg.sessionName === 'string' && msg.sessionName) {
-            send(streamErrorFrame(msg.sessionName, 'input_rejected', msg));
-        }
+        refuseInput(msg, send, checked.reason);
         return true;
     }
     const { input } = checked;
@@ -1809,8 +1828,7 @@ export const handleCommandInput = (
     // against. The sender learns in one hop and falls back to a REST push.
     const stream = activeStreams.get(input.sessionName);
     if (!stream) {
-        log(`! input ${input.sessionName}: no live stream — drop`);
-        send(streamErrorFrame(input.sessionName, 'input_rejected', input));
+        refuseInput(input, send, 'no live stream');
         return true;
     }
     // This stream's outbound half is E2EE for that subscriber, so accepting a
@@ -1818,8 +1836,7 @@ export const handleCommandInput = (
     // and nothing about it proves the subscriber sent it. An encrypted stream
     // takes sealed input (above) or none.
     if (stream.subscriberPublicKey) {
-        log(`! input ${input.sessionName}: stream is E2EE, plaintext input refused — drop`);
-        send(streamErrorFrame(input.sessionName, 'input_rejected', input));
+        refuseInput(input, send, 'stream is E2EE, plaintext input refused');
         return true;
     }
     enqueueInput(input, send);
