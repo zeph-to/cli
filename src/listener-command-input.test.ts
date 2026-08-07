@@ -58,6 +58,7 @@ const {
     MAX_INPUT_KEYS,
     MAX_INPUT_BODY_CHARS,
     MAX_INSERT_CHARS,
+    MAX_INSERT_BACKSPACES,
     INSERT_BUDGET_CHARS,
     INSERT_MAX_PER_SEC,
     checkInsertBudget,
@@ -339,11 +340,10 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
             const { remoteDigest } = await import('./gate.js');
             openStream('zeph-a');
             handleCommandInput(input({ keys: undefined, insert: 'hell' }), send);
-            // A backspace in the composer is a backspace in the pane: the
+            // A deletion in the composer is a deletion in the pane: the
             // accumulator has to lose the character the pane lost.
-            handleCommandInput(input({ seq: 2, keys: ['backspace'] }), send);
-            handleCommandInput(input({ seq: 3, keys: undefined, insert: 'p' }), send);
-            handleCommandInput(input({ seq: 4, keys: ['enter'] }), send);
+            handleCommandInput(input({ seq: 2, keys: undefined, insert: 'p', backspaces: 1 }), send);
+            handleCommandInput(input({ seq: 3, keys: ['enter'] }), send);
 
             expect(await marker('help')).toContain(remoteDigest('help'));
         });
@@ -365,6 +365,45 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
             expect(written).toContain(remoteDigest('earlier'));
             expect(written).not.toContain(remoteDigest('drifted'));
         });
+    });
+
+    it('carries deletions and the text that replaces them in one message', () => {
+        // One edit, one message: split across two, the halves would land on
+        // different meters and could arrive out of order, which corrupts the
+        // pane silently rather than loudly.
+        openStream('zeph-a');
+        handleCommandInput(input({ keys: undefined, insert: 'p', backspaces: 2 }), send);
+        expect(injections()).toEqual(['-t zeph-a BSpace BSpace', '-l -t zeph-a p']);
+        expect(rejections()).toEqual([]);
+    });
+
+    it('accepts an edit that only deletes, and refuses one that does neither', () => {
+        openStream('zeph-a');
+        handleCommandInput(input({ keys: undefined, insert: '', backspaces: 3 }), send);
+        expect(injections()).toEqual(['-t zeph-a BSpace BSpace BSpace']);
+        handleCommandInput(input({ seq: 2, keys: undefined, insert: '', backspaces: 0 }), send);
+        expect(rejections()).toHaveLength(1);
+    });
+
+    it('refuses a backspace count that is not a sane integer', () => {
+        openStream('zeph-a');
+        for (const backspaces of [-1, 1.5, MAX_INSERT_BACKSPACES + 1]) {
+            handleCommandInput(input({ keys: undefined, insert: 'x', backspaces }), send);
+        }
+        expect(injections()).toEqual([]);
+        expect(rejections()).toHaveLength(3);
+    });
+
+    it('charges deletions to the live-typing budget, not the command bucket', () => {
+        // Erasing is as much pane traffic as typing, and it must not spend the
+        // tokens the arrow keys share.
+        openStream('zeph-live');
+        while (checkInsertBudget('zeph-live', 1)) { /* spend the typing allowance */ }
+        handleCommandInput(input({ sessionName: 'zeph-live', keys: undefined, insert: '', backspaces: 4 }), send);
+        expect(injections()).toEqual([]);
+        expect(rejections()).toHaveLength(1);
+        handleCommandInput(input({ sessionName: 'zeph-live', seq: 2 }), send);
+        expect(injections()).toEqual(['-t zeph-live Down']);
     });
 
     it('refuses a seq or epoch that is not a safe non-negative integer', () => {
@@ -521,7 +560,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         const ok = validateInputMessage({ sessionName: 'zeph-a', keys: ['escape'], seq: 4, epoch: 9 });
         expect(ok).toEqual({
             ok: true,
-            input: { sessionName: 'zeph-a', seq: 4, epoch: 9, tokens: ['Escape'], text: null, submits: false },
+            input: { sessionName: 'zeph-a', seq: 4, epoch: 9, tokens: ['Escape'], text: null, submits: false, backspaces: 0 },
         });
         expect(validateInputMessage({ sessionName: 'zeph-a', body: 'hi', seq: 4, epoch: 9 })).toMatchObject({
             ok: true,

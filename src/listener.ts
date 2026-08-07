@@ -1647,6 +1647,13 @@ export interface AgentCommandInput {
      *  with both of the above: a message that carried two of the three would
      *  have to pick one, and the sender would be told nothing about which. */
     insert?: string;
+    /** Characters to erase before typing `insert`. One edit is one message:
+     *  sending the deletions separately would put half an edit on a different
+     *  meter, in a different order, with its own refusal — and a deletion that
+     *  landed after the text it was meant to precede corrupts the pane
+     *  silently. Only meaningful alongside `insert`, which may be empty when an
+     *  edit only removes. */
+    backspaces?: number;
     /** Sender's monotonic counter, and the incarnation it counts within. */
     seq?: number;
     epoch?: number;
@@ -1670,6 +1677,9 @@ export const MAX_INPUT_BODY_CHARS = 4096;
 /** One live-typing message carries a diff, not a document — a batch bigger than
  *  this is a paste, which the phone hands back to the REST path instead. */
 export const MAX_INSERT_CHARS = 256;
+/** Deletions in one edit. Same order as the insert cap for the same reason: an
+ *  edit this big is a paste or a clear, not typing. */
+export const MAX_INSERT_BACKSPACES = 256;
 
 /** The relay socket a message arrived on, and the only way back to its sender. */
 type SendEphemeral = (data: Record<string, unknown>) => void;
@@ -1687,6 +1697,8 @@ type ValidatedInput = SequencedInput & {
      *  the pane (`insert`). The two differ by one Enter and by which meter they
      *  are charged against, so the distinction has to survive the reorder hold. */
     submits: boolean;
+    /** Live typing only: characters to erase before `text` is typed. */
+    backspaces: number;
 };
 
 /** A validated injection queued for delivery in seq order, carrying the socket
@@ -1723,11 +1735,11 @@ const isInputEnvelope = (v: unknown): v is EncryptedEphemeralPayload =>
  *  a subscriber can seal anything, including 400 keys. */
 const parseSealedInput = (
     json: string,
-): Pick<AgentCommandInput, 'keys' | 'body' | 'insert' | 'seq' | 'epoch' | 'sessionName'> | null => {
+): Pick<AgentCommandInput, 'keys' | 'body' | 'insert' | 'backspaces' | 'seq' | 'epoch' | 'sessionName'> | null => {
     try {
         const parsed: unknown = JSON.parse(json);
         if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
-        return parsed as Pick<AgentCommandInput, 'keys' | 'body' | 'insert' | 'seq' | 'epoch' | 'sessionName'>;
+        return parsed as Pick<AgentCommandInput, 'keys' | 'body' | 'insert' | 'backspaces' | 'seq' | 'epoch' | 'sessionName'>;
     } catch {
         return null;
     }
@@ -1766,16 +1778,21 @@ export const validateInputMessage = (msg: AgentCommandInput): InputCheck => {
         if (msg.keys.length > MAX_INPUT_KEYS) return { ok: false, reason: `too many keys (${msg.keys.length})` };
         const tokens = resolveKeys(msg.keys);
         if (!tokens) return { ok: false, reason: `unknown key(s) [${msg.keys.join(' ')}]` };
-        return { ok: true, input: { ...base, tokens, text: null, submits: false } };
+        return { ok: true, input: { ...base, tokens, text: null, submits: false, backspaces: 0 } };
     }
     if (msg.insert !== undefined) {
-        if (typeof msg.insert !== 'string' || !msg.insert) return { ok: false, reason: 'empty input' };
+        if (typeof msg.insert !== 'string') return { ok: false, reason: 'malformed insert' };
         if (msg.insert.length > MAX_INSERT_CHARS) return { ok: false, reason: `insert too long (${msg.insert.length})` };
-        return { ok: true, input: { ...base, tokens: null, text: msg.insert, submits: false } };
+        const backspaces = msg.backspaces ?? 0;
+        if (!Number.isSafeInteger(backspaces) || backspaces < 0) return { ok: false, reason: 'malformed backspaces' };
+        if (backspaces > MAX_INSERT_BACKSPACES) return { ok: false, reason: `too many backspaces (${backspaces})` };
+        // An edit that neither adds nor removes is not an edit.
+        if (!msg.insert && !backspaces) return { ok: false, reason: 'empty input' };
+        return { ok: true, input: { ...base, tokens: null, text: msg.insert, submits: false, backspaces } };
     }
     if (typeof msg.body !== 'string' || !msg.body) return { ok: false, reason: 'empty input' };
     if (msg.body.length > MAX_INPUT_BODY_CHARS) return { ok: false, reason: `body too long (${msg.body.length})` };
-    return { ok: true, input: { ...base, tokens: null, text: msg.body, submits: true } };
+    return { ok: true, input: { ...base, tokens: null, text: msg.body, submits: true, backspaces: 0 } };
 };
 
 /**
@@ -1790,7 +1807,7 @@ const deliverInput = (input: PendingInput): void => {
             ? tryInjectKeys(input.sessionName, input.tokens, {})
             : input.submits
                 ? tryInject(input.sessionName, input.text ?? '', {})
-                : tryInsert(input.sessionName, input.text ?? '', {}));
+                : tryInsert(input.sessionName, input.text ?? '', input.backspaces, {}));
     // Every refusal reachable from here — dead lease, shell pane, rate limit,
     // a failed send-keys — used to be silent, which contradicts the contract
     // above: the sender would keep waiting on a keystroke that never lands
@@ -1954,6 +1971,7 @@ const handleEncryptedInput = (msg: AgentCommandInput, send: SendEphemeral): void
             keys: payload.keys,
             body: payload.body,
             insert: payload.insert,
+            backspaces: payload.backspaces,
         });
         if (!checked.ok) return refuse(checked.reason);
         enqueueInput(checked.input, send);
@@ -2290,23 +2308,35 @@ const tryInjectKeys = (session: string, tokens: string[], deps: HandlePushDeps):
  * checkInsertBudget), but it clears the same pane guards: a shell pane refuses
  * live typing exactly as it refuses a command.
  */
-const tryInsert = (session: string, text: string, deps: HandlePushDeps): boolean => {
-    if (!text) {
+const tryInsert = (
+    session: string,
+    text: string,
+    backspaces: number,
+    deps: HandlePushDeps,
+): boolean => {
+    if (!text && !backspaces) {
         log(`! ${session}: empty insert — drop`);
         return false;
     }
     // Budget before the pane probe, for the reason passesInjectGuards states.
-    if (!(deps.insertBudget ?? checkInsertBudget)(session, text.length)) {
+    // Deletions are charged too: erasing is as much pane traffic as typing.
+    if (!(deps.insertBudget ?? checkInsertBudget)(session, text.length + backspaces)) {
         log(`! ${session}: insert budget spent — drop`);
         return false;
     }
     if (!passesPaneGuards(session, deps)) return false;
-    const ok = (deps.insert ?? injectText)(session, text);
+    // Deletions first, then the text — the order the user made the edit in.
+    // Both halves of one edit, so a failure between them cannot leave the pane
+    // holding a deletion whose replacement never arrived.
+    const erased = backspaces === 0
+        || (deps.sendKeys ?? injectNamedKeys)(session, new Array<string>(backspaces).fill('BSpace'));
+    const ok = erased && (!text || (deps.insert ?? injectText)(session, text));
     if (ok) {
         noteStreamInput(session);
-        liveTyped.set(session, (liveTyped.get(session) ?? '') + text);
+        const held = liveTyped.get(session) ?? '';
+        liveTyped.set(session, (backspaces ? [...held].slice(0, -backspaces).join('') : held) + text);
     }
-    log(`${ok ? '⌨' : '✗'} ${session}: +${text.length}c`);
+    log(`${ok ? '⌨' : '✗'} ${session}: -${backspaces} +${text.length}c`);
     return ok;
 };
 
