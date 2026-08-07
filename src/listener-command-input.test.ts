@@ -7,7 +7,7 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 // test is the ephemeral input path's guards and ordering, not tmux itself.
 // `zeph-shell` reports a shell as its pane command — the RCE guard's subject.
 const FIELD_SEP = '␟';
-const SESSIONS = ['zeph-a', 'zeph-shell', 'zeph-rate'];
+const SESSIONS = ['zeph-a', 'zeph-shell', 'zeph-rate', 'zeph-cost'];
 
 /** Every tmux call the code made, in order — the injection evidence. */
 let tmuxCalls: string[][] = [];
@@ -223,6 +223,32 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         expect(rejections()).toHaveLength(1);
         handleCommandInput(input({ seq: 2, keys: undefined, body: 'x'.repeat(MAX_INPUT_BODY_CHARS) }), send);
         expect(injections()).toHaveLength(2); // text + Enter
+    });
+
+    it('lets a burst of key taps through, and still caps command submits at 30', () => {
+        // Arrowing through a menu or holding Backspace is ordinary human speed.
+        // Charging a keystroke as if it were a whole instruction refused the
+        // phone's key row after a couple of seconds of normal tapping.
+        // A session of its own: the bucket is module state, and another test
+        // in this file drains `zeph-rate` on purpose.
+        openStream('zeph-cost');
+        let landed = 0;
+        for (let seq = 1; seq <= 60; seq++) {
+            tmuxCalls = [];
+            handleCommandInput(input({ sessionName: 'zeph-cost', seq }), send);
+            if (injections().length) landed++;
+        }
+        expect(landed).toBe(60);
+
+        // Submits are the expensive half, and their ceiling is unchanged: the
+        // 60 taps above cost 60 of 120, leaving room for 15 of the 30.
+        let submits = 0;
+        for (let seq = 61; seq <= 100; seq++) {
+            tmuxCalls = [];
+            handleCommandInput(input({ sessionName: 'zeph-cost', seq, keys: undefined, body: 'go' }), send);
+            if (injections().length) submits++;
+        }
+        expect(submits).toBe(15);
     });
 
     it('refuses a seq or epoch that is not a safe non-negative integer', () => {

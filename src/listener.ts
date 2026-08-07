@@ -129,10 +129,19 @@ export const sessionsReportDue = (
     fingerprint !== lastSentFingerprint ||
     nowMs - lastSentAtMs >= SESSION_REPORT_HEARTBEAT_MS;
 
-// Per-session token bucket — caps a runaway/compromised sender. 30/min
-// is generous for human-driven phone use, tight enough to block flooding.
-const RATE_LIMIT_TOKENS = 30;
+// Per-session token bucket — caps a runaway/compromised sender.
+//
+// Weighted rather than flat, because the two things that pass through it are
+// not the same size. A command submit is one whole instruction to the agent;
+// 30 a minute has always been the ceiling for that, and it stays exactly that
+// (120 / SUBMIT_COST). A named key is a keystroke — arrowing through a menu or
+// holding Backspace is ordinary human speed, and charging it as if it were an
+// instruction made the phone's key row refuse a normal burst of taps after a
+// couple of seconds.
+const RATE_LIMIT_TOKENS = 120;
 const RATE_LIMIT_WINDOW_MS = 60_000;
+/** What one command submit costs, keeping its ceiling at the old 30/min. */
+const SUBMIT_COST = 4;
 
 // Shells are refused: a shell prompt + send-keys = arbitrary command exec.
 const SHELL_COMMANDS = new Set(['bash', 'zsh', 'fish', 'sh', 'dash', 'ksh', 'tcsh', 'csh', 'pwsh']);
@@ -154,7 +163,11 @@ const pruneStaleBuckets = (now: number): void => {
     }
 };
 
-export const checkRateLimit = (session: string, now: number = Date.now()): boolean => {
+export const checkRateLimit = (
+    session: string,
+    now: number = Date.now(),
+    cost: number = 1,
+): boolean => {
     pruneStaleBuckets(now);
     const b = buckets.get(session) ?? { tokens: RATE_LIMIT_TOKENS, lastRefillAt: now };
     const elapsed = Math.max(0, now - b.lastRefillAt);
@@ -164,11 +177,11 @@ export const checkRateLimit = (session: string, now: number = Date.now()): boole
         RATE_LIMIT_TOKENS,
         b.tokens + (elapsed / RATE_LIMIT_WINDOW_MS) * RATE_LIMIT_TOKENS,
     );
-    if (refilled < 1) {
+    if (refilled < cost) {
         buckets.set(session, { tokens: refilled, lastRefillAt: now });
         return false;
     }
-    buckets.set(session, { tokens: refilled - 1, lastRefillAt: now });
+    buckets.set(session, { tokens: refilled - cost, lastRefillAt: now });
     return true;
 };
 
@@ -2048,7 +2061,7 @@ interface HandlePushDeps {
     paneCommand?: (session: string) => string | null;
     inject?: (session: string, text: string) => boolean;
     sendKeys?: (session: string, tokens: string[]) => boolean;
-    rateLimit?: (session: string) => boolean;
+    rateLimit?: (session: string, now?: number, cost?: number) => boolean;
     now?: () => number;
     /** Injectable for tests; defaults to the REST-backed downloader. */
     downloadAttachments?: (pushId: string, files: PushFileAttachment[]) => Promise<string[]>;
@@ -2064,11 +2077,11 @@ interface HandlePushDeps {
  * the structured `agent.command` push type and the legacy `@<session>`
  * prefix path route through here so the defense layers can't diverge.
  */
-const passesInjectGuards = (session: string, deps: HandlePushDeps): boolean => {
+const passesInjectGuards = (session: string, deps: HandlePushDeps, cost = 1): boolean => {
     // Rate bucket first: the pane probe below is a blocking tmux spawnSync,
     // and the sequencer can flush several held messages back-to-back — an
     // empty bucket must refuse before paying that probe N times, not after.
-    if (!(deps.rateLimit ?? checkRateLimit)(session)) {
+    if (!(deps.rateLimit ?? checkRateLimit)(session, Date.now(), cost)) {
         log(`! ${session}: rate-limited — drop`);
         return false;
     }
@@ -2115,7 +2128,7 @@ const tryInject = (session: string, text: string, deps: HandlePushDeps): boolean
         log(`! ${session}: empty text — drop`);
         return false;
     }
-    if (!passesInjectGuards(session, deps)) return false;
+    if (!passesInjectGuards(session, deps, SUBMIT_COST)) return false;
     const ok = (deps.inject ?? injectKeys)(session, text);
     const preview = text.length > 60 ? text.slice(0, 60) + '…' : text;
     log(`${ok ? '→' : '✗'} ${session}: ${preview}`);
