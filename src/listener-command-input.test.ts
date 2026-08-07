@@ -7,7 +7,7 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 // test is the ephemeral input path's guards and ordering, not tmux itself.
 // `zeph-shell` reports a shell as its pane command — the RCE guard's subject.
 const FIELD_SEP = '␟';
-const SESSIONS = ['zeph-a', 'zeph-shell', 'zeph-rate', 'zeph-live', 'zeph-burst'];
+const SESSIONS = ['zeph-a', 'zeph-shell', 'zeph-rate'];
 
 /** Every tmux call the code made, in order — the injection evidence. */
 let tmuxCalls: string[][] = [];
@@ -57,11 +57,6 @@ const {
     pendingInputDecrypts,
     MAX_INPUT_KEYS,
     MAX_INPUT_BODY_CHARS,
-    MAX_INSERT_CHARS,
-    MAX_INSERT_BACKSPACES,
-    INSERT_BUDGET_CHARS,
-    INSERT_MAX_PER_SEC,
-    checkInsertBudget,
 } = await import('./listener.js');
 
 const { INPUT_HOLD_MS, MAX_PENDING_INPUTS } = await import('./input-sequencer.js');
@@ -230,182 +225,6 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         expect(injections()).toHaveLength(2); // text + Enter
     });
 
-    // ─── live typing (insert) ───────────────────────────────────────
-    //
-    // `insert` is `body` minus the Enter. That one difference is the whole
-    // feature: it is what lets the phone show characters in the pane as they
-    // are typed instead of only on submit.
-
-    it('types live input into the pane without submitting it', () => {
-        openStream('zeph-a');
-        handleCommandInput(input({ keys: undefined, insert: 'hel' }), send);
-        // One send-keys, and no Enter after it — a body would have produced two.
-        expect(injections()).toEqual(['-l -t zeph-a hel']);
-        expect(rejections()).toEqual([]);
-    });
-
-    it('refuses a message carrying more than one of keys/body/insert', () => {
-        // Picking a winner silently would leave the sender believing the field
-        // it cared about is what landed in the pane.
-        openStream('zeph-a');
-        for (const bad of [
-            { keys: ['down'], insert: 'x' },
-            { keys: undefined, body: 'x', insert: 'y' },
-            { keys: ['down'], body: 'x', insert: 'y' },
-        ]) handleCommandInput(input(bad), send);
-        expect(injections()).toEqual([]);
-        expect(rejections()).toHaveLength(3);
-    });
-
-    it('refuses an empty insert and one past the live-typing cap', () => {
-        // A diff, not a document: a batch this big is a paste, which the phone
-        // is expected to hand back to the REST path instead.
-        expect(MAX_INSERT_CHARS).toBe(256);
-        openStream('zeph-a');
-        handleCommandInput(input({ keys: undefined, insert: '' }), send);
-        handleCommandInput(input({ seq: 2, keys: undefined, insert: 'x'.repeat(MAX_INSERT_CHARS + 1) }), send);
-        expect(injections()).toEqual([]);
-        expect(rejections()).toHaveLength(2);
-        handleCommandInput(input({ seq: 3, keys: undefined, insert: 'x'.repeat(MAX_INSERT_CHARS) }), send);
-        expect(injections()).toHaveLength(1);
-    });
-
-    it('refuses live typing into a shell pane, exactly as it refuses a command', () => {
-        // The RCE guard cannot have two versions: a shell prompt plus injected
-        // text is arbitrary command execution whether or not an Enter follows.
-        openStream('zeph-shell');
-        handleCommandInput(input({ sessionName: 'zeph-shell', keys: undefined, insert: 'rm -rf /' }), send);
-        expect(injections()).toEqual([]);
-        expect(rejections()).toHaveLength(1);
-    });
-
-    it('meters live typing on its own budget, leaving the command bucket alone', () => {
-        // The two budgets exist so that typing — which is many small messages —
-        // cannot starve the arrow keys that share the pane. Drained one at a
-        // time, each must leave the other spending.
-        openStream('zeph-live');
-        while (checkInsertBudget('zeph-live', 1)) { /* spend the typing allowance */ }
-        handleCommandInput(input({ sessionName: 'zeph-live', keys: undefined, insert: 'x' }), send);
-        expect(injections()).toEqual([]);
-        expect(rejections()).toHaveLength(1);
-        // The keys never paid for that typing, so they still go through.
-        handleCommandInput(input({ sessionName: 'zeph-live', seq: 2 }), send);
-        expect(injections()).toEqual(['-t zeph-live Down']);
-    });
-
-    it('refuses more live-typing messages per second than the spawn ceiling allows', () => {
-        // Each insert costs two tmux spawns. This ceiling bounds that, and it
-        // is the ceiling under test here: 17 characters cannot exhaust a 4096
-        // character budget, so nothing else can explain the refusal.
-        // A session of its own: the budget is module state that earlier tests
-        // in this file have already spent some of on `zeph-a`.
-        openStream('zeph-burst');
-        for (let i = 0; i <= INSERT_MAX_PER_SEC; i++) {
-            handleCommandInput(input({ sessionName: 'zeph-burst', seq: i + 1, keys: undefined, insert: 'x' }), send);
-        }
-        expect(injections()).toHaveLength(INSERT_MAX_PER_SEC);
-        expect(rejections()).toHaveLength(1);
-    });
-
-    it('budgets live typing in characters, and refills over the window', () => {
-        // Characters rather than messages is what keeps the abuse ceiling from
-        // widening: the body path already admits 30 × 4096 a minute, and this
-        // is a thirtieth of it.
-        expect(INSERT_BUDGET_CHARS).toBe(4096);
-        expect(checkInsertBudget('budget', INSERT_BUDGET_CHARS, 0)).toBe(true);
-        // Second message of the second, so the per-second ceiling is not what
-        // refuses this — the budget is empty.
-        expect(checkInsertBudget('budget', 1, 1)).toBe(false);
-        expect(checkInsertBudget('budget', 1, 60_001)).toBe(true);
-    });
-
-    // The remote-origin marker (ADR-0002) is matched on the EXACT prompt text,
-    // and live typing delivers that text a fragment at a time. Without the
-    // daemon reassembling it, a prompt typed from the phone would stop putting
-    // the agent into sticky REMOTE mode — the marker's whole purpose.
-    describe('remote-origin marker for live typing', () => {
-        const marker = async (text: string): Promise<string | null> => {
-            const { projectHash, remoteMarkerPath } = await import('./gate.js');
-            const { readFileSync } = await import('fs');
-            const hash = projectHash('/tmp/proj');
-            if (!hash) return null;
-            try {
-                return readFileSync(remoteMarkerPath(hash), 'utf-8');
-            } catch {
-                return null;
-            }
-        };
-
-        it('writes the marker for text assembled from inserts and submitted with Enter', async () => {
-            const { remoteDigest } = await import('./gate.js');
-            openStream('zeph-a');
-            handleCommandInput(input({ keys: undefined, insert: 'hell' }), send);
-            // A deletion in the composer is a deletion in the pane: the
-            // accumulator has to lose the character the pane lost.
-            handleCommandInput(input({ seq: 2, keys: undefined, insert: 'p', backspaces: 1 }), send);
-            handleCommandInput(input({ seq: 3, keys: ['enter'] }), send);
-
-            expect(await marker('help')).toContain(remoteDigest('help'));
-        });
-
-        it('gives up on the marker once a key moves the cursor', async () => {
-            // After an arrow the next insert is no longer an append, so the
-            // accumulator stops describing the prompt. A marker that does not
-            // match never fires, which is why guessing is worse than giving up.
-            const { remoteDigest } = await import('./gate.js');
-            openStream('zeph-a');
-            // A known marker to compare against, so "not written" is proven by
-            // the old value surviving rather than by the file being absent.
-            handleCommandInput(input({ keys: undefined, body: 'earlier' }), send);
-            handleCommandInput(input({ seq: 2, keys: undefined, insert: 'drifted' }), send);
-            handleCommandInput(input({ seq: 3, keys: ['left'] }), send);
-            handleCommandInput(input({ seq: 4, keys: ['enter'] }), send);
-
-            const written = await marker('drifted');
-            expect(written).toContain(remoteDigest('earlier'));
-            expect(written).not.toContain(remoteDigest('drifted'));
-        });
-    });
-
-    it('carries deletions and the text that replaces them in one message', () => {
-        // One edit, one message: split across two, the halves would land on
-        // different meters and could arrive out of order, which corrupts the
-        // pane silently rather than loudly.
-        openStream('zeph-a');
-        handleCommandInput(input({ keys: undefined, insert: 'p', backspaces: 2 }), send);
-        expect(injections()).toEqual(['-t zeph-a BSpace BSpace', '-l -t zeph-a p']);
-        expect(rejections()).toEqual([]);
-    });
-
-    it('accepts an edit that only deletes, and refuses one that does neither', () => {
-        openStream('zeph-a');
-        handleCommandInput(input({ keys: undefined, insert: '', backspaces: 3 }), send);
-        expect(injections()).toEqual(['-t zeph-a BSpace BSpace BSpace']);
-        handleCommandInput(input({ seq: 2, keys: undefined, insert: '', backspaces: 0 }), send);
-        expect(rejections()).toHaveLength(1);
-    });
-
-    it('refuses a backspace count that is not a sane integer', () => {
-        openStream('zeph-a');
-        for (const backspaces of [-1, 1.5, MAX_INSERT_BACKSPACES + 1]) {
-            handleCommandInput(input({ keys: undefined, insert: 'x', backspaces }), send);
-        }
-        expect(injections()).toEqual([]);
-        expect(rejections()).toHaveLength(3);
-    });
-
-    it('charges deletions to the live-typing budget, not the command bucket', () => {
-        // Erasing is as much pane traffic as typing, and it must not spend the
-        // tokens the arrow keys share.
-        openStream('zeph-live');
-        while (checkInsertBudget('zeph-live', 1)) { /* spend the typing allowance */ }
-        handleCommandInput(input({ sessionName: 'zeph-live', keys: undefined, insert: '', backspaces: 4 }), send);
-        expect(injections()).toEqual([]);
-        expect(rejections()).toHaveLength(1);
-        handleCommandInput(input({ sessionName: 'zeph-live', seq: 2 }), send);
-        expect(injections()).toEqual(['-t zeph-live Down']);
-    });
-
     it('refuses a seq or epoch that is not a safe non-negative integer', () => {
         // Number.isFinite admits 1e21, which parks the high-water mark past
         // anything a sender can count back to, and 1.5, which no later integer
@@ -560,16 +379,11 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         const ok = validateInputMessage({ sessionName: 'zeph-a', keys: ['escape'], seq: 4, epoch: 9 });
         expect(ok).toEqual({
             ok: true,
-            input: { sessionName: 'zeph-a', seq: 4, epoch: 9, tokens: ['Escape'], text: null, submits: false, backspaces: 0 },
+            input: { sessionName: 'zeph-a', seq: 4, epoch: 9, tokens: ['Escape'], text: null },
         });
         expect(validateInputMessage({ sessionName: 'zeph-a', body: 'hi', seq: 4, epoch: 9 })).toMatchObject({
             ok: true,
-            input: { tokens: null, text: 'hi', submits: true },
-        });
-        // Same text, opposite meaning: `insert` leaves it in the pane.
-        expect(validateInputMessage({ sessionName: 'zeph-a', insert: 'hi', seq: 4, epoch: 9 })).toMatchObject({
-            ok: true,
-            input: { tokens: null, text: 'hi', submits: false },
+            input: { tokens: null, text: 'hi' },
         });
         expect(tmuxCalls).toEqual([]);
     });
@@ -692,20 +506,6 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
             await pendingInputDecrypts();
 
             expect(injections()).toEqual(['-l -t zeph-a hello; rm -rf /', '-t zeph-a Enter']);
-        });
-
-        it('types live input carried inside an envelope, still without an Enter', async () => {
-            // The sealed parser picks fields out of the decrypted JSON by name.
-            // Leaving `insert` off that list would not fail loudly — the message
-            // would decrypt, validate as empty, and type nothing, so live typing
-            // would work on plaintext streams and silently die on encrypted ones.
-            openE2eeStream(await hostKey());
-
-            handleCommandInput(input({ keys: undefined, encrypted: await seal({ insert: 'hel' }) }), send);
-            await pendingInputDecrypts();
-
-            expect(injections()).toEqual(['-l -t zeph-a hel']);
-            expect(rejections()).toEqual([]);
         });
 
         it('never puts the decrypted payload back on the wire', async () => {

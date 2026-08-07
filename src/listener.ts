@@ -134,21 +134,6 @@ export const sessionsReportDue = (
 const RATE_LIMIT_TOKENS = 30;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 
-// Live typing is a different SHAPE of traffic from a command submit: many tiny
-// messages instead of one. Counted in the bucket above it would empty it within
-// seconds and start refusing arrow keys too, so inserts carry their own budget
-// — denominated in CHARACTERS rather than messages, which is what keeps the
-// abuse ceiling from widening. The `body` path already admits 30 × 4096 =
-// 122,880 characters a minute; this is a thirtieth of that, and still ~13× a
-// human typing rate.
-export const INSERT_BUDGET_CHARS = 4096;
-const INSERT_BUDGET_WINDOW_MS = 60_000;
-// One insert costs two tmux spawns (pane probe + send-keys), so the character
-// budget alone would not bound CPU. The web batches at 150ms, but one batch can
-// still fan out to several messages when a long deletion chunks into BSpace
-// runs — a ceiling that a normal edit can reach would drop live mode mid-typing.
-export const INSERT_MAX_PER_SEC = 16;
-
 // Shells are refused: a shell prompt + send-keys = arbitrary command exec.
 const SHELL_COMMANDS = new Set(['bash', 'zsh', 'fish', 'sh', 'dash', 'ksh', 'tcsh', 'csh', 'pwsh']);
 
@@ -187,50 +172,6 @@ export const checkRateLimit = (session: string, now: number = Date.now()): boole
     return true;
 };
 
-type InsertBucket = { chars: number; refilledAt: number; secondAt: number; inSecond: number };
-
-const insertBuckets = new Map<string, InsertBucket>();
-
-/**
- * Charge one live-typing insert against its session's own budget.
- *
- * Two ceilings, because one insert costs two different scarce things: pane
- * characters (what an abusive sender could flood) and tmux spawns (what the
- * daemon pays). Refusing leaves the budget untouched — a refused insert typed
- * nothing, so charging for it would let a rejected burst starve the keys that
- * come after it.
- */
-export const checkInsertBudget = (
-    session: string,
-    chars: number,
-    now: number = Date.now(),
-): boolean => {
-    for (const [key, b] of insertBuckets) {
-        if (now - b.refilledAt > BUCKET_IDLE_TTL_MS) insertBuckets.delete(key);
-    }
-    const b = insertBuckets.get(session)
-        ?? { chars: INSERT_BUDGET_CHARS, refilledAt: now, secondAt: now, inSecond: 0 };
-    const elapsed = Math.max(0, now - b.refilledAt);
-    const refilled = Math.min(
-        INSERT_BUDGET_CHARS,
-        b.chars + (elapsed / INSERT_BUDGET_WINDOW_MS) * INSERT_BUDGET_CHARS,
-    );
-    const sameSecond = now - b.secondAt < 1000;
-    const secondAt = sameSecond ? b.secondAt : now;
-    const inSecond = sameSecond ? b.inSecond : 0;
-    if (refilled < chars || inSecond >= INSERT_MAX_PER_SEC) {
-        insertBuckets.set(session, { chars: refilled, refilledAt: now, secondAt, inSecond });
-        return false;
-    }
-    insertBuckets.set(session, {
-        chars: refilled - chars,
-        refilledAt: now,
-        secondAt,
-        inSecond: inSecond + 1,
-    });
-    return true;
-};
-
 /** Read the foreground command in the named tmux session's active pane. */
 export const paneCurrentCommand = (session: string): string | null => {
     const result = spawnSync('tmux', tmuxArgs(['display-message', '-p', '-t', session, '#{pane_current_command}']), {
@@ -247,21 +188,13 @@ const isShellPane = (command: string | null): boolean => {
 };
 
 /**
- * Put literal text in the pane and leave it there. `-l` takes the text as
- * data, so tmux escape sequences inside the message can't drive other tmux
- * commands.
- *
- * No Enter — that is the whole difference between live typing and a command
- * submit, and it is why the two have separate entry points instead of a flag.
+ * Inject text into a tmux session: literal text via `-l`, then a
+ * separate `Enter`. `-l` takes the text as data, so tmux escape
+ * sequences inside the message can't drive other tmux commands.
  */
-const injectText = (session: string, text: string): boolean => {
-    const r = spawnSync('tmux', tmuxArgs(['send-keys', '-l', '-t', session, text]), { stdio: ['ignore', 'ignore', 'pipe'] });
-    return r.status === 0;
-};
-
-/** Type text and submit it — the REST `agent.command` contract. */
 const injectKeys = (session: string, text: string): boolean => {
-    if (!injectText(session, text)) return false;
+    const a = spawnSync('tmux', tmuxArgs(['send-keys', '-l', '-t', session, text]), { stdio: ['ignore', 'ignore', 'pipe'] });
+    if (a.status !== 0) return false;
     const b = spawnSync('tmux', tmuxArgs(['send-keys', '-t', session, 'Enter']), { stdio: ['ignore', 'ignore', 'pipe'] });
     return b.status === 0;
 };
@@ -1217,9 +1150,6 @@ export const stopStream = (sessionName: string): void => {
     if (!entry) return;
     clearTimeout(entry.timer);
     activeStreams.delete(sessionName);
-    // Live typing cannot outlive the stream that carried it, and a stale
-    // accumulator would describe a prompt the next stream never typed.
-    liveTyped.delete(sessionName);
     // The next stream is a new run: a sequencer carrying this one's high-water
     // mark would swallow its first keys if the sender restarts its counter.
     // Every sender that typed into this session holds its own, so drop the
@@ -1265,16 +1195,6 @@ export type StreamFramePayload = {
      *  can place the cursor before the pane content finishes decrypting. */
     cursorLine?: number;
     cursorCol?: number;
-    /** This daemon understands `agent.command.input` with an `insert` field, so
-     *  the viewer may type into the pane without submitting.
-     *
-     *  The viewer must see this before it turns live typing on, and that is the
-     *  whole reason the flag exists rather than a release-order note: a daemon
-     *  too old to know `insert` would drop every keystroke and then submit an
-     *  empty command on Enter — the user's text gone, and a half-finished prompt
-     *  sent. Absent means old, and absent is the safe reading, so the failure
-     *  mode of the flag itself is "live typing stays off". */
-    acceptsInsert?: true;
     /** Plaintext pane content — only on unencrypted streams. */
     content?: string;
     /** E2EE envelope — replaces `content` on encrypted streams. */
@@ -1359,7 +1279,6 @@ export const buildStreamFrame = async (
         sessionName,
         capturedAt: new Date().toISOString(),
         truncated: captured.truncated,
-        acceptsInsert: true as const,
         ...(cursor ? { cursorLine: cursor.line, cursorCol: cursor.col } : {}),
     };
     if (!subscriberPublicKey) return { ...base, content: captured.content };
@@ -1643,17 +1562,6 @@ export interface AgentCommandInput {
     keys?: string[];
     /** Literal text; the injector appends the Enter, as on the REST path. */
     body?: string;
-    /** Literal text with NO Enter after it — live typing. Mutually exclusive
-     *  with both of the above: a message that carried two of the three would
-     *  have to pick one, and the sender would be told nothing about which. */
-    insert?: string;
-    /** Characters to erase before typing `insert`. One edit is one message:
-     *  sending the deletions separately would put half an edit on a different
-     *  meter, in a different order, with its own refusal — and a deletion that
-     *  landed after the text it was meant to precede corrupts the pane
-     *  silently. Only meaningful alongside `insert`, which may be empty when an
-     *  edit only removes. */
-    backspaces?: number;
     /** Sender's monotonic counter, and the incarnation it counts within. */
     seq?: number;
     epoch?: number;
@@ -1674,12 +1582,6 @@ export const MAX_INPUT_KEYS = 10;
  *  unbounded body is one tmux send-keys argv of unbounded size, and what it
  *  lands in is an agent prompt, not a paste buffer. */
 export const MAX_INPUT_BODY_CHARS = 4096;
-/** One live-typing message carries a diff, not a document — a batch bigger than
- *  this is a paste, which the phone hands back to the REST path instead. */
-export const MAX_INSERT_CHARS = 256;
-/** Deletions in one edit. Same order as the insert cap for the same reason: an
- *  edit this big is a paste or a clear, not typing. */
-export const MAX_INSERT_BACKSPACES = 256;
 
 /** The relay socket a message arrived on, and the only way back to its sender. */
 type SendEphemeral = (data: Record<string, unknown>) => void;
@@ -1693,12 +1595,6 @@ type ValidatedInput = SequencedInput & {
     /** Exactly one of these is set. */
     tokens: string[] | null;
     text: string | null;
-    /** Whether `text` is a command to submit (`body`) or characters to leave in
-     *  the pane (`insert`). The two differ by one Enter and by which meter they
-     *  are charged against, so the distinction has to survive the reorder hold. */
-    submits: boolean;
-    /** Live typing only: characters to erase before `text` is typed. */
-    backspaces: number;
 };
 
 /** A validated injection queued for delivery in seq order, carrying the socket
@@ -1735,11 +1631,11 @@ const isInputEnvelope = (v: unknown): v is EncryptedEphemeralPayload =>
  *  a subscriber can seal anything, including 400 keys. */
 const parseSealedInput = (
     json: string,
-): Pick<AgentCommandInput, 'keys' | 'body' | 'insert' | 'backspaces' | 'seq' | 'epoch' | 'sessionName'> | null => {
+): Pick<AgentCommandInput, 'keys' | 'body' | 'seq' | 'epoch' | 'sessionName'> | null => {
     try {
         const parsed: unknown = JSON.parse(json);
         if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
-        return parsed as Pick<AgentCommandInput, 'keys' | 'body' | 'insert' | 'backspaces' | 'seq' | 'epoch' | 'sessionName'>;
+        return parsed as Pick<AgentCommandInput, 'keys' | 'body' | 'seq' | 'epoch' | 'sessionName'>;
     } catch {
         return null;
     }
@@ -1766,33 +1662,17 @@ export const validateInputMessage = (msg: AgentCommandInput): InputCheck => {
         epoch,
         ...(typeof msg.deviceId === 'string' && msg.deviceId ? { deviceId: msg.deviceId } : {}),
     };
-    // Three-way exclusivity, checked before any of the three is read: keys and
-    // body already had to be exclusive, and a silent precedence between three
-    // fields would let a sender believe one thing landed while another did.
-    const carried = (['keys', 'body', 'insert'] as const).filter((f) => msg[f] !== undefined);
-    if (carried.length > 1) {
-        return { ok: false, reason: `${carried.join(', ')} are mutually exclusive` };
-    }
     if (msg.keys !== undefined) {
         if (!isKeyList(msg.keys)) return { ok: false, reason: 'malformed keys' };
         if (msg.keys.length > MAX_INPUT_KEYS) return { ok: false, reason: `too many keys (${msg.keys.length})` };
+        if (msg.body !== undefined) return { ok: false, reason: 'keys and body are mutually exclusive' };
         const tokens = resolveKeys(msg.keys);
         if (!tokens) return { ok: false, reason: `unknown key(s) [${msg.keys.join(' ')}]` };
-        return { ok: true, input: { ...base, tokens, text: null, submits: false, backspaces: 0 } };
-    }
-    if (msg.insert !== undefined) {
-        if (typeof msg.insert !== 'string') return { ok: false, reason: 'malformed insert' };
-        if (msg.insert.length > MAX_INSERT_CHARS) return { ok: false, reason: `insert too long (${msg.insert.length})` };
-        const backspaces = msg.backspaces ?? 0;
-        if (!Number.isSafeInteger(backspaces) || backspaces < 0) return { ok: false, reason: 'malformed backspaces' };
-        if (backspaces > MAX_INSERT_BACKSPACES) return { ok: false, reason: `too many backspaces (${backspaces})` };
-        // An edit that neither adds nor removes is not an edit.
-        if (!msg.insert && !backspaces) return { ok: false, reason: 'empty input' };
-        return { ok: true, input: { ...base, tokens: null, text: msg.insert, submits: false, backspaces } };
+        return { ok: true, input: { ...base, tokens, text: null } };
     }
     if (typeof msg.body !== 'string' || !msg.body) return { ok: false, reason: 'empty input' };
     if (msg.body.length > MAX_INPUT_BODY_CHARS) return { ok: false, reason: `body too long (${msg.body.length})` };
-    return { ok: true, input: { ...base, tokens: null, text: msg.body, submits: true, backspaces: 0 } };
+    return { ok: true, input: { ...base, tokens: null, text: msg.body } };
 };
 
 /**
@@ -1805,9 +1685,7 @@ const deliverInput = (input: PendingInput): void => {
     const injected = activeStreams.has(input.sessionName)
         && (input.tokens
             ? tryInjectKeys(input.sessionName, input.tokens, {})
-            : input.submits
-                ? tryInject(input.sessionName, input.text ?? '', {})
-                : tryInsert(input.sessionName, input.text ?? '', input.backspaces, {}));
+            : tryInject(input.sessionName, input.text ?? '', {}));
     // Every refusal reachable from here — dead lease, shell pane, rate limit,
     // a failed send-keys — used to be silent, which contradicts the contract
     // above: the sender would keep waiting on a keystroke that never lands
@@ -1970,8 +1848,6 @@ const handleEncryptedInput = (msg: AgentCommandInput, send: SendEphemeral): void
             deviceId: msg.deviceId,
             keys: payload.keys,
             body: payload.body,
-            insert: payload.insert,
-            backspaces: payload.backspaces,
         });
         if (!checked.ok) return refuse(checked.reason);
         enqueueInput(checked.input, send);
@@ -2163,10 +2039,6 @@ interface HandlePushDeps {
     downloadAttachments?: (pushId: string, files: PushFileAttachment[]) => Promise<string[]>;
     /** Pane cwd lookup for the remote-origin marker (ADR-0002). */
     paneCwd?: (session: string) => string | null;
-    /** Live-typing injector — text with no Enter after it. */
-    insert?: (session: string, text: string) => boolean;
-    /** Live-typing meter, charged in characters (checkInsertBudget). */
-    insertBudget?: (session: string, chars: number) => boolean;
     /** Fired after a successful named-key injection so the WS loop can push
      *  fresh screen frames to the phone (scheduleInjectSnapshots). */
     onKeysInjected?: (session: string) => void;
@@ -2185,16 +2057,6 @@ const passesInjectGuards = (session: string, deps: HandlePushDeps): boolean => {
         log(`! ${session}: rate-limited — drop`);
         return false;
     }
-    return passesPaneGuards(session, deps);
-};
-
-/**
- * The half of the inject guards that is about the PANE rather than the sender:
- * it exists, and it is not a shell. Split out because live typing is metered by
- * a different budget (checkInsertBudget) but must clear exactly these — the RCE
- * defence cannot have two versions.
- */
-const passesPaneGuards = (session: string, deps: HandlePushDeps): boolean => {
     const cmd = (deps.paneCommand ?? paneCurrentCommand)(session);
     if (cmd === null) {
         log(`! ${session}: no such tmux session — drop`);
@@ -2244,48 +2106,10 @@ const tryInject = (session: string, text: string, deps: HandlePushDeps): boolean
     log(`${ok ? '→' : '✗'} ${session}: ${preview}`);
     if (ok) {
         noteStreamInput(session);
-        liveTyped.delete(session);
         const cwd = (deps.paneCwd ?? defaultPaneCwd)(session);
         if (cwd) writeRemoteMarker(cwd, text);
     }
     return ok;
-};
-
-/**
- * What live typing has put into each pane since the last submit.
- *
- * The remote-origin marker (ADR-0002) is matched on the EXACT prompt text, and
- * live typing delivers that text a fragment at a time — so without this, a
- * prompt typed from the phone would stop entering sticky REMOTE mode, which is
- * the whole point of the marker. The fragments accumulate here and the marker
- * is written when the Enter that submits them arrives.
- */
-const liveTyped = new Map<string, string>();
-
-/**
- * Keep the accumulator in step with named keys, and write the marker on submit.
- *
- * Only two keys can be followed: BSpace removes the character it removed in the
- * pane, and Enter submits. Anything else can move the cursor, after which the
- * next insert is no longer an append and the accumulator no longer describes
- * the prompt — so it is abandoned. A marker that does not match simply never
- * fires, which is why guessing is worse than giving up.
- */
-const noteTypedKeys = (session: string, tokens: string[], deps: HandlePushDeps): void => {
-    let typed = liveTyped.get(session);
-    if (typed === undefined) return;
-    for (const token of tokens) {
-        if (token === 'BSpace') {
-            typed = typed.slice(0, -1);
-            continue;
-        }
-        liveTyped.delete(session);
-        if (token !== 'Enter' || !typed) return;
-        const cwd = (deps.paneCwd ?? defaultPaneCwd)(session);
-        if (cwd) writeRemoteMarker(cwd, typed);
-        return;
-    }
-    liveTyped.set(session, typed);
 };
 
 /** Key-event sibling of tryInject: same pane/shell/rate guards, but sends
@@ -2293,50 +2117,8 @@ const noteTypedKeys = (session: string, tokens: string[], deps: HandlePushDeps):
 const tryInjectKeys = (session: string, tokens: string[], deps: HandlePushDeps): boolean => {
     if (!passesInjectGuards(session, deps)) return false;
     const ok = (deps.sendKeys ?? injectNamedKeys)(session, tokens);
-    if (ok) {
-        noteStreamInput(session);
-        noteTypedKeys(session, tokens, deps);
-    }
+    if (ok) noteStreamInput(session);
     log(`${ok ? '⌨' : '✗'} ${session}: [${tokens.join(' ')}]`);
-    return ok;
-};
-
-/**
- * Put text in the pane without submitting it — the live-typing path.
- *
- * Metered by the insert budget rather than the command bucket (see
- * checkInsertBudget), but it clears the same pane guards: a shell pane refuses
- * live typing exactly as it refuses a command.
- */
-const tryInsert = (
-    session: string,
-    text: string,
-    backspaces: number,
-    deps: HandlePushDeps,
-): boolean => {
-    if (!text && !backspaces) {
-        log(`! ${session}: empty insert — drop`);
-        return false;
-    }
-    // Budget before the pane probe, for the reason passesInjectGuards states.
-    // Deletions are charged too: erasing is as much pane traffic as typing.
-    if (!(deps.insertBudget ?? checkInsertBudget)(session, text.length + backspaces)) {
-        log(`! ${session}: insert budget spent — drop`);
-        return false;
-    }
-    if (!passesPaneGuards(session, deps)) return false;
-    // Deletions first, then the text — the order the user made the edit in.
-    // Both halves of one edit, so a failure between them cannot leave the pane
-    // holding a deletion whose replacement never arrived.
-    const erased = backspaces === 0
-        || (deps.sendKeys ?? injectNamedKeys)(session, new Array<string>(backspaces).fill('BSpace'));
-    const ok = erased && (!text || (deps.insert ?? injectText)(session, text));
-    if (ok) {
-        noteStreamInput(session);
-        const held = liveTyped.get(session) ?? '';
-        liveTyped.set(session, (backspaces ? [...held].slice(0, -backspaces).join('') : held) + text);
-    }
-    log(`${ok ? '⌨' : '✗'} ${session}: -${backspaces} +${text.length}c`);
     return ok;
 };
 
