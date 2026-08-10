@@ -246,6 +246,9 @@ const pasteText = (session: string, text: string): boolean => {
  * `Enter` to submit it. The two stay separate because a bracketed paste is
  * text and only text — newlines inside it must not submit early, and the
  * submit has to be a real key press.
+ *
+ * Delivering text WITHOUT the submit is `pasteText` on its own — see the
+ * `insert` wire field and tryInject's `submit` parameter.
  */
 const injectKeys = (session: string, text: string): boolean => {
     if (!pasteText(session, text)) return false;
@@ -849,6 +852,166 @@ export const handleScreenRequest = (req: ScreenRequest): ScreenSnapshot | null =
     return { ...base, ...captured };
 };
 
+// ─── Deep pull: scrollback above the live window ───────────────────
+//
+// The live stream captures a fixed window and every frame is capped at
+// SCREEN_PEEK_MAX_BYTES, so output older than that window is unreachable from
+// the phone. Neither cap is the lever: a deeper STREAM_CAPTURE_LINES only grows
+// what each frame captures and then throws away, and SCREEN_PEEK_MAX_BYTES is
+// sized for API Gateway's 32KB WS frame. So history is pulled instead of
+// streamed — one page per request, walking upward.
+
+/** Ceiling on one page. A page past the frame limit arrives truncated anyway,
+ *  so let the caller ask for less rather than pay for a capture we discard. */
+export const SCREEN_HISTORY_MAX_LINES = 200;
+const SCREEN_HISTORY_DEFAULT_LINES = 100;
+
+export interface ScreenHistoryRequest {
+    subtype?: string;
+    targetDeviceId?: string;
+    sessionName?: string;
+    requestId?: string;
+    /** Lines of history the caller already holds above the live window. 0 asks
+     *  for the page that sits immediately above it. */
+    before?: number;
+    /** Page size. Clamped to SCREEN_HISTORY_MAX_LINES. */
+    lines?: number;
+}
+
+export interface ScreenHistorySnapshot {
+    subtype: 'agent.screen.history.snapshot';
+    requestId: string;
+    sessionName: string;
+    content?: string;
+    /** Echo of the request's offset, so a caller with several pages in flight
+     *  can tell which one this is. */
+    before?: number;
+    /** Lines actually returned — what the caller adds to `before` for the next
+     *  page. Smaller than asked when the payload cap trimmed the page. */
+    lines?: number;
+    /** Whether older lines still exist above this page. */
+    hasMore?: boolean;
+    truncated?: boolean;
+    error?: string;
+    capturedAt: string;
+}
+
+/** These become tmux argv and page arithmetic; a fractional, negative or
+ *  non-numeric one has no sensible coercion, so it is refused. */
+const isPageOffset = (v: unknown): v is number =>
+    typeof v === 'number' && Number.isInteger(v) && v >= 0;
+
+/** How many lines of scrollback the pane is holding, or null when tmux won't
+ *  say — which is also how a dead pane answers. */
+const paneHistorySize = (sessionName: string): number | null => {
+    const r = spawnSync(
+        'tmux',
+        tmuxArgs(['display-message', '-p', '-t', sessionName, '#{history_size}']),
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    if (r.status !== 0) return null;
+    const size = Number((r.stdout ?? '').trim());
+    return Number.isInteger(size) && size >= 0 ? size : null;
+};
+
+/** Capture one explicit range. tmux line 0 is the top of the visible pane and
+ *  negative numbers reach into the history, so both bounds are negative here. */
+const capturePaneRange = (
+    sessionName: string,
+    start: number,
+    end: number,
+): { content: string; truncated: boolean } | null => {
+    const r = spawnSync(
+        'tmux',
+        tmuxArgs([
+            'capture-pane', '-p', '-e', '-t', sessionName,
+            '-S', String(start), '-E', String(end),
+        ]),
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    if (r.status !== 0) return null;
+    return capToFrameLimit(r.stdout ?? '');
+};
+
+const countLines = (content: string): number =>
+    content ? content.replace(/\n$/, '').split('\n').length : 0;
+
+/**
+ * Answer a phone's request for one page of scrollback above the live window.
+ *
+ * Same security posture as the one-shot peek it sits beside: addressed to this
+ * machine, only for sessions the inventory already exposes, and charged to the
+ * same per-session token bucket. It reads the pane through tmux and nothing
+ * else — no new command surface.
+ */
+export const handleScreenHistoryRequest = (
+    req: ScreenHistoryRequest,
+): ScreenHistorySnapshot | null => {
+    if (req.subtype !== 'agent.screen.history.request') return null;
+    if (!req.requestId || !req.sessionName) return null;
+    if (req.targetDeviceId !== computeListenerDeviceId()) return null;
+
+    const capturedAt = new Date().toISOString();
+    const base = {
+        subtype: 'agent.screen.history.snapshot' as const,
+        requestId: req.requestId,
+        sessionName: req.sessionName,
+        capturedAt,
+    };
+
+    const before = req.before ?? 0;
+    const asked = req.lines ?? SCREEN_HISTORY_DEFAULT_LINES;
+    if (!isPageOffset(before) || !isPageOffset(asked) || asked === 0) {
+        return { ...base, error: 'bad_range' };
+    }
+    const lines = Math.min(asked, SCREEN_HISTORY_MAX_LINES);
+
+    if (!checkRateLimit(`screen:${req.sessionName}`)) return { ...base, error: 'rate_limited' };
+    if (!collectSessions().some((s) => s.name === req.sessionName)) {
+        return { ...base, error: 'unknown_session' };
+    }
+
+    const depth = paneHistorySize(req.sessionName);
+    if (depth === null) return { ...base, error: 'capture_failed' };
+
+    // Everything below this line the caller already has: the live window plus
+    // whatever it has paged in above it.
+    const held = STREAM_CAPTURE_LINES + before;
+    // Scrolled past the oldest line. An empty page rather than an error — the
+    // view stops, and stopping is not a failure.
+    if (depth <= held) return { ...base, before, content: '', lines: 0, hasMore: false };
+
+    const captured = capturePaneRange(req.sessionName, -(held + lines), -(held + 1));
+    if (!captured) return { ...base, error: 'capture_failed' };
+
+    const returned = countLines(captured.content);
+    return {
+        ...base,
+        before,
+        content: captured.content,
+        lines: returned,
+        truncated: captured.truncated,
+        hasMore: depth > held + returned,
+    };
+};
+
+/**
+ * Fit one capture into a WS frame. Cuts from the TOP: the bottom of the range
+ * is the part adjacent to what the reader already has — the live pane for a
+ * snapshot, the page below it for a history page — so cutting the other end
+ * would leave a hole exactly where the text has to join up.
+ */
+const capToFrameLimit = (raw: string): { content: string; truncated: boolean } => {
+    let content = raw;
+    let truncated = false;
+    while (Buffer.byteLength(content, 'utf-8') > SCREEN_PEEK_MAX_BYTES) {
+        const cut = content.indexOf('\n', Math.floor(content.length / 8));
+        content = cut > 0 ? content.slice(cut + 1) : content.slice(-SCREEN_PEEK_MAX_BYTES);
+        truncated = true;
+    }
+    return { content, truncated };
+};
+
 /** Raw pane capture + size cap. Shared by the request path and the
  *  post-injection auto-snapshot. */
 const capturePane = (
@@ -856,7 +1019,7 @@ const capturePane = (
     escapes = false,
     lines: number = SCREEN_PEEK_LINES,
 ): { content: string; truncated: boolean } | null => {
-    // `-e` keeps ANSI/color escapes for the xterm.js live stream. The
+    // `-e` keeps the ANSI/color escapes the live mirror renders; the
     // screen-peek path leaves it off so its <pre> renderer stays plain text.
     // `lines` sets how far back the capture reaches — the live stream grabs
     // more history so the mirror has room to scroll; SCREEN_PEEK_MAX_BYTES
@@ -869,15 +1032,7 @@ const capturePane = (
         stdio: ['ignore', 'pipe', 'pipe'],
     });
     if (r.status !== 0) return null;
-    let content = r.stdout ?? '';
-    let truncated = false;
-    while (Buffer.byteLength(content, 'utf-8') > SCREEN_PEEK_MAX_BYTES) {
-        // Cut from the top — the bottom of the pane is what the user needs.
-        const cut = content.indexOf('\n', Math.floor(content.length / 8));
-        content = cut > 0 ? content.slice(cut + 1) : content.slice(-SCREEN_PEEK_MAX_BYTES);
-        truncated = true;
-    }
-    return { content, truncated };
+    return capToFrameLimit(r.stdout ?? '');
 };
 
 /**
@@ -1006,7 +1161,7 @@ export interface StreamControl {
 // How far back the live-stream capture reaches — more than the screen-peek
 // window so the mirror has scrollback to scroll through. SCREEN_PEEK_MAX_BYTES
 // still caps the actual payload, so very wide panes get top-truncated.
-const STREAM_CAPTURE_LINES = 200;
+export const STREAM_CAPTURE_LINES = 200;
 export const STREAM_INTERVAL_MS = 400;
 // Burst cadence: right after a keystroke lands, the pane IS what the user is
 // staring at, so captures tighten for BURST_WINDOW_MS and then fall back to
@@ -1627,10 +1782,20 @@ export interface AgentCommandInput {
      *  Treat it as an ordering namespace, never as authentication — the worst
      *  a forged id buys is a different reorder lane for its own keystrokes. */
     deviceId?: string;
-    /** Named keys, ALLOWED_KEYS-validated. Mutually exclusive with `body`. */
+    /** Named keys, ALLOWED_KEYS-validated. Mutually exclusive with `body`/`insert`. */
     keys?: string[];
     /** Literal text; the injector appends the Enter, as on the REST path. */
     body?: string;
+    /**
+     * Literal text delivered WITHOUT the submitting Enter — the phone
+     * answering a y/n prompt, or typing half a command so a TUI menu opens.
+     *
+     * A separate field rather than a `submit: false` flag on `body`, and that
+     * is the whole point: a daemon too old to know this field sees no `body`
+     * either, so it injects nothing. The flag spelling would have had the old
+     * daemon submit text the user never meant to send.
+     */
+    insert?: string;
     /** Sender's monotonic counter, and the incarnation it counts within. */
     seq?: number;
     epoch?: number;
@@ -1664,6 +1829,9 @@ type ValidatedInput = SequencedInput & {
     /** Exactly one of these is set. */
     tokens: string[] | null;
     text: string | null;
+    /** Whether `text` carries its own submit. False for `insert` (and, vacuously,
+     *  for a key batch — the keys say for themselves what they are). */
+    submit: boolean;
 };
 
 /** A validated injection queued for delivery in seq order, carrying the socket
@@ -1700,11 +1868,11 @@ const isInputEnvelope = (v: unknown): v is EncryptedEphemeralPayload =>
  *  a subscriber can seal anything, including 400 keys. */
 const parseSealedInput = (
     json: string,
-): Pick<AgentCommandInput, 'keys' | 'body' | 'seq' | 'epoch' | 'sessionName'> | null => {
+): Pick<AgentCommandInput, 'keys' | 'body' | 'insert' | 'seq' | 'epoch' | 'sessionName'> | null => {
     try {
         const parsed: unknown = JSON.parse(json);
         if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
-        return parsed as Pick<AgentCommandInput, 'keys' | 'body' | 'seq' | 'epoch' | 'sessionName'>;
+        return parsed as Pick<AgentCommandInput, 'keys' | 'body' | 'insert' | 'seq' | 'epoch' | 'sessionName'>;
     } catch {
         return null;
     }
@@ -1734,14 +1902,24 @@ export const validateInputMessage = (msg: AgentCommandInput): InputCheck => {
     if (msg.keys !== undefined) {
         if (!isKeyList(msg.keys)) return { ok: false, reason: 'malformed keys' };
         if (msg.keys.length > MAX_INPUT_KEYS) return { ok: false, reason: `too many keys (${msg.keys.length})` };
-        if (msg.body !== undefined) return { ok: false, reason: 'keys and body are mutually exclusive' };
+        if (msg.body !== undefined || msg.insert !== undefined) {
+            return { ok: false, reason: 'keys are mutually exclusive with body/insert' };
+        }
         const tokens = resolveKeys(msg.keys);
         if (!tokens) return { ok: false, reason: `unknown key(s) [${msg.keys.join(' ')}]` };
-        return { ok: true, input: { ...base, tokens, text: null } };
+        return { ok: true, input: { ...base, tokens, text: null, submit: false } };
+    }
+    // Submitting and not-submitting the same text are opposite instructions,
+    // so a message carrying both means nothing — refuse rather than pick one.
+    if (msg.insert !== undefined) {
+        if (msg.body !== undefined) return { ok: false, reason: 'insert and body are mutually exclusive' };
+        if (typeof msg.insert !== 'string' || !msg.insert) return { ok: false, reason: 'empty input' };
+        if (msg.insert.length > MAX_INPUT_BODY_CHARS) return { ok: false, reason: `insert too long (${msg.insert.length})` };
+        return { ok: true, input: { ...base, tokens: null, text: msg.insert, submit: false } };
     }
     if (typeof msg.body !== 'string' || !msg.body) return { ok: false, reason: 'empty input' };
     if (msg.body.length > MAX_INPUT_BODY_CHARS) return { ok: false, reason: `body too long (${msg.body.length})` };
-    return { ok: true, input: { ...base, tokens: null, text: msg.body } };
+    return { ok: true, input: { ...base, tokens: null, text: msg.body, submit: true } };
 };
 
 /**
@@ -1754,7 +1932,7 @@ const deliverInput = (input: PendingInput): void => {
     const injected = activeStreams.has(input.sessionName)
         && (input.tokens
             ? tryInjectKeys(input.sessionName, input.tokens, {})
-            : tryInject(input.sessionName, input.text ?? '', {}));
+            : tryInject(input.sessionName, input.text ?? '', {}, input.submit));
     // Every refusal reachable from here — dead lease, shell pane, rate limit,
     // a failed send-keys — used to be silent, which contradicts the contract
     // above: the sender would keep waiting on a keystroke that never lands
@@ -1917,6 +2095,7 @@ const handleEncryptedInput = (msg: AgentCommandInput, send: SendEphemeral): void
             deviceId: msg.deviceId,
             keys: payload.keys,
             body: payload.body,
+            insert: payload.insert,
         });
         if (!checked.ok) return refuse(checked.reason);
         enqueueInput(checked.input, send);
@@ -2094,6 +2273,9 @@ interface PushItem {
     /** Named keys (Esc/arrows/Enter) to inject instead of body text —
      *  drives full-screen modals the phone can't escape with text. */
     keys?: string[];
+    /** Literal text delivered WITHOUT the submitting Enter (see the same field
+     *  on AgentCommandInput for why it is a field and not a flag). */
+    insert?: string;
     /** Optional image/file attachments (agent.command only, plaintext). */
     files?: PushFileAttachment[];
 }
@@ -2101,6 +2283,8 @@ interface PushItem {
 interface HandlePushDeps {
     paneCommand?: (session: string) => string | null;
     inject?: (session: string, text: string) => boolean;
+    /** Paste-only sibling of `inject` — text without the submitting Enter. */
+    insertText?: (session: string, text: string) => boolean;
     sendKeys?: (session: string, tokens: string[]) => boolean;
     rateLimit?: (session: string, now?: number, cost?: number) => boolean;
     now?: () => number;
@@ -2164,15 +2348,31 @@ export const writeRemoteMarker = (
 
 const defaultPaneCwd = (session: string): string | null => readPaneInfo(session).currentPath;
 
-const tryInject = (session: string, text: string, deps: HandlePushDeps): boolean => {
+/**
+ * Type text into a pane. `submit` false stops after the paste, leaving the
+ * text in the prompt for the user to send themselves.
+ *
+ * The rate cost is `SUBMIT_COST` either way. An insert is not itself an
+ * instruction, but it becomes one the moment the user presses Enter, and
+ * charging it less would open a cheaper door into the same bucket.
+ *
+ * The remote-origin marker (ADR-0002) is written for an insert too: the hook
+ * matches the submitted prompt against its digest, and after an insert the
+ * submit is the user's own keypress. Text they edit before sending simply
+ * fails the match and the marker expires, which is the best-effort contract
+ * that path already has.
+ */
+const tryInject = (session: string, text: string, deps: HandlePushDeps, submit = true): boolean => {
     if (!text) {
         log(`! ${session}: empty text — drop`);
         return false;
     }
     if (!passesInjectGuards(session, deps, SUBMIT_COST)) return false;
-    const ok = (deps.inject ?? injectKeys)(session, text);
+    const ok = submit
+        ? (deps.inject ?? injectKeys)(session, text)
+        : (deps.insertText ?? pasteText)(session, text);
     const preview = text.length > 60 ? text.slice(0, 60) + '…' : text;
-    log(`${ok ? '→' : '✗'} ${session}: ${preview}`);
+    log(`${ok ? (submit ? '→' : '⇢') : '✗'} ${session}: ${preview}`);
     if (ok) {
         noteStreamInput(session);
         const cwd = (deps.paneCwd ?? defaultPaneCwd)(session);
@@ -2351,6 +2551,18 @@ export const handlePush = async (
         const injected = tryInjectKeys(push.agentSessionName, tokens, deps);
         if (injected) deps.onKeysInjected?.(push.agentSessionName);
         return injected;
+    }
+
+    // Text without the submit — the phone answering a y/n prompt, or typing
+    // half a command so a TUI menu opens. No attachments: an insert is a
+    // partial line the user is still editing, and file paths appended to it on
+    // their own rows would be in the way rather than useful.
+    if (push.insert !== undefined) {
+        if (push.body) {
+            log(`! ${push.agentSessionName}: insert and body are mutually exclusive — drop`);
+            return false;
+        }
+        return tryInject(push.agentSessionName, push.insert, deps, false);
     }
 
     // Download any attachments BEFORE injecting so the agent can read the
@@ -2679,7 +2891,11 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                     !handleCommandInput(m.data as AgentCommandInput, sendEphemeral) &&
                     !handleStreamControl(m.data as StreamControl, sendEphemeral)
                 ) {
-                    const reply = handleScreenRequest(m.data as ScreenRequest);
+                    // Two pull shapes share this tail: the one-shot peek at the
+                    // live pane, and a page of the scrollback above it.
+                    const reply =
+                        handleScreenRequest(m.data as ScreenRequest)
+                        ?? handleScreenHistoryRequest(m.data as ScreenHistoryRequest);
                     if (reply) sendEphemeral(reply);
                 }
             }
