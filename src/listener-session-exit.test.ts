@@ -9,7 +9,7 @@
  * button that can silently destroy a working agent.
  */
 
-import { mkdtempSync } from 'fs';
+import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
@@ -63,6 +63,7 @@ process.env.XDG_STATE_HOME = join(TMP, 'state');
 
 const { handleSessionExitRequest, computeListenerDeviceId, SESSION_EXIT_STEP_MS } =
     await import('./listener.js');
+const { rememberSessions } = await import('./session-registry.js');
 
 describe('agent.session.exit.request — ending a running session', () => {
     const device = computeListenerDeviceId();
@@ -81,12 +82,25 @@ describe('agent.session.exit.request — ending a running session', () => {
 
     /** Run out the whole signal sequence, letting each awaited wait resolve. */
     const runOutTheSequence = async () => {
-        for (let i = 0; i < 4; i += 1) {
+        for (let i = 0; i < 6; i += 1) {
             await vi.advanceTimersByTimeAsync(SESSION_EXIT_STEP_MS);
         }
     };
 
-    const signals = () => tmuxCalls.filter((c) => c[0] === 'send-keys').map((c) => c.slice(3));
+    /**
+     * Everything sent to the pane, in order, normalised past tmux's two
+     * argument shapes: `send-keys -l -t <s> <text>` types text, while
+     * `send-keys -t <s> <tokens…>` presses named keys.
+     */
+    const signals = () =>
+        tmuxCalls
+            .filter((c) => c[0] === 'send-keys')
+            .map((c) => (c[1] === '-l' ? ['type', c[4]] : c.slice(3)));
+
+    /** What this machine recorded about the session while it was alive — the
+     *  only place the agent's identity (and so its quit command) comes from. */
+    const remember = (agentKind = 'claude') =>
+        rememberSessions([{ name: 'zeph-api', cwd: TMP, agentKind }]);
 
     beforeEach(() => {
         vi.useFakeTimers();
@@ -96,6 +110,7 @@ describe('agent.session.exit.request — ending a running session', () => {
         liveSessions = ['zeph-api'];
         diesAfterSignals = 1;
         signalsSeen = 0;
+        rmSync(join(TMP, 'state'), { recursive: true, force: true });
     });
     afterEach(() => {
         vi.useRealTimers();
@@ -134,8 +149,36 @@ describe('agent.session.exit.request — ending a running session', () => {
         expect(signals()).toEqual([]);
     });
 
-    it('asks before it insists — interrupt first, then end-of-input', async () => {
+    /**
+     * The order this arrived at the hard way. A first version sent only key
+     * presses and was reported as `still_running` against a real Claude Code
+     * pane: it holds its prompt through `C-c` and through `C-d` alike. An
+     * agent that knows how to quit has to be asked in its own words.
+     */
+    it('interrupts, asks the agent to quit, then falls back to end-of-input', async () => {
+        remember('claude');
         diesAfterSignals = null; // a session that ignores everything
+
+        ask();
+        await runOutTheSequence();
+
+        expect(signals()).toEqual([['C-c'], ['type', '/exit'], ['Enter'], ['C-d'], ['C-d']]);
+    });
+
+    // A quit command is only sent where one has been verified against the real
+    // binary — typing a guess puts it at whatever prompt is actually there.
+    it('sends only signals for an agent with no known quit command', async () => {
+        remember('codex');
+        diesAfterSignals = null;
+
+        ask();
+        await runOutTheSequence();
+
+        expect(signals()).toEqual([['C-c'], ['C-d'], ['C-d']]);
+    });
+
+    it('sends only signals for a session this machine never recorded', async () => {
+        diesAfterSignals = null;
 
         ask();
         await runOutTheSequence();

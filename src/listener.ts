@@ -1237,20 +1237,29 @@ export interface SessionExitResult {
 }
 
 /**
- * The signals an ending session is asked to act on, in order.
+ * What an ending session is asked to act on, in order.
  *
- * `C-c` interrupts whatever the agent is doing. `C-d` is end-of-input, which
- * every REPL here treats as "I am done" — the agent gets to close its own
- * files and write whatever it writes on exit. The second `C-d` is for the
- * shell the agent leaves behind: exiting it closes the pane, and a session
- * whose last pane closes is over.
+ * `C-c` first, to interrupt whatever is running and clear the input line —
+ * without it a quit command typed next would land after whatever was already
+ * half-typed there.
+ *
+ * Then the agent's own quit command, when it has one. This is the step the
+ * first version lacked and the reason it did not work: Claude Code holds its
+ * prompt through `C-c` and through `C-d` alike, so a session driven only by
+ * key presses stayed exactly where it was and had to be reported as still
+ * running. An agent that knows how to quit should be asked in its own words.
+ *
+ * `C-d` last, twice. End-of-input closes a REPL that has no quit command, and
+ * closes the shell the agent leaves behind — a session whose last pane exits
+ * is over. Harmless where it is not needed: the sequence stops the moment the
+ * session is gone.
  *
  * Deliberately no `kill-session` at the end. A forced kill would make this
  * always succeed, at the cost of taking the choice away from an agent that was
- * mid-write — and the sequence stops the moment the session is gone anyway, so
- * a well-behaved agent never sees the later signals.
+ * mid-write.
  */
-const EXIT_SEQUENCE: readonly string[][] = [['C-c'], ['C-d'], ['C-d']];
+const EXIT_SIGNALS_BEFORE_QUIT: readonly string[][] = [['C-c']];
+const EXIT_SIGNALS_AFTER_QUIT: readonly string[][] = [['C-d'], ['C-d']];
 /** Time given to each signal before the next one is tried. */
 export const SESSION_EXIT_STEP_MS = 1_500;
 
@@ -1292,11 +1301,28 @@ export const handleSessionExitRequest = (
     if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return answer({ error: 'rate_limited' });
     if (!sessionExists(sessionName)) return answer({ error: 'unknown_session' });
 
+    // The agent's own quit command, if this machine recorded which agent it is
+    // and that agent has one. A session the registry never saw still gets the
+    // signals — less likely to work, but nothing here depends on the record.
+    const quitCommand = REMOTE_AGENTS.find(
+        (a) => a.kind === recallSession(sessionName)?.agentKind,
+    )?.quitCommand;
+
     void (async () => {
-        for (const tokens of EXIT_SEQUENCE) {
-            // Stop as soon as it worked — the remaining signals would land in
-            // whatever tmux gives that name next.
-            if (!sessionExists(sessionName)) break;
+        // Stop as soon as it worked — anything sent after the session is gone
+        // lands in whatever tmux gives that name next.
+        const stillThere = () => sessionExists(sessionName);
+        for (const tokens of EXIT_SIGNALS_BEFORE_QUIT) {
+            if (!stillThere()) break;
+            injectNamedKeys(sessionName, tokens);
+            await wait(SESSION_EXIT_STEP_MS);
+        }
+        if (quitCommand && stillThere()) {
+            injectKeys(sessionName, quitCommand);
+            await wait(SESSION_EXIT_STEP_MS);
+        }
+        for (const tokens of EXIT_SIGNALS_AFTER_QUIT) {
+            if (!stillThere()) break;
             injectNamedKeys(sessionName, tokens);
             await wait(SESSION_EXIT_STEP_MS);
         }
