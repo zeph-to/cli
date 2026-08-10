@@ -1220,6 +1220,97 @@ export const handleSessionResumeRequest = (
     return reply({ resumed: true });
 };
 
+export interface SessionExitRequest {
+    subtype?: string;
+    targetDeviceId?: string;
+    sessionName?: string;
+    requestId?: string;
+}
+
+export interface SessionExitResult {
+    subtype: 'agent.session.exit.result';
+    requestId: string;
+    sessionName: string;
+    exited?: true;
+    error?: string;
+    at: string;
+}
+
+/**
+ * The signals an ending session is asked to act on, in order.
+ *
+ * `C-c` interrupts whatever the agent is doing. `C-d` is end-of-input, which
+ * every REPL here treats as "I am done" — the agent gets to close its own
+ * files and write whatever it writes on exit. The second `C-d` is for the
+ * shell the agent leaves behind: exiting it closes the pane, and a session
+ * whose last pane closes is over.
+ *
+ * Deliberately no `kill-session` at the end. A forced kill would make this
+ * always succeed, at the cost of taking the choice away from an agent that was
+ * mid-write — and the sequence stops the moment the session is gone anyway, so
+ * a well-behaved agent never sees the later signals.
+ */
+const EXIT_SEQUENCE: readonly string[][] = [['C-c'], ['C-d'], ['C-d']];
+/** Time given to each signal before the next one is tried. */
+export const SESSION_EXIT_STEP_MS = 1_500;
+
+const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Ask a session to end, and report whether it did.
+ *
+ * Answers late on purpose: the whole point is to let the agent wind itself
+ * down, so the reply has to wait long enough to know whether it did. A session
+ * that is still there when the signals run out is reported as still there
+ * rather than forced — "I asked and it refused" is a true answer, and a phone
+ * that can silently destroy a working agent is a worse thing to have built.
+ */
+export const handleSessionExitRequest = (
+    req: SessionExitRequest,
+    send: (data: Record<string, unknown>) => void,
+): boolean => {
+    if (req.subtype !== 'agent.session.exit.request') return false;
+    if (!req.requestId || !req.sessionName) return false;
+    if (req.targetDeviceId !== computeListenerDeviceId()) return false;
+
+    const sessionName = req.sessionName;
+    const requestId = req.requestId;
+    const answer = (fields: Partial<SessionExitResult>): true => {
+        send({
+            subtype: 'agent.session.exit.result',
+            requestId,
+            sessionName,
+            at: new Date().toISOString(),
+            ...fields,
+        });
+        return true;
+    };
+
+    // Same budget as resume and as a submitted command: ending a session is a
+    // session-lifecycle action, and pricing it like a keystroke would let a
+    // flood through the cheaper door.
+    if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return answer({ error: 'rate_limited' });
+    if (!sessionExists(sessionName)) return answer({ error: 'unknown_session' });
+
+    void (async () => {
+        for (const tokens of EXIT_SEQUENCE) {
+            // Stop as soon as it worked — the remaining signals would land in
+            // whatever tmux gives that name next.
+            if (!sessionExists(sessionName)) break;
+            injectNamedKeys(sessionName, tokens);
+            await wait(SESSION_EXIT_STEP_MS);
+        }
+        if (sessionExists(sessionName)) {
+            log(`✗ exit ${sessionName}: still running after the exit signals`);
+            answer({ error: 'still_running' });
+            return;
+        }
+        log(`⏻ exit ${sessionName}: ended`);
+        answer({ exited: true });
+    })();
+    return true;
+};
+
 /** Whether tmux already holds a session by this name. */
 const sessionExists = (name: string): boolean =>
     spawnSync('tmux', tmuxArgs(['has-session', '-t', name]), {
@@ -3370,6 +3461,7 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                     // it takes nothing from the wire but a session name — the
                     // rest comes from what this machine wrote down itself.
                     && !handleSessionResumeRequest(m.data as SessionResumeRequest, sendEphemeral)
+                    && !handleSessionExitRequest(m.data as SessionExitRequest, sendEphemeral)
                     // Reading the session's changes: read-only git in the repo
                     // the registry recorded, never a path or command from here.
                     && !handleDiffFilesRequest(m.data as DiffFilesRequest, sendEphemeral)
