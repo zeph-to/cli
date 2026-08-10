@@ -78,6 +78,8 @@ process.env.XDG_STATE_HOME = join(TMP, 'state');
 
 const {
   handleScreenHistoryRequest,
+  handleStreamControl,
+  stopAllStreams,
   computeListenerDeviceId,
   STREAM_CAPTURE_LINES,
   SCREEN_HISTORY_MAX_LINES,
@@ -97,62 +99,109 @@ describe('agent.screen.history.request — one page of scrollback above the live
     targetDeviceId: device,
     sessionName: 'zeph-a',
     requestId: 'r1',
-    before: 0,
+    before: 200,
     lines: 10,
     ...over,
   });
 
+  /** Replies the handler put on the ephemeral channel, in order. */
+  let sent: Array<Record<string, unknown>>;
+  const send = (data: Record<string, unknown>) => { sent.push(data); };
+
+  /** Ask, and hand back what came out. */
+  const ask = (over: Record<string, unknown> = {}) => {
+    const claimed = handleScreenHistoryRequest(request(over), send);
+    return { claimed, reply: sent.at(-1) };
+  };
+
+  /**
+   * A history pull answers only under a live stream lease — that lease carries
+   * the subscriber key the page has to be sealed for.
+   */
+  const openStream = (subscriberPublicKey?: string) => {
+    handleStreamControl(
+      {
+        subtype: 'agent.stream.start',
+        targetDeviceId: device,
+        sessionName: 'zeph-a',
+        renew: true,
+        ...(subscriberPublicKey ? { subscriberPublicKey } : {}),
+      },
+      send,
+    );
+    sent = [];
+    tmuxCalls = [];
+  };
+
   beforeEach(() => {
+    vi.useFakeTimers();
     vi.spyOn(console, 'log').mockImplementation(() => {});
     tmuxCalls = [];
+    sent = [];
     captureFails = false;
     fillPane(STREAM_CAPTURE_LINES + 100);
   });
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    stopAllStreams();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
 
-  /** The history captures only. The inventory sweep captures panes too (that
-   *  is how session state is derived), and those are not what these assert. */
+  /** The history captures only. The inventory sweep and the stream loop capture
+   *  panes too, and those are not what these assert. */
   const historyCaptures = () =>
     tmuxCalls.filter((c) => c[0] === 'capture-pane' && c.includes('-E'));
 
   describe('routing', () => {
     it('does not claim other ephemeral traffic', () => {
-      expect(handleScreenHistoryRequest({ subtype: 'clipboard', targetDeviceId: device })).toBeNull();
-      expect(handleScreenHistoryRequest({})).toBeNull();
+      expect(handleScreenHistoryRequest({ subtype: 'clipboard', targetDeviceId: device }, send)).toBe(false);
+      expect(handleScreenHistoryRequest({}, send)).toBe(false);
       // The one-shot peek is a different subtype and keeps its own handler.
-      expect(handleScreenHistoryRequest(request({ subtype: 'agent.screen.request' }))).toBeNull();
+      expect(handleScreenHistoryRequest(request({ subtype: 'agent.screen.request' }), send)).toBe(false);
+      expect(sent).toEqual([]);
     });
 
     it('ignores a request addressed to another machine', () => {
-      expect(handleScreenHistoryRequest(request({ targetDeviceId: 'dev_someone_else' }))).toBeNull();
+      expect(ask({ targetDeviceId: 'dev_someone_else' }).claimed).toBe(false);
     });
 
     it('ignores a request with no requestId or no session', () => {
-      expect(handleScreenHistoryRequest(request({ requestId: undefined }))).toBeNull();
-      expect(handleScreenHistoryRequest(request({ sessionName: undefined }))).toBeNull();
+      expect(ask({ requestId: undefined }).claimed).toBe(false);
+      expect(ask({ sessionName: undefined }).claimed).toBe(false);
+      expect(sent).toEqual([]);
     });
 
     // Same posture as the peek: the phone may read exactly the panes the
     // inventory already exposes to it, and nothing else.
     it('refuses a session the inventory does not expose, without touching the pane', () => {
-      const reply = handleScreenHistoryRequest(request({ sessionName: 'zeph-not-there' }));
-
-      expect(reply?.error).toBe('unknown_session');
+      openStream();
+      expect(ask({ sessionName: 'zeph-not-there' }).reply?.error).toBe('unknown_session');
       expect(tmuxCalls.some((c) => c.includes('zeph-not-there'))).toBe(false);
     });
 
-    it('reports a failed capture instead of answering with an empty page', () => {
-      captureFails = true;
-      const reply = handleScreenHistoryRequest(request());
+    // Without a lease there is no subscriber key, so a page could only be
+    // answered in the clear — which is the downgrade the stream half refuses.
+    it('refuses a pull with no live stream behind it', () => {
+      const { reply } = ask();
 
-      expect(reply?.error).toBe('capture_failed');
-      expect(reply?.content).toBeUndefined();
+      expect(reply?.error).toBe('no_stream');
+      expect(historyCaptures()).toHaveLength(0);
+    });
+
+    it('reports a failed capture instead of answering with an empty page', () => {
+      openStream();
+      captureFails = true;
+
+      expect(ask().reply?.error).toBe('capture_failed');
+      expect(ask().reply?.content).toBeUndefined();
     });
   });
 
   describe('range', () => {
+    beforeEach(() => openStream());
+
     it('reads the page directly above the scrollback the caller holds', () => {
-      const reply = handleScreenHistoryRequest(request({ before: 200, lines: 10 }));
+      const { reply } = ask({ before: 200, lines: 10 });
 
       const capture = historyCaptures()[0];
       expect(capture[capture.indexOf('-S') + 1]).toBe('-210');
@@ -162,19 +211,19 @@ describe('agent.screen.history.request — one page of scrollback above the live
     });
 
     it('walks further back as the caller reports more held lines', () => {
-      handleScreenHistoryRequest(request({ before: 210, lines: 10 }));
+      ask({ before: 210, lines: 10 });
 
       const capture = historyCaptures()[0];
       expect(capture[capture.indexOf('-S') + 1]).toBe('-220');
       expect(capture[capture.indexOf('-E') + 1]).toBe('-211');
     });
 
-    // The frame the caller is holding may have been trimmed by the byte cap, so
-    // it holds FEWER lines than the capture asked for. Starting the page at the
-    // constant instead of at what it actually holds would skip the lines in
-    // between, and no later page can ever reach back down to them.
+    // The frame the caller holds may have been trimmed by the byte cap, so it
+    // holds FEWER lines than the capture asked for. Starting the page at the
+    // constant instead would skip the lines in between, and no later page can
+    // reach back down to them.
     it('starts where a truncated frame actually ends, not where the constant says', () => {
-      handleScreenHistoryRequest(request({ before: 12, lines: 10 }));
+      ask({ before: 12, lines: 10 });
 
       const capture = historyCaptures()[0];
       expect(capture[capture.indexOf('-S') + 1]).toBe('-22');
@@ -182,7 +231,7 @@ describe('agent.screen.history.request — one page of scrollback above the live
     });
 
     it('assumes the full capture window when the caller names no offset', () => {
-      handleScreenHistoryRequest(request({ before: undefined, lines: 10 }));
+      ask({ before: undefined, lines: 10 });
 
       const capture = historyCaptures()[0];
       expect(capture[capture.indexOf('-S') + 1]).toBe(String(-(STREAM_CAPTURE_LINES + 10)));
@@ -191,33 +240,31 @@ describe('agent.screen.history.request — one page of scrollback above the live
 
     it('returns the lines that sit there, contiguous with the page before it', () => {
       const depth = STREAM_CAPTURE_LINES + 100;
-      const first = handleScreenHistoryRequest(request({ before: 200, lines: 10 }));
-      const second = handleScreenHistoryRequest(request({ before: 210, lines: 10, requestId: 'r2' }));
+      const first = ask({ before: 200, lines: 10 }).reply;
+      const second = ask({ before: 210, lines: 10, requestId: 'r2' }).reply;
 
-      // The live window holds the last STREAM_CAPTURE_LINES lines, so page one
-      // ends just above it and page two ends where page one began.
-      const firstTop = depth - STREAM_CAPTURE_LINES - 10;
-      expect(first?.content?.split('\n')[0]).toBe(`line-${firstTop}`);
-      expect(second?.content?.split('\n').filter(Boolean).at(-1)).toBe(`line-${firstTop - 1}`);
+      const firstTop = depth - 210;
+      expect(String(first?.content).split('\n')[0]).toBe(`line-${firstTop}`);
+      expect(String(second?.content).split('\n').filter(Boolean).at(-1)).toBe(`line-${firstTop - 1}`);
     });
 
     it('keeps the ANSI colours, the way the live frames do', () => {
-      handleScreenHistoryRequest(request({ before: 200 }));
+      ask();
 
       expect(historyCaptures()[0]).toContain('-e');
     });
   });
 
   describe('ends of the history', () => {
-    it('says there is more above the page it returned', () => {
-      const reply = handleScreenHistoryRequest(request({ before: 200, lines: 10 }));
+    beforeEach(() => openStream());
 
-      expect(reply?.hasMore).toBe(true);
+    it('says there is more above the page it returned', () => {
+      expect(ask({ before: 200, lines: 10 }).reply?.hasMore).toBe(true);
     });
 
     it('says there is nothing more once the page reaches the oldest line', () => {
       fillPane(STREAM_CAPTURE_LINES + 10);
-      const reply = handleScreenHistoryRequest(request({ before: 200, lines: 10 }));
+      const { reply } = ask({ before: 200, lines: 10 });
 
       expect(reply?.lines).toBe(10);
       expect(reply?.hasMore).toBe(false);
@@ -227,7 +274,7 @@ describe('agent.screen.history.request — one page of scrollback above the live
     // end: answer emptily rather than with an error, so the view can just stop.
     it('answers an exhausted history with an empty page, not an error', () => {
       fillPane(STREAM_CAPTURE_LINES + 5);
-      const reply = handleScreenHistoryRequest(request({ before: STREAM_CAPTURE_LINES + 5, lines: 10 }));
+      const { reply } = ask({ before: STREAM_CAPTURE_LINES + 5, lines: 10 });
 
       expect(reply?.error).toBeUndefined();
       expect(reply?.content).toBe('');
@@ -238,8 +285,10 @@ describe('agent.screen.history.request — one page of scrollback above the live
   });
 
   describe('what the caller is allowed to ask for', () => {
+    beforeEach(() => openStream());
+
     it('caps the page size — a page the transport cannot carry helps nobody', () => {
-      handleScreenHistoryRequest(request({ before: 0, lines: SCREEN_HISTORY_MAX_LINES + 500 }));
+      ask({ before: 0, lines: SCREEN_HISTORY_MAX_LINES + 500 });
 
       const capture = historyCaptures()[0];
       expect(capture[capture.indexOf('-S') + 1]).toBe(String(-SCREEN_HISTORY_MAX_LINES));
@@ -249,35 +298,30 @@ describe('agent.screen.history.request — one page of scrollback above the live
     // a range nobody can reason about, so it is refused rather than coerced.
     it('refuses a range that is not whole and non-negative', () => {
       for (const bad of [-1, 1.5, NaN, Infinity]) {
-        expect(handleScreenHistoryRequest(request({ before: bad }))?.error).toBe('bad_range');
-        expect(handleScreenHistoryRequest(request({ lines: bad }))?.error).toBe('bad_range');
+        expect(ask({ before: bad }).reply?.error).toBe('bad_range');
+        expect(ask({ lines: bad }).reply?.error).toBe('bad_range');
       }
       expect(historyCaptures()).toHaveLength(0);
     });
 
     it('refuses a range whose numbers are not numbers at all', () => {
-      expect(handleScreenHistoryRequest(request({ before: '10' }))?.error).toBe('bad_range');
-      expect(handleScreenHistoryRequest(request({ lines: 'ten' }))?.error).toBe('bad_range');
+      expect(ask({ before: '10' }).reply?.error).toBe('bad_range');
+      expect(ask({ lines: 'ten' }).reply?.error).toBe('bad_range');
     });
 
     // JSON has no undefined: a client that omits a field may send null for it,
     // and that means "unspecified", not "zero lines".
     it('reads a default page when a field arrives as null', () => {
-      const reply = handleScreenHistoryRequest(request({ before: null, lines: null }));
+      const { reply } = ask({ before: null, lines: null });
 
       expect(reply?.error).toBeUndefined();
-      expect(reply?.lines).toBeGreaterThan(0);
-    });
-
-    it('reads one default page when the caller names no size', () => {
-      const reply = handleScreenHistoryRequest(request({ before: undefined, lines: undefined }));
-
-      expect(reply?.error).toBeUndefined();
-      expect(reply?.lines).toBeGreaterThan(0);
+      expect(Number(reply?.lines)).toBeGreaterThan(0);
     });
   });
 
   describe('payload cap', () => {
+    beforeEach(() => openStream());
+
     it('trims from the top and reports how many lines actually came back', () => {
       // 40KB of history in a 10-line page: past SCREEN_PEEK_MAX_BYTES, so the
       // reply is cut. Cutting from the TOP is what keeps the page contiguous
@@ -285,12 +329,77 @@ describe('agent.screen.history.request — one page of scrollback above the live
       paneLines = Array.from({ length: STREAM_CAPTURE_LINES + 20 }, () => 'x'.repeat(4096));
       historySize = { 'zeph-a': paneLines.length };
 
-      const reply = handleScreenHistoryRequest(request({ before: 200, lines: 10 }));
+      const { reply } = ask({ before: 200, lines: 10 });
 
       expect(reply?.truncated).toBe(true);
-      expect(reply?.lines).toBeLessThan(10);
-      expect(reply?.lines).toBeGreaterThan(0);
-      expect(Buffer.byteLength(reply?.content ?? '', 'utf-8')).toBeLessThanOrEqual(24 * 1024);
+      expect(Number(reply?.lines)).toBeLessThan(10);
+      expect(Number(reply?.lines)).toBeGreaterThan(0);
+      expect(Buffer.byteLength(String(reply?.content), 'utf-8')).toBeLessThanOrEqual(24 * 1024);
+    });
+  });
+
+  /**
+   * History is the same pane text the frames carry. A stream the user chose to
+   * encrypt must not hand that text to the relay just because it was asked for
+   * by scrolling instead of by watching.
+   */
+  describe('an encrypted stream', () => {
+    const recipientKey = async (): Promise<string> => {
+      const { webcrypto } = await import('node:crypto');
+      const wc = webcrypto as unknown as Crypto;
+      const pair = (await wc.subtle.generateKey(
+        { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits'],
+      )) as CryptoKeyPair;
+      const spki = new Uint8Array(await wc.subtle.exportKey('spki', pair.publicKey));
+      let bin = '';
+      for (let i = 0; i < spki.length; i++) bin += String.fromCharCode(spki[i]);
+      return btoa(bin);
+    };
+
+    /** The seal is async (an ECDH derive, then AES): pump until the reply that
+     *  it produces shows up, rather than guessing at a number of ticks. */
+    const flush = async () => {
+      for (let i = 0; i < 50 && sent.length === 0; i++) await vi.advanceTimersByTimeAsync(1);
+    };
+
+    it('seals the page for the subscriber instead of sending it in the clear', async () => {
+      const { initDeviceCrypto } = await import('./crypto.js');
+      await initDeviceCrypto();
+      openStream(await recipientKey());
+
+      handleScreenHistoryRequest(request({ before: 200, lines: 10 }), send);
+      await flush();
+
+      const reply = sent.at(-1);
+      expect(reply?.content).toBeUndefined();
+      expect(reply?.encrypted).toBeDefined();
+      const ciphertext = (reply?.encrypted as { ciphertext: string }).ciphertext;
+      expect(ciphertext).not.toContain('line-');
+      // The page metadata still rides in the clear, exactly as the frames do:
+      // a line count without the lines says nothing.
+      expect(reply?.lines).toBe(10);
+      expect(reply?.hasMore).toBe(true);
+    });
+
+    it('reports a failed seal rather than falling back to plaintext', async () => {
+      openStream('not-a-key');
+
+      handleScreenHistoryRequest(request({ before: 200, lines: 10 }), send);
+      await flush();
+
+      const reply = sent.at(-1);
+      expect(reply?.error).toBe('encrypt_failed');
+      expect(reply?.content).toBeUndefined();
+      expect(reply?.encrypted).toBeUndefined();
+    });
+
+    it('sends the page in the clear only when the stream itself is in the clear', () => {
+      openStream();
+
+      handleScreenHistoryRequest(request({ before: 200, lines: 10 }), send);
+
+      expect(sent.at(-1)?.content).toContain('line-');
+      expect(sent.at(-1)?.encrypted).toBeUndefined();
     });
   });
 });

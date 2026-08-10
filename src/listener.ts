@@ -912,6 +912,9 @@ export interface ScreenHistorySnapshot {
     /** Whether older lines still exist above this page. */
     hasMore?: boolean;
     truncated?: boolean;
+    /** The page sealed for the stream's subscriber — present INSTEAD of
+     *  `content` whenever the stream it belongs to is encrypted. */
+    encrypted?: EncryptedEphemeralPayload;
     error?: string;
     capturedAt: string;
 }
@@ -958,60 +961,84 @@ const countLines = (content: string): number =>
 
 /**
  * Answer a phone's request for one page of scrollback above the live window.
+ * Returns true when the message was ours to answer, so the caller stops routing
+ * it; the reply goes out through `send`, after the seal when there is one.
  *
- * Same security posture as the one-shot peek it sits beside: addressed to this
- * machine, only for sessions the inventory already exposes, and charged to the
- * same per-session token bucket. It reads the pane through tmux and nothing
- * else — no new command surface.
+ * Same security posture as the one-shot peek it sits beside — addressed to this
+ * machine, only for sessions the inventory already exposes, charged to the same
+ * per-session token bucket, and reading the pane through tmux and nothing else —
+ * plus one the peek does not have: it answers ONLY under a live stream lease.
+ * That is what makes E2EE possible here. History is the same pane text the
+ * frames carry, so on an encrypted stream it is sealed for the same subscriber
+ * key and never falls back to plaintext; without a lease there is no key to
+ * seal for, and a pull that answered anyway would be the downgrade the stream
+ * half refuses.
  */
 export const handleScreenHistoryRequest = (
     req: ScreenHistoryRequest,
-): ScreenHistorySnapshot | null => {
-    if (req.subtype !== 'agent.screen.history.request') return null;
-    if (!req.requestId || !req.sessionName) return null;
-    if (req.targetDeviceId !== computeListenerDeviceId()) return null;
+    send: (data: Record<string, unknown>) => void,
+): boolean => {
+    if (req.subtype !== 'agent.screen.history.request') return false;
+    if (!req.requestId || !req.sessionName) return false;
+    if (req.targetDeviceId !== computeListenerDeviceId()) return false;
 
-    const capturedAt = new Date().toISOString();
     const base = {
         subtype: 'agent.screen.history.snapshot' as const,
         requestId: req.requestId,
         sessionName: req.sessionName,
-        capturedAt,
+        capturedAt: new Date().toISOString(),
+    };
+    /** Answer and claim the message. */
+    const reply = (fields: Partial<ScreenHistorySnapshot>): true => {
+        send({ ...base, ...fields });
+        return true;
     };
 
     const before = req.before ?? STREAM_CAPTURE_LINES;
     const asked = req.lines ?? SCREEN_HISTORY_DEFAULT_LINES;
     if (!isPageOffset(before) || !isPageOffset(asked) || asked === 0) {
-        return { ...base, error: 'bad_range' };
+        return reply({ error: 'bad_range' });
     }
     const lines = Math.min(asked, SCREEN_HISTORY_MAX_LINES);
 
-    if (!checkRateLimit(`screen:${req.sessionName}`)) return { ...base, error: 'rate_limited' };
+    if (!checkRateLimit(`screen:${req.sessionName}`)) return reply({ error: 'rate_limited' });
     if (!collectSessions().some((s) => s.name === req.sessionName)) {
-        return { ...base, error: 'unknown_session' };
+        return reply({ error: 'unknown_session' });
     }
+    const stream = activeStreams.get(req.sessionName);
+    if (!stream) return reply({ error: 'no_stream' });
 
     const depth = paneHistorySize(req.sessionName);
-    if (depth === null) return { ...base, error: 'capture_failed' };
+    if (depth === null) return reply({ error: 'capture_failed' });
 
     // Everything below this line the caller already has.
     const held = before;
     // Scrolled past the oldest line. An empty page rather than an error — the
-    // view stops, and stopping is not a failure.
-    if (depth <= held) return { ...base, before, content: '', lines: 0, hasMore: false };
+    // view stops, and stopping is not a failure. Nothing to seal either.
+    if (depth <= held) return reply({ before, content: '', lines: 0, hasMore: false });
 
     const captured = capturePaneRange(req.sessionName, -(held + lines), -(held + 1));
-    if (!captured) return { ...base, error: 'capture_failed' };
+    if (!captured) return reply({ error: 'capture_failed' });
 
     const returned = countLines(captured.content);
-    return {
-        ...base,
+    const page = {
         before,
-        content: captured.content,
         lines: returned,
         truncated: captured.truncated,
         hasMore: depth > held + returned,
     };
+    if (!stream.subscriberPublicKey) return reply({ ...page, content: captured.content });
+
+    // Encrypted stream: the page rides ONLY inside the envelope, and a failed
+    // seal is an error rather than a plaintext page — the same rule the frame
+    // path follows when its encrypt fails.
+    encryptEphemeral(captured.content, stream.subscriberPublicKey)
+        .then((encrypted) => send({ ...base, ...page, encrypted }))
+        .catch((err) => {
+            log(`⧉ history ${req.sessionName}: seal failed (${err instanceof Error ? err.message : err})`);
+            send({ ...base, error: 'encrypt_failed' });
+        });
+    return true;
 };
 
 /**
@@ -2940,13 +2967,13 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                 // lease is live, so it sits behind the same routing chain.
                 if (
                     !handleCommandInput(m.data as AgentCommandInput, sendEphemeral) &&
-                    !handleStreamControl(m.data as StreamControl, sendEphemeral)
+                    !handleStreamControl(m.data as StreamControl, sendEphemeral) &&
+                    // A page of scrollback answers through `send` rather than by
+                    // return value: on an encrypted stream it finishes after the
+                    // seal, exactly like the frames it is history for.
+                    !handleScreenHistoryRequest(m.data as ScreenHistoryRequest, sendEphemeral)
                 ) {
-                    // Two pull shapes share this tail: the one-shot peek at the
-                    // live pane, and a page of the scrollback above it.
-                    const reply =
-                        handleScreenRequest(m.data as ScreenRequest)
-                        ?? handleScreenHistoryRequest(m.data as ScreenHistoryRequest);
+                    const reply = handleScreenRequest(m.data as ScreenRequest);
                     if (reply) sendEphemeral(reply);
                 }
             }
