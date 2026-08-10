@@ -387,6 +387,90 @@ describe('handlePush key events', () => {
     });
 });
 
+describe('handlePush insert (text without the submitting Enter)', () => {
+    const insertDeps = (override: Parameters<typeof handlePush>[1] = {}) => ({
+        paneCommand: () => 'claude',
+        insertText: () => true,
+        rateLimit: () => true,
+        paneCwd: () => null,
+        ...override,
+    });
+
+    const insertCmd = (overrides: Partial<Parameters<typeof handlePush>[0]> = {}) => ({
+        pushId: '1',
+        type: 'agent.command' as const,
+        agentSessionName: 'zeph-myapp',
+        insert: 'y',
+        ...overrides,
+    });
+
+    it('routes an insert to the paste-only injector, never the submitting one', async () => {
+        let inserted: { session: string; text: string } | null = null;
+        let submitted = false;
+        const ok = await handlePush(
+            insertCmd(),
+            insertDeps({
+                insertText: (session, text) => { inserted = { session, text }; return true; },
+                inject: () => { submitted = true; return true; },
+            }),
+        );
+        expect(ok).toBe(true);
+        expect(inserted).toEqual({ session: 'zeph-myapp', text: 'y' });
+        expect(submitted).toBe(false);
+    });
+
+    it('honours the shell-pane RCE guard', async () => {
+        let inserted = false;
+        const ok = await handlePush(
+            insertCmd(),
+            insertDeps({ paneCommand: () => 'bash', insertText: () => { inserted = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(inserted).toBe(false);
+    });
+
+    it('honours the rate limit', async () => {
+        let inserted = false;
+        const ok = await handlePush(
+            insertCmd(),
+            insertDeps({ rateLimit: () => false, insertText: () => { inserted = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(inserted).toBe(false);
+    });
+
+    it('drops a push carrying both insert and body', async () => {
+        // Submitting and not-submitting the same text are opposite
+        // instructions; a message meaning both means nothing.
+        let touched = false;
+        const ok = await handlePush(
+            insertCmd({ body: 'do the thing' }),
+            insertDeps({
+                insertText: () => { touched = true; return true; },
+                inject: () => { touched = true; return true; },
+            }),
+        );
+        expect(ok).toBe(false);
+        expect(touched).toBe(false);
+    });
+
+    it('prefers keys over insert when both are present', async () => {
+        let inserted = false;
+        let sentKeys = false;
+        const ok = await handlePush(
+            insertCmd({ keys: ['escape'] }),
+            insertDeps({
+                sendKeys: () => { sentKeys = true; return true; },
+                insertText: () => { inserted = true; return true; },
+            }),
+        );
+        expect(ok).toBe(true);
+        expect(sentKeys).toBe(true);
+        expect(inserted).toBe(false);
+    });
+
+});
+
 describe('gcAttachments', () => {
     it('removes dirs older than the TTL and keeps fresh ones', () => {
         const root = mkdtempSync(join(tmpdir(), 'zeph-gc-'));
@@ -890,6 +974,18 @@ describe('writeRemoteMarker (ADR-0002)', () => {
         );
         expect(ok).toBe(true);
         expect(existsSync(markerPath('/proj/app'))).toBe(true);
+    });
+
+    it('is written for an insert too, so a later manual Enter still reads as remote', async () => {
+        // The prompt-submit hook matches the submitted text against this
+        // digest. After an insert the user presses Enter themselves, so
+        // without a marker here that submit looks locally typed.
+        const ok = await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-app', insert: 'hello' },
+            { paneCommand: () => 'claude', insertText: () => true, rateLimit: () => true, paneCwd: () => '/proj/inserted' },
+        );
+        expect(ok).toBe(true);
+        expect(existsSync(markerPath('/proj/inserted'))).toBe(true);
     });
 
     it('is NOT written when the inject fails', async () => {
