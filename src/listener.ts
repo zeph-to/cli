@@ -1972,6 +1972,19 @@ export const handleStreamControl = (
         const entry = activeStreams.get(req.sessionName);
         if (entry) {
             entry.expiresAt = Date.now() + leaseFor(entry.renewing);
+            // Answer it. The renew used to succeed in silence, which left the
+            // viewer with no way to tell a healthy quiet stream from a dead
+            // one: the capture loop drops unchanged frames, so an agent that
+            // stops to think and a daemon that stopped existing both produce
+            // exactly nothing. This reply is the difference — it says the
+            // daemon is here and still holds this lease, whatever the pane is
+            // or is not doing.
+            //
+            // No pane content rides on it, so it is not sealed. That is not an
+            // exception to the encryption rule but the reason the rule does not
+            // reach here: there is nothing in this message a relay could read
+            // that it did not already route.
+            send({ subtype: 'agent.stream.renew.ok', sessionName: req.sessionName });
             return true;
         }
         // Addressed to us but we hold no such stream: it was reaped (lost

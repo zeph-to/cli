@@ -96,6 +96,41 @@ describe('stream lease — a vanished subscriber must free its slot', () => {
         expect(start('zeph-d')).toEqual([]);
     });
 
+    /**
+     * The signal a quiet stream has no other way to send. The capture loop
+     * drops unchanged frames, so an agent that stopped to think produces the
+     * same silence as a daemon that stopped existing — and the viewer paints a
+     * frozen pane through both. The renew already runs on a timer; answering it
+     * is what separates the two.
+     */
+    it('answers a healthy renew so the viewer knows the daemon is still there', () => {
+        start('zeph-a');
+
+        const { claimed, sent } = renew('zeph-a');
+
+        expect(claimed).toBe(true);
+        expect(sent).toEqual([{ subtype: 'agent.stream.renew.ok', sessionName: 'zeph-a' }]);
+    });
+
+    // The ack reports on the lease, not on the pane, so it carries nothing a
+    // relay could read — and must not start carrying it.
+    it('puts no pane content in the acknowledgement', () => {
+        start('zeph-a');
+
+        const [ack] = renew('zeph-a').sent;
+
+        expect(Object.keys(ack).sort()).toEqual(['sessionName', 'subtype']);
+    });
+
+    it('answers only the session that was renewed', () => {
+        start('zeph-a');
+        start('zeph-b');
+
+        expect(renew('zeph-b').sent).toEqual([
+            { subtype: 'agent.stream.renew.ok', sessionName: 'zeph-b' },
+        ]);
+    });
+
     it('tells a renewing viewer its stream is gone so it can re-subscribe', () => {
         start('zeph-a');
         // Stream dropped daemon-side (socket reconnect → stopAllStreams, or a
