@@ -4,6 +4,7 @@
 [![downloads](https://img.shields.io/npm/dm/@zeph-to/cli.svg)](https://www.npmjs.com/package/@zeph-to/cli)
 [![node](https://img.shields.io/node/v/@zeph-to/cli.svg)](https://nodejs.org)
 [![license](https://img.shields.io/npm/l/@zeph-to/cli.svg)](./LICENSE)
+[![docs](https://img.shields.io/badge/docs-docs.zeph.to-1f6feb)](https://docs.zeph.to)
 
 **Your agent works, hits a decision, and asks your phone. You tap a button (or type a reply), and the answer lands back in the live session — so the agent keeps going.**
 
@@ -18,6 +19,8 @@
 - **`zeph` CLI** — one-command setup for 8 agents, push sending, and the resident listener for phone-driven remote control.
 
 Part of the Zeph toolchain: [`@zeph-to/mcp-server`](https://github.com/zeph-to/mcp-server) (the MCP tools your agent calls, e.g. `zeph_ask`) · [`zeph-to/plugin`](https://github.com/zeph-to/plugin) (Claude Code plugin bundling hooks + MCP + rules) · the [Zeph app](https://zeph.to) on your phone.
+
+> **New here?** [docs.zeph.to](https://docs.zeph.to) walks the whole setup — one command on this machine, the app on your phone, and a restart. The reference below assumes that is already done.
 
 ## Quick Start
 
