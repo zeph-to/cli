@@ -23,9 +23,9 @@
 
 import { spawnSync } from 'child_process';
 import { createHash } from 'crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'fs';
 import { homedir, hostname, userInfo } from 'os';
-import { join, basename } from 'path';
+import { join, basename, isAbsolute, resolve, sep } from 'path';
 import WebSocket from 'ws';
 import { loadConfig, resolvedEnv, VERSION } from './config.js';
 import {
@@ -862,6 +862,268 @@ export const handleScreenRequest = (req: ScreenRequest): ScreenSnapshot | null =
         return { ...base, error: 'capture_failed' };
     }
     return { ...base, ...captured };
+};
+
+// ─── Diff: reading a session's changes from the phone ──────────────
+//
+// The loop the phone could not close: it can drive an agent but not look at
+// what the agent did. This reads the working tree of the repository the session
+// runs in — read-only, fixed commands, no revision and no repository path from
+// the wire.
+//
+// Why nothing caller-supplied reaches argv: `git diff <ref>` parses a ref
+// beginning with `-` as a flag, so a "validate the string" defence has to be
+// perfect to work at all. Instead the commands are constant, the repo comes
+// from the registry this machine wrote itself, and the one caller-supplied
+// value — a file path — is resolved against the repo root, checked through
+// symlinks, and passed after `--` where git can only read it as a path.
+
+/** Ceiling on one page of patch text. Shares the frame budget the pane
+ *  snapshots use: a diff is routinely megabytes, so paging is in the contract
+ *  from the start rather than bolted on later. */
+export const DIFF_PAGE_MAX_BYTES = 16 * 1024;
+/** Most changed files worth listing. A tree past this is not something anyone
+ *  reviews on a phone; the count says so instead of the list pretending. */
+const DIFF_MAX_FILES = 200;
+
+export interface DiffFilesRequest {
+    subtype?: string;
+    targetDeviceId?: string;
+    sessionName?: string;
+    requestId?: string;
+    /** Seals the answer for this key when present, exactly as a stream frame is
+     *  sealed for its subscriber. Absent = the caller has no device key. */
+    subscriberPublicKey?: string;
+}
+
+export interface DiffFileRequest extends DiffFilesRequest {
+    /** Repo-relative path of the file to read. The only caller-supplied value
+     *  that reaches git, and only after the checks in resolveInRepo. */
+    path?: string;
+    /** Byte offset into this file's patch — paging, since one patch can dwarf
+     *  the frame limit on its own. */
+    offset?: number;
+}
+
+export interface DiffFileEntry {
+    path: string;
+    /** Porcelain status letter: M, A, D, R, ? for untracked. */
+    status: string;
+    added: number;
+    removed: number;
+}
+
+const gitIn = (repo: string, args: string[]): { status: number; stdout: string; stderr: string } => {
+    const r = spawnSync('git', ['-C', repo, '--no-optional-locks', ...args], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return { status: r.status ?? 1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+};
+
+/** The repository the session's directory belongs to, or null when it is not
+ *  in one. Asked of git rather than guessed from the path. */
+const repoRootFor = (cwd: string): string | null => {
+    const r = gitIn(cwd, ['rev-parse', '--show-toplevel']);
+    const root = r.stdout.trim();
+    return r.status === 0 && root ? root : null;
+};
+
+/**
+ * A repo-relative path resolved to somewhere genuinely inside the repo, or null.
+ *
+ * Checks the real path, not the lexical one: `resolve()` alone accepts a
+ * symlink whose string stays inside the repo and whose target does not, which
+ * is the whole trick. An unresolvable path (the file was deleted) falls back to
+ * the lexical check — a deleted file still has a diff worth reading.
+ */
+const resolveInRepo = (root: string, rel: string): string | null => {
+    if (isAbsolute(rel)) return null;
+    const lexical = resolve(root, rel);
+    const inside = (p: string): boolean => p === root || p.startsWith(root + sep);
+    if (!inside(lexical)) return null;
+    try {
+        const realRoot = realpathSync(root);
+        const real = realpathSync(lexical);
+        return real === realRoot || real.startsWith(realRoot + sep) ? lexical : null;
+    } catch {
+        return lexical;
+    }
+};
+
+/** Session name → the repository it works in, with every refusal named. */
+const repoForSession = (sessionName: string): { root: string } | { error: string } => {
+    const known = recallSession(sessionName);
+    if (!known) return { error: 'unknown_session' };
+    if (!sessionDirectoryExists(known)) return { error: 'missing_directory' };
+    const root = repoRootFor(known.cwd);
+    if (!root) return { error: 'not_a_repo' };
+    return { root };
+};
+
+/** Send a reply, sealed when the caller handed over a key. A seal that fails is
+ *  an error rather than a plaintext answer — same rule as the frame path. */
+const sendMaybeSealed = (
+    send: (data: Record<string, unknown>) => void,
+    base: Record<string, unknown>,
+    payload: { field: string; value: string },
+    subscriberPublicKey: string | undefined,
+): true => {
+    if (!subscriberPublicKey) {
+        send({ ...base, [payload.field]: payload.value });
+        return true;
+    }
+    encryptEphemeral(payload.value, subscriberPublicKey)
+        .then((encrypted) => send({ ...base, encrypted }))
+        .catch((err) => {
+            log(`⧉ diff: seal failed (${err instanceof Error ? err.message : err})`);
+            send({ ...base, error: 'encrypt_failed' });
+        });
+    return true;
+};
+
+/** Parse `git diff --numstat` into per-path counts. Binary files report `-`. */
+const parseNumstat = (out: string): Map<string, { added: number; removed: number }> => {
+    const counts = new Map<string, { added: number; removed: number }>();
+    for (const line of out.split('\n')) {
+        if (!line) continue;
+        const [added, removed, ...rest] = line.split('\t');
+        const path = rest.join('\t');
+        if (!path) continue;
+        counts.set(path, {
+            added: Number.isInteger(Number(added)) ? Number(added) : 0,
+            removed: Number.isInteger(Number(removed)) ? Number(removed) : 0,
+        });
+    }
+    return counts;
+};
+
+/** Parse `git status --porcelain=v1` into (status letter, path) pairs. */
+const parsePorcelain = (out: string): Array<{ status: string; path: string }> => {
+    const rows: Array<{ status: string; path: string }> = [];
+    for (const line of out.split('\n')) {
+        if (line.length < 4) continue;
+        const code = line.slice(0, 2).trim();
+        // Renames report `old -> new`; the new path is what a reader opens.
+        const raw = line.slice(3);
+        const path = raw.includes(' -> ') ? raw.slice(raw.indexOf(' -> ') + 4) : raw;
+        if (!path) continue;
+        rows.push({ status: code === '??' ? '?' : code[0], path });
+    }
+    return rows;
+};
+
+/**
+ * Answer "what changed in this session's repo".
+ *
+ * Every argument is constant: the request contributes a session name, which
+ * selects a directory from the registry, and nothing else reaches git.
+ */
+export const handleDiffFilesRequest = (
+    req: DiffFilesRequest,
+    send: (data: Record<string, unknown>) => void,
+): boolean => {
+    if (req.subtype !== 'agent.diff.files.request') return false;
+    if (!req.requestId || !req.sessionName) return false;
+    if (req.targetDeviceId !== computeListenerDeviceId()) return false;
+
+    const base = {
+        subtype: 'agent.diff.files.result' as const,
+        requestId: req.requestId,
+        sessionName: req.sessionName,
+        at: new Date().toISOString(),
+    };
+    const reply = (fields: Record<string, unknown>): true => {
+        send({ ...base, ...fields });
+        return true;
+    };
+
+    if (!checkRateLimit(`diff:${req.sessionName}`)) return reply({ error: 'rate_limited' });
+    const repo = repoForSession(req.sessionName);
+    if ('error' in repo) return reply({ error: repo.error });
+
+    const status = gitIn(repo.root, ['status', '--porcelain=v1']);
+    if (status.status !== 0) return reply({ error: 'git_failed' });
+    const counts = parseNumstat(gitIn(repo.root, ['diff', '--numstat']).stdout);
+
+    const rows = parsePorcelain(status.stdout);
+    const files: DiffFileEntry[] = rows.slice(0, DIFF_MAX_FILES).map((r) => ({
+        path: r.path,
+        status: r.status,
+        added: counts.get(r.path)?.added ?? 0,
+        removed: counts.get(r.path)?.removed ?? 0,
+    }));
+    // The list itself is metadata about the tree — paths, counts. The patch
+    // TEXT is what gets sealed; a caller with a key gets the list sealed too,
+    // since a path list is itself a fair amount to hand a relay.
+    if (!req.subscriberPublicKey) {
+        return reply({ files, truncated: rows.length > DIFF_MAX_FILES });
+    }
+    return sendMaybeSealed(
+        send,
+        { ...base, truncated: rows.length > DIFF_MAX_FILES },
+        { field: 'files', value: JSON.stringify(files) },
+        req.subscriberPublicKey,
+    );
+};
+
+/**
+ * Answer one file's patch, one page at a time.
+ *
+ * The path is the only caller-supplied value that reaches git, and it reaches
+ * it as its own argv entry after `--`, having been resolved against the repo
+ * root and checked through symlinks first.
+ */
+export const handleDiffFileRequest = (
+    req: DiffFileRequest,
+    send: (data: Record<string, unknown>) => void,
+): boolean => {
+    if (req.subtype !== 'agent.diff.file.request') return false;
+    if (!req.requestId || !req.sessionName) return false;
+    if (req.targetDeviceId !== computeListenerDeviceId()) return false;
+
+    const base = {
+        subtype: 'agent.diff.file.result' as const,
+        requestId: req.requestId,
+        sessionName: req.sessionName,
+        path: typeof req.path === 'string' ? req.path : '',
+        at: new Date().toISOString(),
+    };
+    const reply = (fields: Record<string, unknown>): true => {
+        send({ ...base, ...fields });
+        return true;
+    };
+
+    if (typeof req.path !== 'string' || !req.path) return reply({ error: 'bad_path' });
+    const offset = req.offset ?? 0;
+    if (!isPageOffset(offset)) return reply({ error: 'bad_range' });
+    if (!checkRateLimit(`diff:${req.sessionName}`)) return reply({ error: 'rate_limited' });
+
+    const repo = repoForSession(req.sessionName);
+    if ('error' in repo) return reply({ error: repo.error });
+    if (!resolveInRepo(repo.root, req.path)) {
+        log(`✗ diff ${req.sessionName}: ${req.path} is outside ${repo.root}`);
+        return reply({ error: 'path_outside_repo' });
+    }
+
+    const out = gitIn(repo.root, ['diff', '--no-color', '--', req.path]);
+    if (out.status !== 0) return reply({ error: 'git_failed' });
+    // Byte offsets, not line ones: the caller pages by what the transport can
+    // carry, and a single line of minified output can exceed a page on its own.
+    const buf = Buffer.from(out.stdout, 'utf-8');
+    const page = buf.subarray(offset, offset + DIFF_PAGE_MAX_BYTES);
+    const meta = {
+        ...base,
+        offset,
+        length: page.length,
+        hasMore: offset + page.length < buf.length,
+    };
+    return sendMaybeSealed(
+        send,
+        meta,
+        { field: 'chunk', value: page.toString('utf-8') },
+        req.subscriberPublicKey,
+    );
 };
 
 // ─── Resume: starting a session that has ended ─────────────────────
@@ -3095,6 +3357,10 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                     // it takes nothing from the wire but a session name — the
                     // rest comes from what this machine wrote down itself.
                     && !handleSessionResumeRequest(m.data as SessionResumeRequest, sendEphemeral)
+                    // Reading the session's changes: read-only git in the repo
+                    // the registry recorded, never a path or command from here.
+                    && !handleDiffFilesRequest(m.data as DiffFilesRequest, sendEphemeral)
+                    && !handleDiffFileRequest(m.data as DiffFileRequest, sendEphemeral)
                 ) {
                     const reply = handleScreenRequest(m.data as ScreenRequest);
                     if (reply) sendEphemeral(reply);
