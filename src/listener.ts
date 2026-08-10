@@ -39,7 +39,8 @@ import {
     writeListenerRuntime,
 } from './listener-process.js';
 import { projectHash, remoteDigest, remoteMarkerPath, stateDir } from './gate.js';
-import { matchAgentByPaneCommand, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
+import { recallSession, rememberSessions, sessionDirectoryExists } from './session-registry.js';
+import { matchAgentByPaneCommand, REMOTE_AGENTS, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 import { advanceState, evaluateState, findPatternMatch, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
 import { decryptEphemeral, encryptEphemeral, getDevicePublicKey, initDeviceCrypto, type EncryptedEphemeralPayload } from './crypto.js';
@@ -862,6 +863,106 @@ export const handleScreenRequest = (req: ScreenRequest): ScreenSnapshot | null =
     }
     return { ...base, ...captured };
 };
+
+// ─── Resume: starting a session that has ended ─────────────────────
+//
+// Every other remote path types into a process that already exists. This one
+// creates one, which is a different kind of authority, so the request is built
+// to carry as little of it as possible: a session NAME and nothing else.
+// Where to start and what to start are read back from the registry this machine
+// wrote while the session was alive (session-registry.ts) — a phone, or a relay
+// posing as one, cannot name a directory, a binary, or an argument.
+
+export interface SessionResumeRequest {
+    subtype?: string;
+    targetDeviceId?: string;
+    sessionName?: string;
+    requestId?: string;
+}
+
+export interface SessionResumeResult {
+    subtype: 'agent.session.resume.result';
+    requestId: string;
+    sessionName: string;
+    resumed?: true;
+    error?: string;
+    at: string;
+}
+
+/**
+ * Start a remembered session again, detached, and tell the phone what happened.
+ * Returns true when the message was ours to answer.
+ *
+ * The refusals are the design. Unknown name: not in the registry, so there is
+ * nothing to start and nothing to guess from. Missing directory: the project
+ * moved or was deleted, and starting an agent in the wrong place is worse than
+ * not starting one. Unknown agent kind: the record names an agent this build
+ * has no binary for — a wire enum outlives installs, and a guess here would be
+ * a command nobody chose. Already running: the session is live and the phone
+ * should be watching it, not replacing it.
+ */
+export const handleSessionResumeRequest = (
+    req: SessionResumeRequest,
+    send: (data: Record<string, unknown>) => void,
+): boolean => {
+    if (req.subtype !== 'agent.session.resume.request') return false;
+    if (!req.requestId || !req.sessionName) return false;
+    if (req.targetDeviceId !== computeListenerDeviceId()) return false;
+
+    const sessionName = req.sessionName;
+    const base = {
+        subtype: 'agent.session.resume.result' as const,
+        requestId: req.requestId,
+        sessionName,
+        at: new Date().toISOString(),
+    };
+    const reply = (fields: Partial<SessionResumeResult>): true => {
+        send({ ...base, ...fields });
+        return true;
+    };
+
+    // Charged like a submitted command, not like a keystroke: this starts a
+    // process, and the two share one budget so a flood cannot be laundered
+    // through whichever path is cheaper.
+    if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return reply({ error: 'rate_limited' });
+
+    const known = recallSession(sessionName);
+    if (!known) {
+        log(`✗ resume ${sessionName}: never seen on this machine`);
+        return reply({ error: 'unknown_session' });
+    }
+    if (sessionExists(sessionName)) return reply({ error: 'already_running' });
+    if (!sessionDirectoryExists(known)) {
+        log(`✗ resume ${sessionName}: ${known.cwd} is gone`);
+        return reply({ error: 'missing_directory' });
+    }
+    const agent = REMOTE_AGENTS.find((a) => a.kind === known.agentKind);
+    if (!agent) {
+        log(`✗ resume ${sessionName}: no binary for agent kind ${known.agentKind}`);
+        return reply({ error: 'unknown_agent' });
+    }
+
+    // argv, never a shell string: the binary comes from the agent table and the
+    // directory from our own record, and neither is concatenated into anything
+    // a shell would re-parse.
+    const started = spawnSync(
+        'tmux',
+        tmuxArgs(['new-session', '-d', '-s', sessionName, '-c', known.cwd, agent.binary]),
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    if (started.status !== 0) {
+        log(`✗ resume ${sessionName}: tmux refused (${(started.stderr ?? '').trim() || 'no detail'})`);
+        return reply({ error: 'start_failed' });
+    }
+    log(`⟲ resume ${sessionName}: ${agent.binary} in ${known.cwd}`);
+    return reply({ resumed: true });
+};
+
+/** Whether tmux already holds a session by this name. */
+const sessionExists = (name: string): boolean =>
+    spawnSync('tmux', tmuxArgs(['has-session', '-t', name]), {
+        stdio: ['ignore', 'ignore', 'ignore'],
+    }).status === 0;
 
 // ─── Deep pull: scrollback above the live window ───────────────────
 //
@@ -2274,6 +2375,10 @@ export const collectSessionsVerbose = (): CollectResult => {
 
     const sessions: AgentSession[] = [];
     const rejected: Array<{ name: string; reason: string }> = [];
+    // Pane cwd per session, read in the same sweep. Kept beside the wire shape
+    // rather than in it: AgentSession is a server/phone contract and the
+    // directory is local knowledge the registry needs, nothing the phone gets.
+    const paneCwdOf = new Map<string, string>();
     for (const line of rawLines) {
         const [name, attached, created, activity] = line.split(FIELD_SEP);
         const parsed = parseSessionName(name);
@@ -2295,6 +2400,7 @@ export const collectSessionsVerbose = (): CollectResult => {
         const agentSessionId = info.currentPath
             ? (agent.resolveSessionId?.(info.currentPath, info.panePid ?? undefined) ?? null)
             : null;
+        if (info.currentPath) paneCwdOf.set(name, info.currentPath);
         sessions.push({
             name,
             attached: attached === '1',
@@ -2308,6 +2414,19 @@ export const collectSessionsVerbose = (): CollectResult => {
         });
     }
     pruneSessionStates(new Set(sessions.map((s) => s.name)));
+    // Write down what each live session IS, while it still exists to be read.
+    // tmux forgets a session the moment it ends, which is exactly when the
+    // phone wants it back — and a resume must take its directory and its binary
+    // from what this machine observed, never from the wire.
+    rememberSessions(
+        sessions.map((s) => ({
+            name: s.name,
+            cwd: paneCwdOf.get(s.name) ?? null,
+            agentKind: s.agentKind,
+            project: s.project,
+            label: s.label,
+        })),
+    );
     return { sessions, rejected };
 };
 
@@ -2972,6 +3091,10 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                     // return value: on an encrypted stream it finishes after the
                     // seal, exactly like the frames it is history for.
                     !handleScreenHistoryRequest(m.data as ScreenHistoryRequest, sendEphemeral)
+                    // Resume creates a process rather than typing into one, so
+                    // it takes nothing from the wire but a session name — the
+                    // rest comes from what this machine wrote down itself.
+                    && !handleSessionResumeRequest(m.data as SessionResumeRequest, sendEphemeral)
                 ) {
                     const reply = handleScreenRequest(m.data as ScreenRequest);
                     if (reply) sendEphemeral(reply);
