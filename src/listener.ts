@@ -276,6 +276,17 @@ const ALLOWED_KEYS = new Map<string, string>([
     ['backspace', 'BSpace'],
     ['delete', 'DC'],
     ['space', 'Space'],
+    // Control keys, added one at a time and only where the phone has no other
+    // way to do the thing: interrupt what the agent is doing, toggle its
+    // verbose output, clear the screen. The whitelist property is unchanged —
+    // naming three does not open send-keys' key-name syntax to a fourth.
+    //
+    // `ctrl-d` is deliberately absent. At an empty prompt it is EOF: the agent
+    // exits, the pane falls back to a shell, and isShellPane then refuses
+    // everything — correctly, but the phone has no way to start it again.
+    ['ctrl-c', 'C-c'],
+    ['ctrl-r', 'C-r'],
+    ['ctrl-l', 'C-l'],
 ]);
 
 /**
@@ -871,8 +882,17 @@ export interface ScreenHistoryRequest {
     targetDeviceId?: string;
     sessionName?: string;
     requestId?: string;
-    /** Lines of history the caller already holds above the live window. 0 asks
-     *  for the page that sits immediately above it. */
+    /**
+     * How many lines of scrollback the caller already holds above the visible
+     * pane — the `historyLines` of its newest frame plus every history line it
+     * has pulled since. 0 asks for the page directly above the visible pane.
+     *
+     * The caller says this rather than the daemon assuming STREAM_CAPTURE_LINES,
+     * because the byte cap trims frames from the top and a caller holding fewer
+     * lines than the capture asked for would otherwise be handed a page that
+     * starts above its own content, with the gap unreachable forever after.
+     * Absent falls back to the constant — the untruncated case.
+     */
     before?: number;
     /** Page size. Clamped to SCREEN_HISTORY_MAX_LINES. */
     lines?: number;
@@ -959,7 +979,7 @@ export const handleScreenHistoryRequest = (
         capturedAt,
     };
 
-    const before = req.before ?? 0;
+    const before = req.before ?? STREAM_CAPTURE_LINES;
     const asked = req.lines ?? SCREEN_HISTORY_DEFAULT_LINES;
     if (!isPageOffset(before) || !isPageOffset(asked) || asked === 0) {
         return { ...base, error: 'bad_range' };
@@ -974,9 +994,8 @@ export const handleScreenHistoryRequest = (
     const depth = paneHistorySize(req.sessionName);
     if (depth === null) return { ...base, error: 'capture_failed' };
 
-    // Everything below this line the caller already has: the live window plus
-    // whatever it has paged in above it.
-    const held = STREAM_CAPTURE_LINES + before;
+    // Everything below this line the caller already has.
+    const held = before;
     // Scrolled past the oldest line. An empty page rather than an error — the
     // view stops, and stopping is not a failure.
     if (depth <= held) return { ...base, before, content: '', lines: 0, hasMore: false };
@@ -1074,14 +1093,31 @@ export const cursorLineFor = (
     content: string,
     cursor: { x: number; y: number; height: number },
 ): { line: number; col: number } | null => {
-    // capture-pane ends the last row with a newline, which split() turns into a
-    // trailing empty element that is not a pane row.
-    const lines = content.split('\n');
-    const rows = lines.length > 0 && lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
+    const rows = paneRowCount(content);
     const line = rows - cursor.height + cursor.y;
     if (line < 0 || line >= rows) return null;
     return { line, col: cursor.x };
 };
+
+/** capture-pane ends the last row with a newline, which split() turns into a
+ *  trailing empty element that is not a pane row. */
+const paneRowCount = (content: string): number => {
+    const lines = content.split('\n');
+    return lines.length > 0 && lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
+};
+
+/**
+ * How many of a frame's lines are scrollback rather than the visible pane.
+ *
+ * This is the number the viewer hands back as `before` when it asks for
+ * history. STREAM_CAPTURE_LINES is only what the capture ASKED for: the byte
+ * cap trims from the top, and a coloured TUI pane hits that cap routinely, so
+ * assuming the viewer holds the full window would start the first history page
+ * above what it actually has — leaving a gap no later page can reach, since
+ * every later page walks further up.
+ */
+export const historyLinesIn = (content: string, paneHeight: number): number =>
+    Math.max(0, paneRowCount(content) - paneHeight);
 
 /** Delays after a key injection at which the pane is re-captured and pushed
  *  to the phone unsolicited. The first frame lands right after most TUI
@@ -1404,6 +1440,14 @@ export type StreamFramePayload = {
      *  can place the cursor before the pane content finishes decrypting. */
     cursorLine?: number;
     cursorCol?: number;
+    /** How many of this frame's lines are scrollback rather than the visible
+     *  pane — what the viewer sends back as `before` when it pulls history.
+     *  Fewer than STREAM_CAPTURE_LINES whenever the byte cap trimmed the frame,
+     *  which is exactly the case a constant would get wrong. Absent when the
+     *  pane geometry could not be read; the viewer then falls back to the
+     *  constant. Plaintext for the same reason the cursor is: a line count
+     *  without the lines says nothing. */
+    historyLines?: number;
     /** Plaintext pane content — only on unencrypted streams. */
     content?: string;
     /** E2EE envelope — replaces `content` on encrypted streams. */
@@ -1481,14 +1525,16 @@ export const buildStreamFrame = async (
     captured: { content: string; truncated: boolean },
     sessionName: string,
     subscriberPublicKey?: string,
-    cursor?: { line: number; col: number } | null,
+    meta?: { cursor?: { line: number; col: number } | null; historyLines?: number },
 ): Promise<StreamFramePayload | null> => {
+    const cursor = meta?.cursor;
     const base = {
         subtype: 'agent.stream.frame' as const,
         sessionName,
         capturedAt: new Date().toISOString(),
         truncated: captured.truncated,
         ...(cursor ? { cursorLine: cursor.line, cursorCol: cursor.col } : {}),
+        ...(meta?.historyLines === undefined ? {} : { historyLines: meta.historyLines }),
     };
     if (!subscriberPublicKey) return { ...base, content: captured.content };
     try {
@@ -1639,6 +1685,11 @@ export const handleStreamControl = (
         // tmux spawn on ticks that go on to send nothing is what that costs.
         const cursorAt = capturePaneCursor(sessionName);
         const cursor = cursorAt ? cursorLineFor(captured.content, cursorAt) : null;
+        // Same read gives the pane height, which is what separates this frame's
+        // scrollback from its visible rows — the offset a history pull starts at.
+        const historyLines = cursorAt
+            ? historyLinesIn(captured.content, cursorAt.height)
+            : undefined;
         const cursorKey = cursor ? `${cursor.line},${cursor.col}` : '';
         if (captured.content === lastContent && cursorKey === lastCursor) {
             stats.skipped++;
@@ -1665,7 +1716,7 @@ export const handleStreamControl = (
         // guaranteed under load; the receiver drops any seq it has already
         // painted past.
         const seq = ++wireSeq;
-        void buildStreamFrame(captured, sessionName, subscriberPublicKey, cursor).then((frame) => {
+        void buildStreamFrame(captured, sessionName, subscriberPublicKey, { cursor, historyLines }).then((frame) => {
             // Stream stopped or restarted while this frame was in flight —
             // `stats` is unique per start, so it doubles as the identity
             // token. Don't send into a dead/replaced stream or skew its stats.

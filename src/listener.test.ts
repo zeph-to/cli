@@ -29,6 +29,7 @@ import {
     collectWatchHits,
     setPatternWatches,
     resetPatternWatches,
+    historyLinesIn,
 } from './listener.js';
 
 describe('checkRateLimit', () => {
@@ -282,6 +283,24 @@ describe('resolveKeys', () => {
     it('rejects the whole batch if any key is unknown', () => {
         expect(resolveKeys(['escape', 'C-c'])).toBeNull();
         expect(resolveKeys(['pageup'])).toBeNull();
+    });
+
+    it('maps the three control keys a phone needs against a running agent', () => {
+        // Interrupt, toggle verbose output, clear the screen.
+        expect(resolveKeys(['ctrl-c'])).toEqual(['C-c']);
+        expect(resolveKeys(['CTRL-R', ' ctrl-l '])).toEqual(['C-r', 'C-l']);
+    });
+
+    it('still refuses every control key that was not named', () => {
+        // Naming three does not open the send-keys key-name syntax: the map
+        // knows only what was put in it. `ctrl-d` is left out deliberately —
+        // one EOF at an empty prompt ends the agent, and the phone has no way
+        // to start it again.
+        expect(resolveKeys(['ctrl-d'])).toBeNull();
+        expect(resolveKeys(['ctrl-x'])).toBeNull();
+        expect(resolveKeys(['ctrl-z'])).toBeNull();
+        // The tmux spelling is not a wire name — only the lowercase one is.
+        expect(resolveKeys(['C-r'])).toBeNull();
     });
 
     it('rejects an empty list', () => {
@@ -877,6 +896,45 @@ describe('buildStreamFrame (stream E2EE)', () => {
             { content: 'secret pane', truncated: false }, 'zeph-a', await makeRecipientKey(),
         );
         expect(frame).toBeNull();
+    });
+
+    // The viewer sends this number back as `before` when it pulls history, so a
+    // frame that omits it silently costs the reader the lines between what it
+    // holds and where the daemon would guess the page starts.
+    it('tells the viewer how much scrollback the frame carries', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const frame = await buildStreamFrame(
+            { content: 'pane', truncated: true }, 'zeph-a', undefined, { historyLines: 137 },
+        );
+        expect(frame).toMatchObject({ historyLines: 137 });
+    });
+
+    it('leaves it out when the pane geometry could not be read', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const frame = await buildStreamFrame({ content: 'pane', truncated: false }, 'zeph-a');
+        expect(frame).not.toHaveProperty('historyLines');
+    });
+});
+
+describe('historyLinesIn', () => {
+    // 24 rows captured, 10 of them the visible pane.
+    const capture = (rows: number) => Array.from({ length: rows }, (_, i) => `l${i}`).join('\n') + '\n';
+
+    it('counts the rows above the visible pane', () => {
+        expect(historyLinesIn(capture(24), 10)).toBe(14);
+    });
+
+    it('reports what a trimmed frame actually holds, not what was asked for', () => {
+        // The byte cap cut the capture down to 12 rows; only 2 are scrollback.
+        expect(historyLinesIn(capture(12), 10)).toBe(2);
+    });
+
+    it('never goes negative when the pane is taller than the capture', () => {
+        expect(historyLinesIn(capture(4), 10)).toBe(0);
+    });
+
+    it('counts a capture with no trailing newline the same way', () => {
+        expect(historyLinesIn('l0\nl1\nl2', 1)).toBe(2);
     });
 });
 

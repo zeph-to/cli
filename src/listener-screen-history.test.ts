@@ -151,28 +151,48 @@ describe('agent.screen.history.request — one page of scrollback above the live
   });
 
   describe('range', () => {
-    it('reads the page immediately above the live window', () => {
-      const reply = handleScreenHistoryRequest(request({ before: 0, lines: 10 }));
+    it('reads the page directly above the scrollback the caller holds', () => {
+      const reply = handleScreenHistoryRequest(request({ before: 200, lines: 10 }));
 
       const capture = historyCaptures()[0];
-      expect(capture[capture.indexOf('-S') + 1]).toBe(String(-(STREAM_CAPTURE_LINES + 10)));
-      expect(capture[capture.indexOf('-E') + 1]).toBe(String(-(STREAM_CAPTURE_LINES + 1)));
+      expect(capture[capture.indexOf('-S') + 1]).toBe('-210');
+      expect(capture[capture.indexOf('-E') + 1]).toBe('-201');
       expect(reply?.error).toBeUndefined();
       expect(reply?.lines).toBe(10);
     });
 
-    it('walks further back as the client reports what it already holds', () => {
-      handleScreenHistoryRequest(request({ before: 10, lines: 10 }));
+    it('walks further back as the caller reports more held lines', () => {
+      handleScreenHistoryRequest(request({ before: 210, lines: 10 }));
 
       const capture = historyCaptures()[0];
-      expect(capture[capture.indexOf('-S') + 1]).toBe(String(-(STREAM_CAPTURE_LINES + 20)));
-      expect(capture[capture.indexOf('-E') + 1]).toBe(String(-(STREAM_CAPTURE_LINES + 11)));
+      expect(capture[capture.indexOf('-S') + 1]).toBe('-220');
+      expect(capture[capture.indexOf('-E') + 1]).toBe('-211');
+    });
+
+    // The frame the caller is holding may have been trimmed by the byte cap, so
+    // it holds FEWER lines than the capture asked for. Starting the page at the
+    // constant instead of at what it actually holds would skip the lines in
+    // between, and no later page can ever reach back down to them.
+    it('starts where a truncated frame actually ends, not where the constant says', () => {
+      handleScreenHistoryRequest(request({ before: 12, lines: 10 }));
+
+      const capture = historyCaptures()[0];
+      expect(capture[capture.indexOf('-S') + 1]).toBe('-22');
+      expect(capture[capture.indexOf('-E') + 1]).toBe('-13');
+    });
+
+    it('assumes the full capture window when the caller names no offset', () => {
+      handleScreenHistoryRequest(request({ before: undefined, lines: 10 }));
+
+      const capture = historyCaptures()[0];
+      expect(capture[capture.indexOf('-S') + 1]).toBe(String(-(STREAM_CAPTURE_LINES + 10)));
+      expect(capture[capture.indexOf('-E') + 1]).toBe(String(-(STREAM_CAPTURE_LINES + 1)));
     });
 
     it('returns the lines that sit there, contiguous with the page before it', () => {
       const depth = STREAM_CAPTURE_LINES + 100;
-      const first = handleScreenHistoryRequest(request({ before: 0, lines: 10 }));
-      const second = handleScreenHistoryRequest(request({ before: 10, lines: 10, requestId: 'r2' }));
+      const first = handleScreenHistoryRequest(request({ before: 200, lines: 10 }));
+      const second = handleScreenHistoryRequest(request({ before: 210, lines: 10, requestId: 'r2' }));
 
       // The live window holds the last STREAM_CAPTURE_LINES lines, so page one
       // ends just above it and page two ends where page one began.
@@ -182,7 +202,7 @@ describe('agent.screen.history.request — one page of scrollback above the live
     });
 
     it('keeps the ANSI colours, the way the live frames do', () => {
-      handleScreenHistoryRequest(request());
+      handleScreenHistoryRequest(request({ before: 200 }));
 
       expect(historyCaptures()[0]).toContain('-e');
     });
@@ -190,14 +210,14 @@ describe('agent.screen.history.request — one page of scrollback above the live
 
   describe('ends of the history', () => {
     it('says there is more above the page it returned', () => {
-      const reply = handleScreenHistoryRequest(request({ before: 0, lines: 10 }));
+      const reply = handleScreenHistoryRequest(request({ before: 200, lines: 10 }));
 
       expect(reply?.hasMore).toBe(true);
     });
 
     it('says there is nothing more once the page reaches the oldest line', () => {
       fillPane(STREAM_CAPTURE_LINES + 10);
-      const reply = handleScreenHistoryRequest(request({ before: 0, lines: 10 }));
+      const reply = handleScreenHistoryRequest(request({ before: 200, lines: 10 }));
 
       expect(reply?.lines).toBe(10);
       expect(reply?.hasMore).toBe(false);
@@ -207,7 +227,7 @@ describe('agent.screen.history.request — one page of scrollback above the live
     // end: answer emptily rather than with an error, so the view can just stop.
     it('answers an exhausted history with an empty page, not an error', () => {
       fillPane(STREAM_CAPTURE_LINES + 5);
-      const reply = handleScreenHistoryRequest(request({ before: 5, lines: 10 }));
+      const reply = handleScreenHistoryRequest(request({ before: STREAM_CAPTURE_LINES + 5, lines: 10 }));
 
       expect(reply?.error).toBeUndefined();
       expect(reply?.content).toBe('');
@@ -222,9 +242,7 @@ describe('agent.screen.history.request — one page of scrollback above the live
       handleScreenHistoryRequest(request({ before: 0, lines: SCREEN_HISTORY_MAX_LINES + 500 }));
 
       const capture = historyCaptures()[0];
-      expect(capture[capture.indexOf('-S') + 1]).toBe(
-        String(-(STREAM_CAPTURE_LINES + SCREEN_HISTORY_MAX_LINES)),
-      );
+      expect(capture[capture.indexOf('-S') + 1]).toBe(String(-SCREEN_HISTORY_MAX_LINES));
     });
 
     // These numbers become tmux argv. A fractional or negative one would build
@@ -267,7 +285,7 @@ describe('agent.screen.history.request — one page of scrollback above the live
       paneLines = Array.from({ length: STREAM_CAPTURE_LINES + 20 }, () => 'x'.repeat(4096));
       historySize = { 'zeph-a': paneLines.length };
 
-      const reply = handleScreenHistoryRequest(request({ before: 0, lines: 10 }));
+      const reply = handleScreenHistoryRequest(request({ before: 200, lines: 10 }));
 
       expect(reply?.truncated).toBe(true);
       expect(reply?.lines).toBeLessThan(10);
