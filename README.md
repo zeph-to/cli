@@ -364,9 +364,9 @@ being on:
 - **Encryption on.** The phone sends its device public key when it
   subscribes, every pane frame comes back inside an ECDH P-256 +
   AES-256-GCM envelope, and your keystrokes are sealed for this
-  listener with their `seq`/`epoch` stamps sealed *inside* the
-  ciphertext, so the relay can't replay one. A frame that fails to
-  encrypt is dropped, never downgraded.
+  listener with their `seq`/`epoch` stamps embedded in the ciphertext,
+  so the relay can't replay one. A frame that fails to encrypt is
+  dropped, never downgraded.
 
 Two gaps either way. A message sent while no live stream is open falls
 back to REST, which is plaintext to the server — that includes every
@@ -662,8 +662,8 @@ useless, so push contents stay private. Three limits worth knowing:
   device verified, and strict mode then wraps only for verified
   devices — but it defaults off, its verified list is per browser
   profile, and this CLI does not consult it: `selectRecipients` asks
-  only whether a device has a public key. So the app can close this for
-  pushes it sends itself; a CLI push cannot (ADR-0007 Phase 4).
+  only whether a device has a public key, and whether that key is the
+  legacy account-wide one (ADR-0007 Phase 4).
 - **No forward secrecy.** The ECDH secret for a given sender/device pair
   is static, so compromising either private key opens every past push
   wrapped for that pair.
