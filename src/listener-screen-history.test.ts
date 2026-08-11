@@ -357,9 +357,19 @@ describe('agent.screen.history.request — one page of scrollback above the live
     };
 
     /** The seal is async (an ECDH derive, then AES): pump until the reply that
-     *  it produces shows up, rather than guessing at a number of ticks. */
+     *  it produces shows up, rather than guessing at a number of ticks.
+     *
+     *  Two properties matter, and the original 50-tick version had neither.
+     *  The budget has to be far larger than the expected cost — the derive is
+     *  real native crypto, and a loaded CI runner needs many more turns than a
+     *  laptop; 50 was enough locally and not on ubuntu. And exhausting it has
+     *  to FAIL here: falling through with `sent` still empty left
+     *  `sent.at(-1)` undefined, which quietly satisfied the `content`
+     *  assertion below and failed the next one, reporting "expected undefined
+     *  to be defined" for what was really a timeout. */
     const flush = async () => {
-      for (let i = 0; i < 50 && sent.length === 0; i++) await vi.advanceTimersByTimeAsync(1);
+      for (let i = 0; i < 2000 && sent.length === 0; i++) await vi.advanceTimersByTimeAsync(1);
+      if (sent.length === 0) throw new Error('seal produced no reply within the pump budget');
     };
 
     it('seals the page for the subscriber instead of sending it in the clear', async () => {
