@@ -1,0 +1,26 @@
+{
+  "$comment": "Candidate gemini detection rules, verified against real panes by harness-bench.test.ts before they are published. These are DATA for the OTA manifest (zeph/apps/server/src/agent-rules/manifest.json), not bundled rules — agent-rules.default.ts stays empty for gemini so a listener that cannot reach the endpoint keeps reporting `unknown` rather than guessing. Authored from panes captured for this repo (Gemini CLI v0.46.0); no rule content is carried over from any other project.",
+  "$coverage": "KNOWN GAP — `blocked` here means the folder-trust dialog, the only blocked screen that was actually captured. Gemini's tool-approval prompt is the common blocked case in practice and has NO rule: the probe session had shell auto-approved, so it never rendered. Until someone captures it, a gemini session waiting on tool approval reports `working` (the spinner rule) or `idle`, not `blocked`. Do not read the bench matrix's green `blocked` cell as full coverage of that state.",
+  "rules": [
+    {
+      "id": "gemini-blocked-trust-dialog",
+      "state": "blocked",
+      "priority": 900,
+      "tailLines": 30,
+      "contains": ["do you trust the files in this folder?"]
+    },
+    {
+      "id": "gemini-working-cancel-hint",
+      "state": "working",
+      "priority": 800,
+      "contains": ["esc to cancel"]
+    },
+    {
+      "id": "gemini-idle-input-placeholder",
+      "state": "idle",
+      "priority": 600,
+      "contains": ["type your message"],
+      "not": [{ "contains": ["esc to cancel"] }]
+    }
+  ]
+}

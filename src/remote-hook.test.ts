@@ -126,9 +126,14 @@ describe('runRemoteHook (ADR-0002, gemini/codex)', () => {
         writeRemoteMarker(cwd, text, () => NOW);
         // NBSP is part of the digest: the exact text matches …
         expect(runRemoteHook('gemini', stdin(text, cwd), TWO_WAY, () => NOW)).not.toBeNull();
-        // … and the NBSP-stripped variant must NOT.
+        // … and the NBSP-stripped variant must NOT. The first call left this
+        // project in REMOTE, so the second one still speaks — as the sticky
+        // reminder. What it must never be is the entry note, and the marker it
+        // failed to match must survive for a later prompt.
         writeRemoteMarker(cwd, text, () => NOW);
-        expect(runRemoteHook('gemini', stdin('nbsp end', cwd), TWO_WAY, () => NOW)).toBeNull();
+        const ctx = contextOf(runRemoteHook('gemini', stdin('nbsp end', cwd), TWO_WAY, () => NOW));
+        expect(ctx).not.toContain('arrived from the user');
+        expect(existsSync(markerPath(cwd))).toBe(true);
     });
 
     it('malformed marker content → silent, no crash', () => {
@@ -145,6 +150,57 @@ describe('runRemoteHook (ADR-0002, gemini/codex)', () => {
         expect(runRemoteHook('gemini', JSON.stringify({ prompt: 'phone text' }), TWO_WAY, () => NOW)).toBeNull();
         expect(runRemoteHook('gemini', 'not json', TWO_WAY, () => NOW)).toBeNull();
         expect(existsSync(markerPath(cwd))).toBe(true);
+    });
+
+    // Sticky REMOTE, same three scenarios as the bash twin's
+    // "[sticky state alive…]" blocks in plugin/tests/test-zeph-remote.sh.
+
+    const statePath = (cwd: string): string =>
+        join(stateHome, 'zeph', `remote-active-${projectHash(cwd)!}`);
+
+    const seedState = (cwd: string, secondsAgo = 0): void => {
+        mkdirSync(join(stateHome, 'zeph'), { recursive: true });
+        writeFileSync(statePath(cwd), `${Math.floor(NOW / 1000) - secondsAgo}\n`);
+    };
+
+    it('entering REMOTE records the state so later turns keep it', () => {
+        const cwd = '/proj/enter';
+        writeRemoteMarker(cwd, 'start from the phone', () => NOW);
+        runRemoteHook('gemini', stdin('start from the phone', cwd), TWO_WAY, () => NOW);
+        expect(existsSync(statePath(cwd))).toBe(true);
+    });
+
+    // The device-switch case: no marker, no zeph_ask result, and until the
+    // state file existed there was nothing left to say the session was remote.
+    it('state alive but no marker → reminder, not the entry note', () => {
+        const cwd = '/proj/sticky';
+        seedState(cwd);
+        const ctx = contextOf(runRemoteHook('gemini', stdin('typed at the terminal', cwd), TWO_WAY, () => NOW));
+        expect(ctx).toContain('REMOTE');
+        expect(ctx).not.toContain('arrived from the user');
+        expect(existsSync(statePath(cwd))).toBe(true);
+    });
+
+    it('state past the TTL → silent, and the state is swept', () => {
+        const cwd = '/proj/sticky-stale';
+        seedState(cwd, 20_000);
+        expect(runRemoteHook('gemini', stdin('much later', cwd), TWO_WAY, () => NOW)).toBeNull();
+        expect(existsSync(statePath(cwd))).toBe(false);
+    });
+
+    it('state alive but muted → silent (mute outranks, Rule 12)', () => {
+        const cwd = '/proj/sticky-muted';
+        seedState(cwd);
+        writeFileSync(join(stateHome, 'zeph', `muted-${projectHash(cwd)!}`), '');
+        expect(runRemoteHook('gemini', stdin('anything', cwd), TWO_WAY, () => NOW)).toBeNull();
+        expect(existsSync(statePath(cwd))).toBe(true);
+    });
+
+    it('state alive but no ZEPH_HOOK_ID → silent (no zeph_ask to remind about)', () => {
+        const cwd = '/proj/sticky-oneway';
+        seedState(cwd);
+        expect(runRemoteHook('gemini', stdin('typed at the terminal', cwd), ONE_WAY, () => NOW)).toBeNull();
+        expect(existsSync(statePath(cwd))).toBe(true);
     });
 });
 

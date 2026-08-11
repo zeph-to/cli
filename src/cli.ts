@@ -8,6 +8,7 @@ import { handleLogin } from './login.js';
 import { handleUninstall } from './uninstall.js';
 import { handleVerify } from './verify.js';
 import { handleCheckUpdate } from './check-update.js';
+import { handleAsk } from './ask.js';
 import { handleAgentSession } from './wrapper.js';
 import { handleListener, computeListenerDeviceId } from './listener.js';
 import { detectProjectDir, loadConfig, resolvedEnv, VERSION } from './config.js';
@@ -80,6 +81,10 @@ Commands:
   verify          Check installation health across detected agents
   check-update    Check whether a newer Zeph version is available
   notify          Send a push notification
+  ask             Ask the phone a question and WAIT for the answer
+                  (--title, --body, --actions id:Label,…, --timeout secs)
+                  Prints one JSON line; exit 0 answered, 1 not. Built for
+                  hooks, which cannot call the MCP zeph_ask tool.
   list            List recent push notifications
   dismiss <id>    Dismiss a push notification (or --all)
   rename <name>   Set this agent session's display name in the app
@@ -481,6 +486,8 @@ const main = async (): Promise<number> => {
       return handleCheckUpdate(args);
     case 'notify':
       return handleNotify(args);
+    case 'ask':
+      return handleAsk(args);
     case 'list':
       return handleList(args);
     case 'dismiss':

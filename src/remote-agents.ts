@@ -27,6 +27,17 @@ export interface RemoteAgent {
     binary: string;
     /** `zeph <subcommand>` aliases that launch this agent. */
     subcommands: readonly string[];
+    /**
+     * What this agent is typed to make it quit, if it has such a command.
+     *
+     * Signals are not enough on their own: Claude Code holds its prompt
+     * through both `C-c` and `C-d`, so a remote "end this session" built only
+     * out of key presses reports failure against the agent people actually
+     * run. Omitted where the command has not been verified against the real
+     * binary — sending a guess into a live pane types it at whatever prompt
+     * is there.
+     */
+    quitCommand?: string;
     /** Extra pane_command basenames accepted as this agent (beyond binary). */
     paneMatchAliases?: readonly string[];
     /**
@@ -228,6 +239,7 @@ const REMOTE_AGENT_TABLE = [
         displayName: 'Claude Code',
         binary: 'claude',
         subcommands: ['cc', 'claude'],
+        quitCommand: '/exit',
         // Exact pid-tree match first; mtime heuristic only as fallback
         // (older CC without ~/.claude/sessions, or ps failure).
         resolveSessionId: (paneCwd, panePid) =>

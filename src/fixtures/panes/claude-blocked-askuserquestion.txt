@@ -1,0 +1,18 @@
+❯ Call the AskUserQuestion tool right now with the question "Pick a color" and the
+  options Red, Green, Blue. Do not use any other tool and do not read any files.
+────────────────────────────────────────────────────────────────────────────────────
+ ☐ Color
+
+Pick a color
+
+❯ 1. Red
+     Red
+  2. Green
+     Green
+  3. Blue
+     Blue
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
