@@ -356,10 +356,30 @@ describe('agent.screen.history.request — one page of scrollback above the live
       return btoa(bin);
     };
 
-    /** The seal is async (an ECDH derive, then AES): pump until the reply that
-     *  it produces shows up, rather than guessing at a number of ticks. */
-    const flush = async () => {
-      for (let i = 0; i < 50 && sent.length === 0; i++) await vi.advanceTimersByTimeAsync(1);
+    /**
+     * The seal is async — an ECDH derive, then an AES encrypt — so the reply
+     * exists only once that resolves. Waiting on `sent` being non-empty for a
+     * fixed number of ticks was wrong twice over: any unrelated emission
+     * satisfies it, and a machine slower than this one turns "the seal had not
+     * finished yet" into a failed assertion about encryption.
+     *
+     * That is what CI hit. Once every test file was given its own empty home,
+     * `initDeviceCrypto` generates a keypair rather than loading one another
+     * file left behind, and the old budget of 50 ticks stopped covering the
+     * derive on a two-core runner. Locally it still passed, which is the worst
+     * shape a bound like that can have.
+     *
+     * So wait for this request's own reply, matched by subtype, and pump with a
+     * zero-length advance: the point is to yield, and moving fake time forward
+     * would walk into the stream loop's next capture and put frames in `sent`.
+     */
+    const historyReply = async (): Promise<Record<string, unknown> | undefined> => {
+      const isHistory = (m: Record<string, unknown>) => m.subtype === 'agent.screen.history.snapshot';
+      for (let i = 0; i < 5_000 && !sent.some(isHistory); i++) await vi.advanceTimersByTimeAsync(0);
+      const reply = sent.find(isHistory);
+      expect(reply, `no history reply; ${sent.length} message(s) sent: ${JSON.stringify(sent).slice(0, 300)}`)
+        .toBeDefined();
+      return reply;
     };
 
     it('seals the page for the subscriber instead of sending it in the clear', async () => {
@@ -368,9 +388,8 @@ describe('agent.screen.history.request — one page of scrollback above the live
       openStream(await recipientKey());
 
       handleScreenHistoryRequest(request({ before: 200, lines: 10 }), send);
-      await flush();
 
-      const reply = sent.at(-1);
+      const reply = await historyReply();
       expect(reply?.content).toBeUndefined();
       expect(reply?.encrypted).toBeDefined();
       const ciphertext = (reply?.encrypted as { ciphertext: string }).ciphertext;
@@ -385,9 +404,8 @@ describe('agent.screen.history.request — one page of scrollback above the live
       openStream('not-a-key');
 
       handleScreenHistoryRequest(request({ before: 200, lines: 10 }), send);
-      await flush();
 
-      const reply = sent.at(-1);
+      const reply = await historyReply();
       expect(reply?.error).toBe('encrypt_failed');
       expect(reply?.content).toBeUndefined();
       expect(reply?.encrypted).toBeUndefined();
