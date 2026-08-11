@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-    autoPushMode, decidePush, GATE_DEFAULTS, isMuted, normalizeMarker, normalizePushMode,
-    projectHash, PUSHMODE_DEFAULT, PUSHMODE_DEFAULT_FLAG, readPushMode, stateDir,
+    autoPushMode, decidePush, GATE_DEFAULTS, isMuted, isRemoteActive, normalizeMarker,
+    normalizePushMode, projectHash, PUSHMODE_DEFAULT, PUSHMODE_DEFAULT_FLAG, readPushMode,
+    REMOTE_TTL_SEC, remoteStatePath, stateDir, touchRemoteActive,
 } from './gate.js';
 
 // ── Cross-repo parity vectors ────────────────────────────────────
@@ -221,5 +222,66 @@ describe('gate.ts: project state helpers', () => {
     it('isMuted has no global default — mute stays project-only', () => {
         writeFileSync(join(TMP, 'state', 'zeph', 'muted-default'), '');
         expect(isMuted(TMP)).toBe(false);
+    });
+});
+
+// ── Sticky REMOTE state (twin of gate.sh zeph_remote_active/_touch) ──
+
+describe('gate.ts: sticky REMOTE state', () => {
+    const NOW = 1_800_000_000_000; // fixed clock; the epoch second is 1800000000
+    const at = (ms: number) => () => ms;
+
+    it('keys the state file exactly as the bash hook does', () => {
+        touchRemoteActive(TMP, at(NOW));
+        expect(remoteStatePath(projectHash(TMP)!))
+            .toBe(join(TMP, 'state', 'zeph', `remote-active-${projectHash(TMP)}`));
+        expect(readFileSync(remoteStatePath(projectHash(TMP)!), 'utf-8').trim())
+            .toBe(String(Math.floor(NOW / 1000)));
+    });
+
+    it('is inactive with no state file, and does not create one', () => {
+        expect(isRemoteActive(TMP, at(NOW))).toBe(false);
+        expect(existsSync(remoteStatePath(projectHash(TMP)!))).toBe(false);
+    });
+
+    it('stays active right up to the TTL boundary', () => {
+        touchRemoteActive(TMP, at(NOW));
+        const lastFreshMs = NOW + REMOTE_TTL_SEC * 1000;
+        expect(isRemoteActive(TMP, at(lastFreshMs))).toBe(true);
+    });
+
+    // The sweep is the only thing that ends a REMOTE session nobody exited:
+    // there is no SessionEnd hook, so a crashed session's state would
+    // otherwise make every later session in this project ask an absent phone.
+    it('sweeps state one second past the TTL', () => {
+        touchRemoteActive(TMP, at(NOW));
+        const file = remoteStatePath(projectHash(TMP)!);
+        expect(isRemoteActive(TMP, at(NOW + (REMOTE_TTL_SEC + 1) * 1000))).toBe(false);
+        expect(existsSync(file)).toBe(false);
+    });
+
+    it('sweeps state it cannot parse', () => {
+        const file = remoteStatePath(projectHash(TMP)!);
+        writeFileSync(file, 'not-a-timestamp\n');
+        expect(isRemoteActive(TMP, at(NOW))).toBe(false);
+        expect(existsSync(file)).toBe(false);
+    });
+
+    // Parity regression against the bash twin's `case "$ts" in *[!0-9]*)`,
+    // which rejects every one of these. Number() is looser: it reads '1e10' as
+    // ten billion, so a file bash sweeps would have kept REMOTE alive here
+    // until the year 2286.
+    it.each(['1e10', '0x10', '+5', '1_000'])('sweeps non-digit state %j', (raw) => {
+        const file = remoteStatePath(projectHash(TMP)!);
+        writeFileSync(file, `${raw}\n`);
+        expect(isRemoteActive(TMP, at(NOW))).toBe(false);
+        expect(existsSync(file)).toBe(false);
+    });
+
+    it('refreshing pushes the expiry back', () => {
+        touchRemoteActive(TMP, at(NOW));
+        const later = NOW + REMOTE_TTL_SEC * 1000;
+        touchRemoteActive(TMP, at(later));
+        expect(isRemoteActive(TMP, at(later + REMOTE_TTL_SEC * 1000))).toBe(true);
     });
 });

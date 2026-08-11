@@ -19,7 +19,7 @@
  */
 import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
-import { existsSync, readFileSync, statSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 
@@ -150,6 +150,78 @@ export const remoteDigest = (text: string): string =>
   createHash('sha256')
     .update(text.replace(/^[ \t\r\n\f\v]+|[ \t\r\n\f\v]+$/g, ''))
     .digest('hex');
+
+// ── Sticky REMOTE state ──────────────────────────────────────────
+//
+// The marker above is a ONE-SHOT entry signal, consumed the moment a prompt
+// matches it. REMOTE outlives that turn — the user can answer from the phone
+// and then type at the terminal — so the mode itself lives in
+// `remote-active-<hash>`, holding the epoch second it was last confirmed.
+// Keeping it in a file is also what lets it survive context compaction.
+// Bash twin: plugin/hooks/gate.sh zeph_remote_active / zeph_remote_touch.
+//
+// Deliberately not routed through findStateFile. That helper also honors a
+// legacy /tmp copy so files written by older versions keep working; this kind
+// has never had a /tmp writer, so the branch could only ever match something
+// stale — and since the refresh always writes the XDG path, such a file would
+// never expire.
+
+/**
+ * How long REMOTE stays live without a refresh. Generous on purpose: the state
+ * is refreshed on every phone prompt and every answered `zeph_ask`, so it only
+ * has to outlive a working session, never an idle user. It exists at all
+ * because nothing owns "this session ended" — there is no SessionEnd hook — so
+ * a crash or Ctrl-C would otherwise latch REMOTE forever.
+ */
+export const REMOTE_TTL_SEC = 14400;
+
+/** State path for a project hash: `<stateDir>/remote-active-<cksum(dir)>`. */
+export const remoteStatePath = (hash: string): string =>
+  join(stateDir(), `remote-active-${hash}`);
+
+/**
+ * True while REMOTE is live for this project. State that is expired or
+ * unparseable is deleted on sight — the same housekeeping a stale entry
+ * marker gets, since state that can never flag again is dead weight.
+ */
+export const isRemoteActive = (dir: string, now: () => number = Date.now): boolean => {
+  const hash = projectHash(dir);
+  if (!hash) return false;
+  const file = remoteStatePath(hash);
+  let raw: string;
+  try {
+    raw = readFileSync(file, 'utf-8').trim();
+  } catch {
+    return false;
+  }
+  // Digits only, matching the bash twin's `case "$ts" in *[!0-9]*)`. Number()
+  // alone is looser than that test — it reads '1e10' as ten billion, so a file
+  // bash would sweep would live on here as a far-future timestamp.
+  const fresh = /^\d+$/.test(raw) && Math.floor(now() / 1000) - Number(raw) <= REMOTE_TTL_SEC;
+  if (!fresh) {
+    try {
+      unlinkSync(file);
+    } catch {
+      /* best-effort housekeeping */
+    }
+  }
+  return fresh;
+};
+
+/**
+ * Enter REMOTE, or push its expiry back. Best-effort by contract: the prompt
+ * hooks that call this must never fail a prompt over state IO.
+ */
+export const touchRemoteActive = (dir: string, now: () => number = Date.now): void => {
+  const hash = projectHash(dir);
+  if (!hash) return;
+  try {
+    mkdirSync(stateDir(), { recursive: true });
+    writeFileSync(remoteStatePath(hash), `${Math.floor(now() / 1000)}\n`);
+  } catch {
+    /* a hook must never fail on state IO */
+  }
+};
 
 /** True when the user ran /zeph-mute for this project. */
 export const isMuted = (dir: string): boolean => {
