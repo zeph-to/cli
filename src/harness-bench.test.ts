@@ -43,7 +43,10 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { clearRegexCache, evaluateState, type AgentState } from './agent-state.js';
+import {
+    clearRegexCache, ENGINE_VERSION, evaluateState,
+    type AgentState, type DetectionManifest, type DetectionRule,
+} from './agent-state.js';
 import { DEFAULT_MANIFEST } from './agent-rules.default.js';
 import { compareManifestVersions } from './agent-rules-fetch.js';
 import type { AgentKind } from './remote-agents.js';
@@ -136,6 +139,61 @@ describe('harness bench — bundled rules vs real panes', () => {
 });
 
 /**
+ * Candidate rules — verified here, published elsewhere.
+ *
+ * Rules for an agent the bundle deliberately leaves empty still have to be
+ * proven against real panes before they go out, or publishing walks straight
+ * past the gate this file exists to be. The candidate set lives as data in
+ * fixtures/gemini-rules.candidate.json and is copied verbatim into
+ * zeph/apps/server/src/agent-rules/manifest.json when published; the engine
+ * that runs it here is the same one the listener runs.
+ *
+ * Nothing mechanical ties the two repos together — that repo's manifest cannot
+ * be read from this repo's CI, the same limit PUBLISHED_FLOOR lives with. What
+ * this does buy: rules cannot be *authored* without a real pane proving each
+ * one, and a vendor UI change turns these red exactly like the bundled set.
+ */
+const CANDIDATE_CASES: readonly BenchCase[] = CASES.filter((c) => c.agent === 'gemini');
+
+describe('candidate gemini rules — verified before publishing', () => {
+    const candidate = JSON.parse(
+        readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'gemini-rules.candidate.json'), 'utf-8'),
+    ) as { rules: DetectionRule[] };
+
+    const manifest: DetectionManifest = {
+        engineVersion: ENGINE_VERSION,
+        version: DEFAULT_MANIFEST.version,
+        agents: { gemini: candidate.rules },
+    };
+
+    for (const c of CANDIDATE_CASES) {
+        it(`${c.screen} → ${c.expected}`, () => {
+            clearRegexCache();
+            const result = evaluateState(readPane(c.fixture), c.agent, manifest);
+            expect(result.state).toBe(c.expected);
+            expect(result.ruleId).toBeTruthy();
+        });
+    }
+
+    it('leaves the bundle alone — an offline listener still reports unknown', () => {
+        // The whole point of publishing over the air: a daemon that cannot
+        // reach the endpoint must keep saying `unknown` rather than carry a
+        // half-verified guess in its binary.
+        expect(DEFAULT_MANIFEST.agents.gemini ?? []).toHaveLength(0);
+    });
+
+    it('every candidate rule is structurally valid for the listener validator', () => {
+        for (const rule of candidate.rules) {
+            expect(rule.id.length).toBeGreaterThan(0);
+            expect(['working', 'blocked', 'idle', 'unknown']).toContain(rule.state);
+            expect(typeof rule.priority).toBe('number');
+        }
+        const ids = candidate.rules.map((r) => r.id);
+        expect(new Set(ids).size).toBe(ids.length);
+    });
+});
+
+/**
  * The bundle must never claim a version the published manifest hasn't reached.
  *
  * `loadManifestFromCache` and the fetch path both gate on
@@ -152,7 +210,7 @@ describe('harness bench — bundled rules vs real panes', () => {
  * first, then move this line. A floor that lags the published version is
  * harmless — it only ever blocks a bundle bump, never a fetch.
  */
-const PUBLISHED_FLOOR = '2026.07.04.3';
+const PUBLISHED_FLOOR = '2026.08.11.1';
 
 describe('bundled manifest vs published manifest', () => {
     it('does not outrank what the endpoint serves', () => {
