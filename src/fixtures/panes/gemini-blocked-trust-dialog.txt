@@ -1,0 +1,39 @@
+
+
+ ▝▜▄     Gemini CLI v0.46.0
+   ▝▜▄
+  ▗▟▀    Authenticated with gemini-api-key /auth
+ ▝▀
+
+
+Tips for getting started:
+1. /help for more information
+2. Ask coding questions, edit code or run commands
+3. Be specific for the best results
+
+ℹ Skipping project agents due to untrusted folder. To enable, ensure that the
+  project root is trusted.
+
+ℹ You have 1 extension with an update available. Run "/extensions update caveman".
+
+╭──────────────────────────────────────────────────────────────────────────────────╮
+│ Gemini CLI update available! 0.46.0 → 0.54.4                                     │
+│ Installed via Homebrew. Please update with "brew upgrade gemini-cli".            │
+╰──────────────────────────────────────────────────────────────────────────────────╯
+
+
+ ╭────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                │
+ │ Do you trust the files in this folder?                                         │
+ │                                                                                │
+ │ Trusting a folder allows Gemini CLI to load its local configurations,          │
+ │ including custom commands, hooks, MCP servers, agent skills, and settings.     │
+ │ These configurations could execute code on your behalf or change the behavior  │
+ │ of the CLI.                                                                    │
+ │                                                                                │
+ │                                                                                │
+ │ ● 1. Trust folder (gemini-cwd)                                                 │
+ │   2. Trust parent folder (scratchpad)                                          │
+ │   3. Don't trust                                                               │
+ │                                                                                │
+ ╰────────────────────────────────────────────────────────────────────────────────╯

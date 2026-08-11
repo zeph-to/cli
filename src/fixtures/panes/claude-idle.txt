@@ -1,0 +1,10 @@
+     This message disappears once the first observation lands.
+
+     View Observations Live @ http://localhost:37777
+
+────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────
+  Opus 5 · high | probe-cwd | 5h 67% (47m) • 7d 78% (2d 8h) • Fable 30%
+  -- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+                                                                  ● high · /effort
