@@ -139,6 +139,69 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         ]);
     });
 
+    // ── insert: text WITHOUT the submitting Enter ──
+    //
+    // A phone answering a y/n prompt, or typing half a command so a TUI menu
+    // opens, needs the text in the pane and the submit left to the user. The
+    // wire says that with a separate `insert` field rather than a flag on
+    // `body`, so a daemon too old to know the field injects NOTHING instead of
+    // submitting text the user never meant to send.
+
+    it('inserts text as a paste and leaves the pane holding it — no Enter', () => {
+        openStream('zeph-a');
+        handleCommandInput(input({ keys: undefined, insert: 'y' }), send);
+        expect(tmuxInvocations()).toEqual([
+            'set-buffer -b zeph-inject -- y',
+            'paste-buffer -d -p -b zeph-inject -t zeph-a',
+        ]);
+        expect(rejections()).toEqual([]);
+    });
+
+    it('refuses an insert that arrives alongside a body', () => {
+        // One message may only mean one thing: submitting and not-submitting
+        // the same text are opposite instructions.
+        openStream('zeph-a');
+        handleCommandInput(input({ keys: undefined, insert: 'y', body: 'hi' }), send);
+        expect(tmuxInvocations()).toEqual([]);
+        expect(rejections()).toHaveLength(1);
+    });
+
+    it('refuses an insert that arrives alongside keys', () => {
+        openStream('zeph-a');
+        handleCommandInput(input({ insert: 'y' }), send);
+        expect(tmuxInvocations()).toEqual([]);
+        expect(rejections()).toHaveLength(1);
+    });
+
+    it('refuses an insert past the injection cap', () => {
+        openStream('zeph-a');
+        handleCommandInput(input({ keys: undefined, insert: 'x'.repeat(MAX_INPUT_BODY_CHARS + 1) }), send);
+        expect(tmuxInvocations()).toEqual([]);
+        expect(rejections()).toHaveLength(1);
+    });
+
+    it('refuses an empty insert', () => {
+        openStream('zeph-a');
+        handleCommandInput(input({ keys: undefined, insert: '' }), send);
+        expect(tmuxInvocations()).toEqual([]);
+        expect(rejections()).toHaveLength(1);
+    });
+
+    it('REST path: an insert push pastes without Enter too', async () => {
+        // The fallback transport must agree with the live one — a key that
+        // lands differently depending on whether a stream happened to be up
+        // is the worst kind of inconsistency to debug.
+        const { handlePush } = await import('./listener.js');
+        await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-a', insert: 'y' },
+            { rateLimit: () => true, paneCwd: () => null },
+        );
+        expect(tmuxInvocations()).toEqual([
+            'set-buffer -b zeph-inject -- y',
+            'paste-buffer -d -p -b zeph-inject -t zeph-a',
+        ]);
+    });
+
     it('falls back to typing when the buffer cannot be set', () => {
         // Delivered imperfectly beats not delivered.
         bufferFails = true;
@@ -446,11 +509,17 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         const ok = validateInputMessage({ sessionName: 'zeph-a', keys: ['escape'], seq: 4, epoch: 9 });
         expect(ok).toEqual({
             ok: true,
-            input: { sessionName: 'zeph-a', seq: 4, epoch: 9, tokens: ['Escape'], text: null },
+            input: { sessionName: 'zeph-a', seq: 4, epoch: 9, tokens: ['Escape'], text: null, submit: false },
         });
         expect(validateInputMessage({ sessionName: 'zeph-a', body: 'hi', seq: 4, epoch: 9 })).toMatchObject({
             ok: true,
-            input: { tokens: null, text: 'hi' },
+            input: { tokens: null, text: 'hi', submit: true },
+        });
+        // `insert` carries the same text with the submit withheld — that flag
+        // is the whole difference between the two.
+        expect(validateInputMessage({ sessionName: 'zeph-a', insert: 'hi', seq: 4, epoch: 9 })).toMatchObject({
+            ok: true,
+            input: { tokens: null, text: 'hi', submit: false },
         });
         expect(tmuxCalls).toEqual([]);
     });
@@ -576,6 +645,36 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
                 'set-buffer -b zeph-inject -- hello; rm -rf /',
                 'paste-buffer -d -p -b zeph-inject -t zeph-a',
                 'send-keys -t zeph-a Enter',
+            ]);
+        });
+
+        it('inserts sealed text without the submitting Enter', async () => {
+            openE2eeStream(await hostKey());
+
+            handleCommandInput(input({ keys: undefined, encrypted: await seal({ insert: 'y' }) }), send);
+            await pendingInputDecrypts();
+
+            expect(tmuxInvocations()).toEqual([
+                'set-buffer -b zeph-inject -- y',
+                'paste-buffer -d -p -b zeph-inject -t zeph-a',
+            ]);
+        });
+
+        it('ignores a plaintext insert stapled beside an envelope', async () => {
+            // The relay can append fields to a message it forwards, and submit
+            // vs no-submit is exactly the kind of difference it would be worth
+            // flipping. Only the ciphertext decides what gets typed.
+            openE2eeStream(await hostKey());
+
+            handleCommandInput(
+                input({ keys: undefined, insert: 'rm -rf /', encrypted: await seal({ insert: 'y' }) }),
+                send,
+            );
+            await pendingInputDecrypts();
+
+            expect(tmuxInvocations()).toEqual([
+                'set-buffer -b zeph-inject -- y',
+                'paste-buffer -d -p -b zeph-inject -t zeph-a',
             ]);
         });
 

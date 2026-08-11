@@ -4,6 +4,7 @@
 [![downloads](https://img.shields.io/npm/dm/@zeph-to/cli.svg)](https://www.npmjs.com/package/@zeph-to/cli)
 [![node](https://img.shields.io/node/v/@zeph-to/cli.svg)](https://nodejs.org)
 [![license](https://img.shields.io/npm/l/@zeph-to/cli.svg)](./LICENSE)
+[![docs](https://img.shields.io/badge/docs-docs.zeph.to-1f6feb)](https://docs.zeph.to)
 
 **Your agent works, hits a decision, and asks your phone. You tap a button (or type a reply), and the answer lands back in the live session — so the agent keeps going.**
 
@@ -18,6 +19,8 @@
 - **`zeph` CLI** — one-command setup for 8 agents, push sending, and the resident listener for phone-driven remote control.
 
 Part of the Zeph toolchain: [`@zeph-to/mcp-server`](https://github.com/zeph-to/mcp-server) (the MCP tools your agent calls, e.g. `zeph_ask`) · [`zeph-to/plugin`](https://github.com/zeph-to/plugin) (Claude Code plugin bundling hooks + MCP + rules) · the [Zeph app](https://zeph.to) on your phone.
+
+> **New here?** [docs.zeph.to](https://docs.zeph.to) walks the whole setup — one command on this machine, the app on your phone, and a restart. The reference below assumes that is already done.
 
 ## Quick Start
 
@@ -354,10 +357,26 @@ into a shell-adjacent pane). The defense is layered:
    prompt is still in front of every destructive tool call. The phone
    can *talk* but can't approve `rm -rf` for you.
 
-The transport (WS) is currently authenticated by API key + `push:read`
-scope and is **not** end-to-end encrypted in v1 — your Zeph backend
-sees the message plaintext. If you self-host or trust your backend,
-that's fine. If you don't, hold off until per-device E2E ships.
+The transport (WS) is authenticated by API key + `push:read` scope.
+Whether your backend also reads what crosses it depends on encryption
+being on:
+
+- **Encryption off — the default.** The phone has no device keypair to
+  hand the listener, so pane frames and the messages you type both
+  cross the relay in plaintext.
+- **Encryption on.** The phone sends its device public key when it
+  subscribes, every pane frame comes back inside an ECDH P-256 +
+  AES-256-GCM envelope, and your keystrokes are sealed for this
+  listener with their `seq`/`epoch` stamps embedded in the ciphertext,
+  so the relay can't replay one. A frame that fails to encrypt is
+  dropped, never downgraded.
+
+Two gaps either way. A message sent while no live stream is open falls
+back to REST, which is plaintext to the server — that includes every
+`@<session>` command from the agent chat. And the sealed channel buys
+confidentiality against a *passive* relay only: each side learns the
+other's key from the wire, so a backend that mints its own keypair can
+pose as the listener.
 
 ## CLI Usage
 
@@ -619,15 +638,20 @@ session.
 
 ## Encryption
 
-Push bodies and long-body attachments are encrypted with AES-256-GCM.
-This host holds its own ECDH P-256 keypair in `~/.zeph/device-keys.json`
-— generated on first use, and the private half never leaves the machine.
-Each push is encrypted once, and its AES key is wrapped separately for
-every device on your account using ECDH against that device's public
-key.
+End-to-end encryption is **off by default** and turning it on needs
+Zeph Pro. The switch is in the app under Settings → E2E Encryption;
+until you flip it, every push leaves this host in plaintext. If the
+account later loses Pro the server answers `PRO_REQUIRED` and the CLI
+resends the same push in the clear. No configuration either way.
 
-Toggle encryption in the Zeph app (Settings → Encryption); when it is
-off, the CLI sends plaintext. No configuration needed.
+With it on, push bodies and long-body attachments are encrypted with
+AES-256-GCM. This host holds its own ECDH P-256 keypair in
+`~/.zeph/device-keys.json` — generated on first use, and the private
+half never leaves the machine; the backend stores public keys only and
+rejects a private-key upload. Each push is encrypted once, and its AES
+key is wrapped separately for every device on your account using ECDH
+against that device's public key. The title and URL move inside the
+ciphertext with the body.
 
 **Threat model:** against a passive backend — a leaked snapshot, an
 operator reading the table — the stored ciphertext and wrapped keys are
@@ -636,9 +660,13 @@ useless, so push contents stay private. Three limits worth knowing:
 - **No protection from an active malicious operator.** Recipient public
   keys come from `GET /devices` on that same server, unsigned and
   unpinned. A backend that injects a device record carrying its own key
-  gets the message key wrapped for it, and reads everything. Closing
-  this needs out-of-band device verification (ADR-0007 Phase 4, not
-  built).
+  gets the message key wrapped for it, and reads everything. The Zeph
+  app ships the counter-measure — compare device fingerprints, mark a
+  device verified, and strict mode then wraps only for verified
+  devices — but it defaults off, its verified list is per browser
+  profile, and this CLI does not consult it: `selectRecipients` asks
+  only whether a device has a public key, and whether that key is the
+  legacy account-wide one (ADR-0007 Phase 4).
 - **No forward secrecy.** The ECDH secret for a given sender/device pair
   is static, so compromising either private key opens every past push
   wrapped for that pair.

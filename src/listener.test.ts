@@ -29,6 +29,7 @@ import {
     collectWatchHits,
     setPatternWatches,
     resetPatternWatches,
+    historyLinesIn,
 } from './listener.js';
 
 describe('checkRateLimit', () => {
@@ -284,6 +285,24 @@ describe('resolveKeys', () => {
         expect(resolveKeys(['pageup'])).toBeNull();
     });
 
+    it('maps the three control keys a phone needs against a running agent', () => {
+        // Interrupt, toggle verbose output, clear the screen.
+        expect(resolveKeys(['ctrl-c'])).toEqual(['C-c']);
+        expect(resolveKeys(['CTRL-R', ' ctrl-l '])).toEqual(['C-r', 'C-l']);
+    });
+
+    it('still refuses every control key that was not named', () => {
+        // Naming three does not open the send-keys key-name syntax: the map
+        // knows only what was put in it. `ctrl-d` is left out deliberately —
+        // one EOF at an empty prompt ends the agent, and the phone has no way
+        // to start it again.
+        expect(resolveKeys(['ctrl-d'])).toBeNull();
+        expect(resolveKeys(['ctrl-x'])).toBeNull();
+        expect(resolveKeys(['ctrl-z'])).toBeNull();
+        // The tmux spelling is not a wire name — only the lowercase one is.
+        expect(resolveKeys(['C-r'])).toBeNull();
+    });
+
     it('rejects an empty list', () => {
         expect(resolveKeys([])).toBeNull();
     });
@@ -385,6 +404,90 @@ describe('handlePush key events', () => {
         expect(sentKeys).toBe(true);
         expect(injectedText).toBe(false);
     });
+});
+
+describe('handlePush insert (text without the submitting Enter)', () => {
+    const insertDeps = (override: Parameters<typeof handlePush>[1] = {}) => ({
+        paneCommand: () => 'claude',
+        insertText: () => true,
+        rateLimit: () => true,
+        paneCwd: () => null,
+        ...override,
+    });
+
+    const insertCmd = (overrides: Partial<Parameters<typeof handlePush>[0]> = {}) => ({
+        pushId: '1',
+        type: 'agent.command' as const,
+        agentSessionName: 'zeph-myapp',
+        insert: 'y',
+        ...overrides,
+    });
+
+    it('routes an insert to the paste-only injector, never the submitting one', async () => {
+        let inserted: { session: string; text: string } | null = null;
+        let submitted = false;
+        const ok = await handlePush(
+            insertCmd(),
+            insertDeps({
+                insertText: (session, text) => { inserted = { session, text }; return true; },
+                inject: () => { submitted = true; return true; },
+            }),
+        );
+        expect(ok).toBe(true);
+        expect(inserted).toEqual({ session: 'zeph-myapp', text: 'y' });
+        expect(submitted).toBe(false);
+    });
+
+    it('honours the shell-pane RCE guard', async () => {
+        let inserted = false;
+        const ok = await handlePush(
+            insertCmd(),
+            insertDeps({ paneCommand: () => 'bash', insertText: () => { inserted = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(inserted).toBe(false);
+    });
+
+    it('honours the rate limit', async () => {
+        let inserted = false;
+        const ok = await handlePush(
+            insertCmd(),
+            insertDeps({ rateLimit: () => false, insertText: () => { inserted = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(inserted).toBe(false);
+    });
+
+    it('drops a push carrying both insert and body', async () => {
+        // Submitting and not-submitting the same text are opposite
+        // instructions; a message meaning both means nothing.
+        let touched = false;
+        const ok = await handlePush(
+            insertCmd({ body: 'do the thing' }),
+            insertDeps({
+                insertText: () => { touched = true; return true; },
+                inject: () => { touched = true; return true; },
+            }),
+        );
+        expect(ok).toBe(false);
+        expect(touched).toBe(false);
+    });
+
+    it('prefers keys over insert when both are present', async () => {
+        let inserted = false;
+        let sentKeys = false;
+        const ok = await handlePush(
+            insertCmd({ keys: ['escape'] }),
+            insertDeps({
+                sendKeys: () => { sentKeys = true; return true; },
+                insertText: () => { inserted = true; return true; },
+            }),
+        );
+        expect(ok).toBe(true);
+        expect(sentKeys).toBe(true);
+        expect(inserted).toBe(false);
+    });
+
 });
 
 describe('gcAttachments', () => {
@@ -794,6 +897,45 @@ describe('buildStreamFrame (stream E2EE)', () => {
         );
         expect(frame).toBeNull();
     });
+
+    // The viewer sends this number back as `before` when it pulls history, so a
+    // frame that omits it silently costs the reader the lines between what it
+    // holds and where the daemon would guess the page starts.
+    it('tells the viewer how much scrollback the frame carries', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const frame = await buildStreamFrame(
+            { content: 'pane', truncated: true }, 'zeph-a', undefined, { historyLines: 137 },
+        );
+        expect(frame).toMatchObject({ historyLines: 137 });
+    });
+
+    it('leaves it out when the pane geometry could not be read', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const frame = await buildStreamFrame({ content: 'pane', truncated: false }, 'zeph-a');
+        expect(frame).not.toHaveProperty('historyLines');
+    });
+});
+
+describe('historyLinesIn', () => {
+    // 24 rows captured, 10 of them the visible pane.
+    const capture = (rows: number) => Array.from({ length: rows }, (_, i) => `l${i}`).join('\n') + '\n';
+
+    it('counts the rows above the visible pane', () => {
+        expect(historyLinesIn(capture(24), 10)).toBe(14);
+    });
+
+    it('reports what a trimmed frame actually holds, not what was asked for', () => {
+        // The byte cap cut the capture down to 12 rows; only 2 are scrollback.
+        expect(historyLinesIn(capture(12), 10)).toBe(2);
+    });
+
+    it('never goes negative when the pane is taller than the capture', () => {
+        expect(historyLinesIn(capture(4), 10)).toBe(0);
+    });
+
+    it('counts a capture with no trailing newline the same way', () => {
+        expect(historyLinesIn('l0\nl1\nl2', 1)).toBe(2);
+    });
 });
 
 describe('pattern watches (§S5 v2)', () => {
@@ -890,6 +1032,18 @@ describe('writeRemoteMarker (ADR-0002)', () => {
         );
         expect(ok).toBe(true);
         expect(existsSync(markerPath('/proj/app'))).toBe(true);
+    });
+
+    it('is written for an insert too, so a later manual Enter still reads as remote', async () => {
+        // The prompt-submit hook matches the submitted text against this
+        // digest. After an insert the user presses Enter themselves, so
+        // without a marker here that submit looks locally typed.
+        const ok = await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-app', insert: 'hello' },
+            { paneCommand: () => 'claude', insertText: () => true, rateLimit: () => true, paneCwd: () => '/proj/inserted' },
+        );
+        expect(ok).toBe(true);
+        expect(existsSync(markerPath('/proj/inserted'))).toBe(true);
     });
 
     it('is NOT written when the inject fails', async () => {
