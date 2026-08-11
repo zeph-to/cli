@@ -204,11 +204,19 @@ describe('candidate gemini rules — verified before publishing', () => {
  * bad rule without a release. That is the failure the 0.5.10 rollback taught
  * (SPEC-AGENT-AWARENESS.md §S7).
  *
- * PUBLISHED_FLOOR mirrors zeph/apps/server/src/agent-rules/manifest.json.
- * It lives here as a constant because that manifest is in a different repo and
- * this repo's CI cannot read it. Raising it is a deliberate act: publish there
- * first, then move this line. A floor that lags the published version is
- * harmless — it only ever blocks a bundle bump, never a fetch.
+ * PUBLISHED_FLOOR mirrors zeph/apps/server/src/agent-rules/manifest.json. It is
+ * a constant rather than a live read for hermeticity, NOT because the value is
+ * out of reach: agent-rules-fetch.ts pulls that same manifest from the public
+ * `api.zeph.to/v1/agent-detection/manifest`, so a unit test could too — and
+ * then would fail whenever the network did, which is not what this test is for.
+ *
+ * The cost is a hand-maintained mirror with no drift gate, unlike the
+ * plugin→cli artifacts that `sync-from-plugin.mjs --check` keeps honest. If
+ * this pair drifts often enough to hurt, the fix is a scheduled job that reads
+ * the live endpoint and fails only itself — not making this test depend on a
+ * network. Raising the floor is a deliberate act: publish there first, then
+ * move this line. A floor that lags the published version is harmless — it only
+ * ever blocks a bundle bump, never a fetch.
  */
 const PUBLISHED_FLOOR = '2026.08.11.1';
 

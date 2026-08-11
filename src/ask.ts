@@ -16,7 +16,7 @@
  * and dies with the tool call, so a socket would cost a handshake it cannot
  * amortise; plain polling is the whole protocol here.
  */
-import { loadConfig } from './config.js';
+import { loadConfig, resolvedEnv } from './config.js';
 
 /** Server-side hook trigger + event read. Kept narrow on purpose — this
  *  module needs two routes, not an API client. */
@@ -169,8 +169,13 @@ export const liveDeps = (): AskDeps => ({
  */
 export const handleAsk = async (args: Record<string, string | boolean>): Promise<number> => {
     const config = loadConfig();
-    const apiKey = (args['api-key'] as string) || process.env.ZEPH_API_KEY || config.apiKey;
-    const hookId = (args.hook as string) || process.env.ZEPH_HOOK_ID || config.hookId;
+    // `resolvedEnv`, not `process.env`: a hook environment can hand us a literal
+    // unexpanded `${ZEPH_API_KEY}`, which is truthy and would beat the config
+    // file. Auth then fails, this returns `answered: false`, and the approval
+    // hook maps that to DENY — a command blocked for a reason that has nothing
+    // to do with the user. Every other command in cli.ts resolves env this way.
+    const apiKey = (args['api-key'] as string) || resolvedEnv('ZEPH_API_KEY') || config.apiKey;
+    const hookId = (args.hook as string) || resolvedEnv('ZEPH_HOOK_ID') || config.hookId;
     const title = (args.title as string) || '';
 
     if (!apiKey || !hookId || !title) {
