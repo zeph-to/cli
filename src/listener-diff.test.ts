@@ -287,10 +287,17 @@ describe("agent.diff — what changed in a session's repo", () => {
             return btoa(bin);
         };
 
+        // Same shape as the pump in listener-screen-history.test.ts, and the
+        // same two fixes: a budget wide enough for a loaded CI runner to finish
+        // a real ECDH derive, and a hard failure when it runs out — giving up
+        // silently turns a timeout into a confusing assertion on `undefined`.
+        // The wait only costs its full length when something is already wrong;
+        // the loop exits the moment a reply lands.
         const settle = async () => {
-            for (let i = 0; i < 50 && sent.length === 0; i++) {
+            for (let i = 0; i < 1000 && sent.length === 0; i++) {
                 await new Promise((r) => setTimeout(r, 1));
             }
+            if (sent.length === 0) throw new Error('seal produced no reply within the settle budget');
         };
 
         it('seals the file list for the caller that asked with a key', async () => {
