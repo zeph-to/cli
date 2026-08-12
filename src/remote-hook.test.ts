@@ -126,14 +126,14 @@ describe('runRemoteHook (ADR-0002, gemini/codex)', () => {
         writeRemoteMarker(cwd, text, () => NOW);
         // NBSP is part of the digest: the exact text matches …
         expect(runRemoteHook('gemini', stdin(text, cwd), TWO_WAY, () => NOW)).not.toBeNull();
-        // … and the NBSP-stripped variant must NOT. The first call left this
-        // project in REMOTE, so the second one still speaks — as the sticky
-        // reminder. What it must never be is the entry note, and the marker it
-        // failed to match must survive for a later prompt.
+        // … and the NBSP-stripped variant must NOT. This is the ambiguous
+        // case, not a terminal turn: a fresh marker the prompt failed to match
+        // means a phone message is still in flight, so the hook stays silent,
+        // keeps the marker for a later prompt, and leaves REMOTE alone.
         writeRemoteMarker(cwd, text, () => NOW);
-        const ctx = contextOf(runRemoteHook('gemini', stdin('nbsp end', cwd), TWO_WAY, () => NOW));
-        expect(ctx).not.toContain('arrived from the user');
+        expect(runRemoteHook('gemini', stdin('nbsp end', cwd), TWO_WAY, () => NOW)).toBeNull();
         expect(existsSync(markerPath(cwd))).toBe(true);
+        expect(existsSync(statePath(cwd))).toBe(true);
     });
 
     it('malformed marker content → silent, no crash', () => {
@@ -170,14 +170,58 @@ describe('runRemoteHook (ADR-0002, gemini/codex)', () => {
         expect(existsSync(statePath(cwd))).toBe(true);
     });
 
-    // The device-switch case: no marker, no zeph_ask result, and until the
-    // state file existed there was nothing left to say the session was remote.
-    it('state alive but no marker → reminder, not the entry note', () => {
+    // No marker means the user's own keyboard — a phone answer comes back as a
+    // tool_result and never reaches a prompt hook. So they are back, and the
+    // session leaves REMOTE instead of answering the terminal with a phone loop.
+    it('state alive but no marker → the exit note, and the state is cleared', () => {
         const cwd = '/proj/sticky';
         seedState(cwd);
         const ctx = contextOf(runRemoteHook('gemini', stdin('typed at the terminal', cwd), TWO_WAY, () => NOW));
-        expect(ctx).toContain('REMOTE');
+        expect(ctx).toContain('LEFT sticky REMOTE mode');
         expect(ctx).not.toContain('arrived from the user');
+        expect(existsSync(statePath(cwd))).toBe(false);
+        // Said once: with the state gone, later terminal turns cost nothing.
+        expect(runRemoteHook('gemini', stdin('and another one', cwd), TWO_WAY, () => NOW)).toBeNull();
+    });
+
+    // Ambiguous evidence: the digest missing does not mean the user typed —
+    // the message may be queued behind a long turn, or the two sides may hash
+    // a composition differently. Dropping REMOTE strands a user still on the
+    // phone, so the mode is left exactly as it was.
+    it('fresh marker left unmatched → silent, and REMOTE survives', () => {
+        const cwd = '/proj/sticky-pending';
+        seedState(cwd);
+        writeRemoteMarker(cwd, 'the phone message', () => NOW);
+        expect(runRemoteHook('gemini', stdin('not the injected text', cwd), TWO_WAY, () => NOW)).toBeNull();
+        expect(existsSync(statePath(cwd))).toBe(true);
+        expect(existsSync(markerPath(cwd))).toBe(true);
+    });
+
+    it('empty prompt with a marker pending → no evidence, REMOTE survives', () => {
+        const cwd = '/proj/sticky-empty';
+        seedState(cwd);
+        writeRemoteMarker(cwd, 'the phone message', () => NOW);
+        expect(runRemoteHook('gemini', stdin('', cwd), TWO_WAY, () => NOW)).toBeNull();
+        expect(existsSync(statePath(cwd))).toBe(true);
+    });
+
+    it('stale marker on a live session → still a terminal turn, REMOTE ends', () => {
+        const cwd = '/proj/sticky-stale-marker';
+        seedState(cwd);
+        writeRemoteMarker(cwd, 'old phone text', () => NOW - 1_000_000);
+        const ctx = contextOf(runRemoteHook('gemini', stdin('typed at the terminal', cwd), TWO_WAY, () => NOW));
+        expect(ctx).toContain('LEFT sticky REMOTE mode');
+        expect(existsSync(statePath(cwd))).toBe(false);
+        expect(existsSync(markerPath(cwd))).toBe(false);
+    });
+
+    it('a phone message after that re-enters REMOTE', () => {
+        const cwd = '/proj/sticky-reentry';
+        seedState(cwd);
+        runRemoteHook('gemini', stdin('typed at the terminal', cwd), TWO_WAY, () => NOW);
+        writeRemoteMarker(cwd, 'back on the phone', () => NOW);
+        const ctx = contextOf(runRemoteHook('gemini', stdin('back on the phone', cwd), TWO_WAY, () => NOW));
+        expect(ctx).toContain('arrived from the user');
         expect(existsSync(statePath(cwd))).toBe(true);
     });
 
