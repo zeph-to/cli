@@ -136,11 +136,12 @@ describe('runRemoteHook (ADR-0002, gemini/codex)', () => {
         expect(existsSync(statePath(cwd))).toBe(true);
     });
 
-    it('malformed marker content → silent, no crash', () => {
+    it('malformed marker content → silent, no crash, and the junk is swept', () => {
         const cwd = '/proj/garbage';
         mkdirSync(join(stateHome, 'zeph'), { recursive: true });
         writeFileSync(markerPath(cwd), 'not-a-timestamp junk\n');
         expect(runRemoteHook('gemini', stdin('whatever', cwd), TWO_WAY, () => NOW)).toBeNull();
+        expect(existsSync(markerPath(cwd))).toBe(false);
     });
 
     it('empty prompt / missing cwd / invalid JSON → silent no-op', () => {
