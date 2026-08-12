@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import {
     autoPushMode, decidePush, GATE_DEFAULTS, isMuted, isRemoteActive, normalizeMarker,
     normalizePushMode, projectHash, PUSHMODE_DEFAULT, PUSHMODE_DEFAULT_FLAG, readPushMode,
-    REMOTE_TTL_SEC, remoteStatePath, stateDir, touchRemoteActive,
+    clearRemoteActive, REMOTE_TTL_SEC, remoteStatePath, stateDir, touchRemoteActive,
 } from './gate.js';
 
 // ── Cross-repo parity vectors ────────────────────────────────────
@@ -283,5 +283,13 @@ describe('gate.ts: sticky REMOTE state', () => {
         const later = NOW + REMOTE_TTL_SEC * 1000;
         touchRemoteActive(TMP, at(later));
         expect(isRemoteActive(TMP, at(later + REMOTE_TTL_SEC * 1000))).toBe(true);
+    });
+
+    it('clearing ends REMOTE, and clearing nothing is not an error', () => {
+        touchRemoteActive(TMP, at(NOW));
+        clearRemoteActive(TMP);
+        expect(isRemoteActive(TMP, at(NOW))).toBe(false);
+        expect(existsSync(remoteStatePath(projectHash(TMP)!))).toBe(false);
+        expect(() => clearRemoteActive(TMP)).not.toThrow();
     });
 });

@@ -169,9 +169,11 @@ export const remoteDigest = (text: string): string =>
 /**
  * How long REMOTE stays live without a refresh. Generous on purpose: the state
  * is refreshed on every phone prompt and every answered `zeph_ask`, so it only
- * has to outlive a working session, never an idle user. It exists at all
- * because nothing owns "this session ended" — there is no SessionEnd hook — so
- * a crash or Ctrl-C would otherwise latch REMOTE forever.
+ * has to outlive a working session, never an idle user. It is the backstop and
+ * not the usual exit — a terminal-typed prompt, a Done-like answer and the
+ * model's `<!-- zeph: exit -->` all delete the file outright. What none of them
+ * covers is a session that simply died: there is no SessionEnd hook, so without
+ * a TTL a crash or Ctrl-C would latch REMOTE forever.
  */
 export const REMOTE_TTL_SEC = 14400;
 
@@ -220,6 +222,21 @@ export const touchRemoteActive = (dir: string, now: () => number = Date.now): vo
     writeFileSync(remoteStatePath(hash), `${Math.floor(now() / 1000)}\n`);
   } catch {
     /* a hook must never fail on state IO */
+  }
+};
+
+/**
+ * Leave REMOTE. Best-effort like its twin: an absent file is success, and the
+ * caller is a hook with its own job to finish. Bash twin: gate.sh
+ * zeph_remote_clear.
+ */
+export const clearRemoteActive = (dir: string): void => {
+  const hash = projectHash(dir);
+  if (!hash) return;
+  try {
+    unlinkSync(remoteStatePath(hash));
+  } catch {
+    /* already gone, or unwritable — the prompt still goes through */
   }
 };
 
