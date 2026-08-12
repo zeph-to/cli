@@ -169,7 +169,16 @@ const remoteOrigin = (prompt: string, cwd: string, now: () => number): RemoteOri
 
   // Marker format: "<epochSec> <sha256hex>\n" (listener.ts writeRemoteMarker).
   const record = content.match(/^(\d+) ([0-9a-f]{64})\n?$/);
-  if (!record) return 'keyboard';
+  if (!record) {
+    // Junk can only ever be re-read and re-rejected — same housekeeping a
+    // stale marker gets. Twin: zeph-remote.sh's `rm -f` on the parse branches.
+    try {
+      unlinkSync(marker);
+    } catch {
+      /* best-effort housekeeping */
+    }
+    return 'keyboard';
+  }
 
   if (Math.floor(now() / 1000) - Number(record[1]) > FRESH_WINDOW_SEC) {
     // Stale markers are dead weight (can never flag) — delete on sight.
