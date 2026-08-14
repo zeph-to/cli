@@ -116,7 +116,7 @@ tmux session via `tmux send-keys`.
 [zeph listener — resident daemon, started by `zeph cc` automatically]
    │  tmux send-keys -l -t zeph-myapp "리팩토링 마무리해줘" + Enter
    ▼
-[tmux session "zeph-myapp" running claude / codex / cursor-agent / gemini]
+[tmux session "zeph-myapp" running claude / codex / cursor-agent / gemini / hermes]
 ```
 
 The listener polls its tmux session inventory every 5 seconds and
@@ -164,6 +164,26 @@ through. Same reason the `stop`-hook auto-push `zeph setup` installs
 covers the Cursor **IDE** but not `zeph cursor` panes; ask for a
 `zeph_notify` when you want one.
 
+`zeph hermes` is in the same position, and asking for it works the same
+way. `zeph install` does not wire Hermes either — add the MCP server to
+`~/.hermes/config.yaml` by hand, as one entry under `mcp_servers`:
+
+```yaml
+mcp_servers:
+  zeph:
+    command: "npx"
+    args: ["-y", "@zeph-to/mcp-server"]
+```
+
+Add the entry; do not replace the file. `mcp_servers` is shared with
+every other server you have configured, and nothing under `~/.hermes` is
+in version control. Then `/reload-mcp` inside Hermes.
+
+`zeph_ask` needs a hook id, which the MCP server reads from
+`ZEPH_HOOK_ID` or from `hookId` in `~/.zeph/config.json` — `zeph install`
+writes the latter, so a machine that has run it once needs no `env`
+block here.
+
 ### Setup
 
 1. **Install tmux.** The listener uses `send-keys`; the wrapper spawns
@@ -190,11 +210,25 @@ covers the Cursor **IDE** but not `zeph cursor` panes; ask for a
    zeph codex     # codex        → tmux session "zeph-<project>"
    zeph cursor    # cursor-agent → tmux session "zeph-<project>"
    zeph gemini    # gemini       → tmux session "zeph-<project>"
+   zeph hermes    # hermes       → tmux session "zeph-<project>"
    ```
 
    `zeph cursor` runs **`cursor-agent`**, Cursor's terminal agent — a
    separate install from the Cursor IDE (the bare `cursor` on your PATH
    is the editor launcher, which exits immediately and can't be driven).
+
+   `zeph hermes` runs Hermes in its classic REPL, which is the default.
+   Launching it in TUI mode instead (`zeph hermes --tui`, or `HERMES_TUI=1`
+   in the environment) puts the pane on the terminal's alternate screen,
+   and the alternate screen has no scrollback — the live mirror on your
+   phone still draws, but scrolling up in it comes back empty.
+
+   If a Hermes session disappears from the phone's picker after you detach
+   and re-attach its tmux session, that's tmux dropping the pane's
+   `start_command`: the listener then sees only `python` and can't tell
+   which agent is running. `zeph listener` run in the foreground prints the
+   reason (`no agent in pane (start=…, current=python)`). Kill the session
+   and start it again with `zeph hermes` to recover.
 
    The first `zeph cc` on a machine **auto-spawns a background
    listener** (singleton, PID file at `~/.zeph/listener.pid`,
@@ -407,6 +441,7 @@ zeph cc                       # claude
 zeph codex                    # codex
 zeph cursor                   # cursor-agent (Cursor CLI, not the IDE)
 zeph gemini                   # gemini
+zeph hermes                   # hermes
 
 # Run the resident listener (foreground; background it as you like)
 zeph listener

@@ -268,6 +268,17 @@ const REMOTE_AGENT_TABLE = [
         binary: 'gemini',
         subcommands: ['gemini'],
     },
+    {
+        // `hermes` on PATH is a bash script that execs a venv Python, so the
+        // pane's *current* command reads `python`. Only `pane_start_command`
+        // identifies it, which is the same bargain `claude` (node) already
+        // makes. Deliberately no paneMatchAliases: `python` would adopt every
+        // Python REPL on the machine as a Hermes session.
+        kind: 'hermes',
+        displayName: 'Hermes',
+        binary: 'hermes',
+        subcommands: ['hermes'],
+    },
 ] as const satisfies readonly RemoteAgent[];
 
 /** Closed union of remote-controllable agent kinds ('claude' | 'codex' | 'cursor' | 'gemini'). */

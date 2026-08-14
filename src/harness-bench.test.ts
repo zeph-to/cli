@@ -49,7 +49,7 @@ import {
 } from './agent-state.js';
 import { DEFAULT_MANIFEST } from './agent-rules.default.js';
 import { compareManifestVersions } from './agent-rules-fetch.js';
-import type { AgentKind } from './remote-agents.js';
+import { REMOTE_AGENTS, type AgentKind } from './remote-agents.js';
 
 const PANES_DIR = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'panes');
 
@@ -77,9 +77,14 @@ const CASES: readonly BenchCase[] = [
 ];
 
 /**
- * Which agents the bench has captured at all. Exhaustive over `AgentKind` on
- * purpose: adding a remote-control agent fails to compile until someone says
- * whether the bench covers it, so a new harness can't slip in unobserved.
+ * Which agents the bench has captured at all. Meant to be exhaustive over
+ * `AgentKind` so a new harness can't slip in unobserved — but the type alone
+ * does not enforce that here: tsconfig excludes `*.test.ts` and vitest does
+ * not typecheck, so `Record<AgentKind, boolean>` never fails a build. Cursor
+ * was added to the registry and this map was never updated, which is exactly
+ * how the matrix below lost a row without anyone noticing. The `covers every
+ * registered kind` test at the bottom of this describe is what actually
+ * enforces it.
  */
 const HAS_FIXTURES: Record<AgentKind, boolean> = {
     claude: true,
@@ -87,6 +92,8 @@ const HAS_FIXTURES: Record<AgentKind, boolean> = {
     // Not installed on the machine that captured these; `zeph setup` still
     // writes its hooks and rules, so this is a real gap, not an oversight.
     codex: false,
+    cursor: false,
+    hermes: false,
 };
 
 const readPane = (fixture: string): string => readFileSync(join(PANES_DIR, fixture), 'utf-8');
@@ -117,6 +124,15 @@ describe('harness bench — bundled rules vs real panes', () => {
             }
         });
     }
+
+    // The guard the type annotation on HAS_FIXTURES was supposed to be. It has
+    // to live in this file: exporting the map so another `.test.ts` could
+    // import it would register this whole describe block a second time, under
+    // that file's own beforeEach.
+    it('HAS_FIXTURES covers every registered kind', () => {
+        expect(Object.keys(HAS_FIXTURES).sort())
+            .toEqual(REMOTE_AGENTS.map((a) => a.kind).slice().sort());
+    });
 
     // The matrix is a REPORT, not a gate — the per-case tests above are what
     // fail. Printing it from afterAll keeps that honest: a test whose assertion

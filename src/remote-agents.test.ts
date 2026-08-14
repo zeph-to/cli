@@ -35,7 +35,7 @@ describe('remote-agents.ts: table invariants', () => {
         }
     });
 
-    it('only claude carries a session resolver (codex/cursor/gemini are documented stubs)', () => {
+    it('only claude carries a session resolver (every other row is a documented stub)', () => {
         for (const a of REMOTE_AGENTS) {
             if (a.kind === 'claude') expect(typeof a.resolveSessionId).toBe('function');
             else expect(a.resolveSessionId).toBeUndefined();
@@ -49,6 +49,7 @@ describe('remote-agents.ts: lookups', () => {
         expect(findAgentBySubcommand('claude')?.kind).toBe('claude');
         expect(findAgentBySubcommand('codex')?.kind).toBe('codex');
         expect(findAgentBySubcommand('gemini')?.kind).toBe('gemini');
+        expect(findAgentBySubcommand('hermes')?.kind).toBe('hermes');
     });
 
     it('cursor launches the terminal TUI, never the IDE launcher', () => {
@@ -63,9 +64,23 @@ describe('remote-agents.ts: lookups', () => {
         // The IDE launcher is not an agent pane — a `cursor` pane is someone
         // opening the editor, and adopting it would address a dead session.
         expect(matchAgentByPaneCommand('cursor')).toBeUndefined();
+        expect(matchAgentByPaneCommand('hermes')?.kind).toBe('hermes');
         expect(matchAgentByPaneCommand('bash')).toBeUndefined();
         expect(matchAgentByPaneCommand('node')).toBeUndefined();
         expect(matchAgentByPaneCommand('')).toBeUndefined();
+    });
+
+    // `hermes` on PATH is a bash script that execs the interpreter, so a pane
+    // running it reports `python` as its current command. Registering that as
+    // an alias would adopt every Python REPL on the machine as a Hermes
+    // session — visible in the phone picker, and a target for text injection.
+    // The registry relies on `pane_start_command` instead; these assertions
+    // are what stops the alias from being added back as a "fix" for a pane
+    // that stopped matching.
+    it('never adopts a bare interpreter pane as an agent', () => {
+        expect(matchAgentByPaneCommand('python')).toBeUndefined();
+        expect(matchAgentByPaneCommand('python3')).toBeUndefined();
+        expect(matchAgentByPaneCommand('python3.11')).toBeUndefined();
     });
 });
 
