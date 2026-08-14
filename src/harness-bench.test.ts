@@ -76,26 +76,6 @@ const CASES: readonly BenchCase[] = [
     { agent: 'gemini', expected: 'idle', fixture: 'gemini-idle.txt', screen: 'input box at rest' },
 ];
 
-/**
- * Which agents the bench has captured at all. Meant to be exhaustive over
- * `AgentKind` so a new harness can't slip in unobserved — but the type alone
- * does not enforce that here: tsconfig excludes `*.test.ts` and vitest does
- * not typecheck, so `Record<AgentKind, boolean>` never fails a build. Cursor
- * was added to the registry and this map was never updated, which is exactly
- * how the matrix below lost a row without anyone noticing. The `covers every
- * registered kind` test at the bottom of this describe is what actually
- * enforces it.
- */
-const HAS_FIXTURES: Record<AgentKind, boolean> = {
-    claude: true,
-    gemini: true,
-    // Not installed on the machine that captured these; `zeph setup` still
-    // writes its hooks and rules, so this is a real gap, not an oversight.
-    codex: false,
-    cursor: false,
-    hermes: false,
-};
-
 const readPane = (fixture: string): string => readFileSync(join(PANES_DIR, fixture), 'utf-8');
 
 const hasBundledRules = (agent: AgentKind): boolean => (DEFAULT_MANIFEST.agents[agent] ?? []).length > 0;
@@ -125,30 +105,27 @@ describe('harness bench — bundled rules vs real panes', () => {
         });
     }
 
-    // The guard the type annotation on HAS_FIXTURES was supposed to be. It has
-    // to live in this file: exporting the map so another `.test.ts` could
-    // import it would register this whole describe block a second time, under
-    // that file's own beforeEach.
-    it('HAS_FIXTURES covers every registered kind', () => {
-        expect(Object.keys(HAS_FIXTURES).sort())
-            .toEqual(REMOTE_AGENTS.map((a) => a.kind).slice().sort());
-    });
-
     // The matrix is a REPORT, not a gate — the per-case tests above are what
     // fail. Printing it from afterAll keeps that honest: a test whose assertion
     // cannot fail would be a report wearing a test's clothes.
+    //
+    // Rows come from the registry rather than a hand-kept list of covered
+    // agents, so an agent added to REMOTE_AGENTS shows up here as an empty row
+    // instead of silently not appearing at all. Cursor did the latter for
+    // months, back when this walked a separate map someone had to remember.
     afterAll(() => {
         const states: AgentState[] = ['working', 'blocked', 'idle'];
-        const rows = (Object.keys(HAS_FIXTURES) as AgentKind[]).map((agent) => {
-            if (!HAS_FIXTURES[agent]) return `  ${agent.padEnd(8)} no fixtures captured yet`;
+        const rows = REMOTE_AGENTS.map(({ kind }) => {
+            const captured = CASES.some((c) => c.agent === kind);
+            if (!captured) return `  ${kind.padEnd(8)} no fixtures captured yet`;
             const cells = states.map((state) => {
-                const c = CASES.find((x) => x.agent === agent && x.expected === state);
+                const c = CASES.find((x) => x.agent === kind && x.expected === state);
                 if (!c) return `${state}: no fixture`;
-                if (!hasBundledRules(agent)) return `${state}: uncovered`;
+                if (!hasBundledRules(kind)) return `${state}: uncovered`;
                 const got = classify(c);
                 return `${state}: ${got.state === state ? got.ruleId : `MISMATCH(${got.state})`}`;
             });
-            return `  ${agent.padEnd(8)} ${cells.join(' | ')}`;
+            return `  ${kind.padEnd(8)} ${cells.join(' | ')}`;
         });
         process.stdout.write(['harness bench matrix:', ...rows, ''].join('\n'));
     });

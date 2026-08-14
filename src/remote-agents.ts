@@ -283,7 +283,7 @@ const REMOTE_AGENT_TABLE = [
     },
 ] as const satisfies readonly RemoteAgent[];
 
-/** Closed union of remote-controllable agent kinds ('claude' | 'codex' | 'cursor' | 'gemini'). */
+/** Closed union of remote-controllable agent kinds, derived from the table above. */
 export type AgentKind = (typeof REMOTE_AGENT_TABLE)[number]['kind'];
 
 /** A registry row: the uniform RemoteAgent shape with `kind` narrowed to the closed union. */

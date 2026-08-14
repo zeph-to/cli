@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { detectClaudeSessionIdByPid, findAgentBySubcommand, matchAgentByPaneCommand, REMOTE_AGENTS } from './remote-agents.js';
 
 // Top-level CLI commands the registry's subcommands must never collide
@@ -26,6 +27,20 @@ describe('remote-agents.ts: table invariants', () => {
     it('no subcommand collides with a built-in CLI command', () => {
         const all = REMOTE_AGENTS.flatMap((a) => [...a.subcommands]);
         for (const sub of all) expect(RESERVED_COMMANDS).not.toContain(sub);
+    });
+
+    // `--help` builds its agent list from this table, so it can never drift.
+    // The README lists them by hand, which is how a shipped agent ends up
+    // documented nowhere. This is the only thing that notices.
+    it('every agent is documented in the README', () => {
+        const readme = readFileSync(
+            join(dirname(fileURLToPath(import.meta.url)), '..', 'README.md'),
+            'utf-8',
+        );
+        for (const a of REMOTE_AGENTS) {
+            expect(readme, `README.md never mentions \`zeph ${a.subcommands[0]}\``)
+                .toContain(`zeph ${a.subcommands[0]}`);
+        }
     });
 
     it('every row has at least one subcommand and a binary', () => {
@@ -70,13 +85,9 @@ describe('remote-agents.ts: lookups', () => {
         expect(matchAgentByPaneCommand('')).toBeUndefined();
     });
 
-    // `hermes` on PATH is a bash script that execs the interpreter, so a pane
-    // running it reports `python` as its current command. Registering that as
-    // an alias would adopt every Python REPL on the machine as a Hermes
-    // session — visible in the phone picker, and a target for text injection.
-    // The registry relies on `pane_start_command` instead; these assertions
-    // are what stops the alias from being added back as a "fix" for a pane
-    // that stopped matching.
+    // Guards the no-paneMatchAliases decision on the hermes row (see the
+    // comment there) against being undone as a "fix" for a pane that stopped
+    // matching.
     it('never adopts a bare interpreter pane as an agent', () => {
         expect(matchAgentByPaneCommand('python')).toBeUndefined();
         expect(matchAgentByPaneCommand('python3')).toBeUndefined();
