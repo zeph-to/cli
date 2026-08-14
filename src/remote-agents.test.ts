@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { detectClaudeSessionIdByPid, findAgentBySubcommand, matchAgentByPaneCommand, REMOTE_AGENTS } from './remote-agents.js';
 
 // Top-level CLI commands the registry's subcommands must never collide
@@ -28,6 +29,20 @@ describe('remote-agents.ts: table invariants', () => {
         for (const sub of all) expect(RESERVED_COMMANDS).not.toContain(sub);
     });
 
+    // `--help` builds its agent list from this table, so it can never drift.
+    // The README lists them by hand, which is how a shipped agent ends up
+    // documented nowhere. This is the only thing that notices.
+    it('every agent is documented in the README', () => {
+        const readme = readFileSync(
+            join(dirname(fileURLToPath(import.meta.url)), '..', 'README.md'),
+            'utf-8',
+        );
+        for (const a of REMOTE_AGENTS) {
+            expect(readme, `README.md never mentions \`zeph ${a.subcommands[0]}\``)
+                .toContain(`zeph ${a.subcommands[0]}`);
+        }
+    });
+
     it('every row has at least one subcommand and a binary', () => {
         for (const a of REMOTE_AGENTS) {
             expect(a.subcommands.length).toBeGreaterThan(0);
@@ -35,7 +50,7 @@ describe('remote-agents.ts: table invariants', () => {
         }
     });
 
-    it('only claude carries a session resolver (codex/cursor/gemini are documented stubs)', () => {
+    it('only claude carries a session resolver (every other row is a documented stub)', () => {
         for (const a of REMOTE_AGENTS) {
             if (a.kind === 'claude') expect(typeof a.resolveSessionId).toBe('function');
             else expect(a.resolveSessionId).toBeUndefined();
@@ -49,6 +64,7 @@ describe('remote-agents.ts: lookups', () => {
         expect(findAgentBySubcommand('claude')?.kind).toBe('claude');
         expect(findAgentBySubcommand('codex')?.kind).toBe('codex');
         expect(findAgentBySubcommand('gemini')?.kind).toBe('gemini');
+        expect(findAgentBySubcommand('hermes')?.kind).toBe('hermes');
     });
 
     it('cursor launches the terminal TUI, never the IDE launcher', () => {
@@ -63,9 +79,19 @@ describe('remote-agents.ts: lookups', () => {
         // The IDE launcher is not an agent pane — a `cursor` pane is someone
         // opening the editor, and adopting it would address a dead session.
         expect(matchAgentByPaneCommand('cursor')).toBeUndefined();
+        expect(matchAgentByPaneCommand('hermes')?.kind).toBe('hermes');
         expect(matchAgentByPaneCommand('bash')).toBeUndefined();
         expect(matchAgentByPaneCommand('node')).toBeUndefined();
         expect(matchAgentByPaneCommand('')).toBeUndefined();
+    });
+
+    // Guards the no-paneMatchAliases decision on the hermes row (see the
+    // comment there) against being undone as a "fix" for a pane that stopped
+    // matching.
+    it('never adopts a bare interpreter pane as an agent', () => {
+        expect(matchAgentByPaneCommand('python')).toBeUndefined();
+        expect(matchAgentByPaneCommand('python3')).toBeUndefined();
+        expect(matchAgentByPaneCommand('python3.11')).toBeUndefined();
     });
 });
 

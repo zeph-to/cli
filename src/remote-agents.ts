@@ -1,6 +1,6 @@
 /**
- * Remote-control agent registry — the single table behind `zeph cc` /
- * `zeph codex` / `zeph gemini`, the listener's pane matching, and the
+ * Remote-control agent registry — the single table behind every
+ * `zeph <agent>` subcommand, the listener's pane matching, and the
  * per-agent session-id enrichment. Adding a remote-controllable agent is
  * one row here (plus, for a genuinely new kind, backend/phone support:
  * `kind` is a wire contract — AgentSession.agentKind flows to the server
@@ -43,8 +43,9 @@ export interface RemoteAgent {
     /**
      * Resolve the agent's own session id from the pane's cwd (+ pane pid
      * when the caller knows it — enables exact process-tree matching).
-     * EXTENSION POINT: omitted for codex/gemini until their session-file
-     * formats are confirmed — the listener then reports agentSessionId: null.
+     * EXTENSION POINT: carried only by Claude Code. Every other row omits
+     * it until that agent's session-file format is confirmed — the listener
+     * then reports agentSessionId: null.
      */
     resolveSessionId?: (paneCwd: string, panePid?: number) => string | null;
 }
@@ -268,9 +269,21 @@ const REMOTE_AGENT_TABLE = [
         binary: 'gemini',
         subcommands: ['gemini'],
     },
+    {
+        // `hermes` on PATH is a bash script that execs a venv Python, so the
+        // pane's *current* command reads the interpreter (`python3.11` as
+        // measured). Only `pane_start_command` identifies it, which is the
+        // same bargain `claude` (node) already makes. Deliberately no
+        // paneMatchAliases: matching interpreter names would adopt every
+        // Python REPL on the machine as a Hermes session.
+        kind: 'hermes',
+        displayName: 'Hermes',
+        binary: 'hermes',
+        subcommands: ['hermes'],
+    },
 ] as const satisfies readonly RemoteAgent[];
 
-/** Closed union of remote-controllable agent kinds ('claude' | 'codex' | 'cursor' | 'gemini'). */
+/** Closed union of remote-controllable agent kinds, derived from the table above. */
 export type AgentKind = (typeof REMOTE_AGENT_TABLE)[number]['kind'];
 
 /** A registry row: the uniform RemoteAgent shape with `kind` narrowed to the closed union. */

@@ -8,7 +8,7 @@
 
 **Your agent works, hits a decision, and asks your phone. You tap a button (or type a reply), and the answer lands back in the live session — so the agent keeps going.**
 
-`@zeph-to/cli` is the terminal side of that round trip: a zero-dependency push SDK, a `zeph` CLI that wires up 8 AI agents in one command, and a resident listener that lets your phone **drive Claude Code / Codex / Cursor / Gemini sessions** by typing straight into named tmux sessions.
+`@zeph-to/cli` is the terminal side of that round trip: a zero-dependency push SDK, a `zeph` CLI that wires up 8 AI agents in one command, and a resident listener that lets your phone **drive any agent session it can start** by typing straight into named tmux sessions.
 
 <p align="center">
   <img src="https://zeph.to/readme/demo.gif" alt="Agent asks 'Deploy to prod?' on your phone; you tap Deploy; the session ships" width="560"><br>
@@ -83,13 +83,13 @@ To **send** notifications:
 zeph notify --title "Deploy done" --body "v2.1.0 shipped"
 ```
 
-To **drive a Claude Code / Codex / Cursor / Gemini session from your phone**, see
+To **drive an agent session from your phone**, see
 [Remote Control](#remote-control) below.
 
 ## Remote Control
 
-> Send messages from your phone *into* a live Claude Code / Codex /
-> Gemini session — even after a `zeph_ask` polling window has expired.
+> Send messages from your phone *into* a live agent session — even after
+> a `zeph_ask` polling window has expired.
 
 <p align="center">
   <img src="https://zeph.to/readme/ask-phone.png" alt="A Zeph hook on the phone: a question with tappable answer buttons and a text field" width="300">
@@ -116,7 +116,7 @@ tmux session via `tmux send-keys`.
 [zeph listener — resident daemon, started by `zeph cc` automatically]
    │  tmux send-keys -l -t zeph-myapp "리팩토링 마무리해줘" + Enter
    ▼
-[tmux session "zeph-myapp" running claude / codex / cursor-agent / gemini]
+[tmux session "zeph-myapp" running claude / codex / cursor-agent / gemini / hermes]
 ```
 
 The listener polls its tmux session inventory every 5 seconds and
@@ -164,6 +164,26 @@ through. Same reason the `stop`-hook auto-push `zeph setup` installs
 covers the Cursor **IDE** but not `zeph cursor` panes; ask for a
 `zeph_notify` when you want one.
 
+`zeph hermes` is in the same position, and asking for it works the same
+way. `zeph install` does not wire Hermes either — add the MCP server to
+`~/.hermes/config.yaml` by hand, as one entry under `mcp_servers`:
+
+```yaml
+mcp_servers:
+  zeph:
+    command: "npx"
+    args: ["-y", "@zeph-to/mcp-server"]
+```
+
+Add the entry; do not replace the file. `mcp_servers` is shared with
+every other server you have configured, and nothing under `~/.hermes` is
+in version control. Then `/reload-mcp` inside Hermes.
+
+`zeph_ask` needs a hook id, which the MCP server reads from
+`ZEPH_HOOK_ID` or from `hookId` in `~/.zeph/config.json` — `zeph install`
+writes the latter, so a machine that has run it once needs no `env`
+block here.
+
 ### Setup
 
 1. **Install tmux.** The listener uses `send-keys`; the wrapper spawns
@@ -190,11 +210,26 @@ covers the Cursor **IDE** but not `zeph cursor` panes; ask for a
    zeph codex     # codex        → tmux session "zeph-<project>"
    zeph cursor    # cursor-agent → tmux session "zeph-<project>"
    zeph gemini    # gemini       → tmux session "zeph-<project>"
+   zeph hermes    # hermes       → tmux session "zeph-<project>"
    ```
 
    `zeph cursor` runs **`cursor-agent`**, Cursor's terminal agent — a
    separate install from the Cursor IDE (the bare `cursor` on your PATH
    is the editor launcher, which exits immediately and can't be driven).
+
+   `zeph hermes` runs Hermes in its classic REPL, which is the default.
+   Launching it in TUI mode instead (`zeph hermes --tui`, or `HERMES_TUI=1`
+   in the environment) puts the pane on the terminal's alternate screen,
+   and the alternate screen has no scrollback — the live mirror on your
+   phone still draws, but scrolling up in it comes back empty.
+
+   If a Hermes session disappears from the phone's picker, the cause is
+   tmux having dropped the pane's `start_command`: all the listener sees
+   then is the interpreter Hermes execs (`python3.11` at time of writing),
+   which names no agent. `zeph listener` run in the foreground prints the
+   reason (`no agent in pane (start=…, current=python3.11)`). Kill the
+   session and start it again with `zeph hermes` to recover. `claude` sits
+   on the same edge for the same reason — it execs node.
 
    The first `zeph cc` on a machine **auto-spawns a background
    listener** (singleton, PID file at `~/.zeph/listener.pid`,
@@ -407,6 +442,7 @@ zeph cc                       # claude
 zeph codex                    # codex
 zeph cursor                   # cursor-agent (Cursor CLI, not the IDE)
 zeph gemini                   # gemini
+zeph hermes                   # hermes
 
 # Run the resident listener (foreground; background it as you like)
 zeph listener

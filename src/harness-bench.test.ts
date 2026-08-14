@@ -49,7 +49,7 @@ import {
 } from './agent-state.js';
 import { DEFAULT_MANIFEST } from './agent-rules.default.js';
 import { compareManifestVersions } from './agent-rules-fetch.js';
-import type { AgentKind } from './remote-agents.js';
+import { REMOTE_AGENTS, type AgentKind } from './remote-agents.js';
 
 const PANES_DIR = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'panes');
 
@@ -75,19 +75,6 @@ const CASES: readonly BenchCase[] = [
     { agent: 'gemini', expected: 'blocked', fixture: 'gemini-blocked-trust-dialog.txt', screen: 'folder trust dialog' },
     { agent: 'gemini', expected: 'idle', fixture: 'gemini-idle.txt', screen: 'input box at rest' },
 ];
-
-/**
- * Which agents the bench has captured at all. Exhaustive over `AgentKind` on
- * purpose: adding a remote-control agent fails to compile until someone says
- * whether the bench covers it, so a new harness can't slip in unobserved.
- */
-const HAS_FIXTURES: Record<AgentKind, boolean> = {
-    claude: true,
-    gemini: true,
-    // Not installed on the machine that captured these; `zeph setup` still
-    // writes its hooks and rules, so this is a real gap, not an oversight.
-    codex: false,
-};
 
 const readPane = (fixture: string): string => readFileSync(join(PANES_DIR, fixture), 'utf-8');
 
@@ -121,18 +108,24 @@ describe('harness bench — bundled rules vs real panes', () => {
     // The matrix is a REPORT, not a gate — the per-case tests above are what
     // fail. Printing it from afterAll keeps that honest: a test whose assertion
     // cannot fail would be a report wearing a test's clothes.
+    //
+    // Rows come from the registry rather than a hand-kept list of covered
+    // agents, so an agent added to REMOTE_AGENTS shows up here as an empty row
+    // instead of silently not appearing at all. Cursor did the latter for
+    // months, back when this walked a separate map someone had to remember.
     afterAll(() => {
         const states: AgentState[] = ['working', 'blocked', 'idle'];
-        const rows = (Object.keys(HAS_FIXTURES) as AgentKind[]).map((agent) => {
-            if (!HAS_FIXTURES[agent]) return `  ${agent.padEnd(8)} no fixtures captured yet`;
+        const rows = REMOTE_AGENTS.map(({ kind }) => {
+            const captured = CASES.some((c) => c.agent === kind);
+            if (!captured) return `  ${kind.padEnd(8)} no fixtures captured yet`;
             const cells = states.map((state) => {
-                const c = CASES.find((x) => x.agent === agent && x.expected === state);
+                const c = CASES.find((x) => x.agent === kind && x.expected === state);
                 if (!c) return `${state}: no fixture`;
-                if (!hasBundledRules(agent)) return `${state}: uncovered`;
+                if (!hasBundledRules(kind)) return `${state}: uncovered`;
                 const got = classify(c);
                 return `${state}: ${got.state === state ? got.ruleId : `MISMATCH(${got.state})`}`;
             });
-            return `  ${agent.padEnd(8)} ${cells.join(' | ')}`;
+            return `  ${kind.padEnd(8)} ${cells.join(' | ')}`;
         });
         process.stdout.write(['harness bench matrix:', ...rows, ''].join('\n'));
     });
