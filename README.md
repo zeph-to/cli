@@ -225,10 +225,11 @@ block here.
 
    If a Hermes session disappears from the phone's picker after you detach
    and re-attach its tmux session, that's tmux dropping the pane's
-   `start_command`: the listener then sees only `python` and can't tell
-   which agent is running. `zeph listener` run in the foreground prints the
-   reason (`no agent in pane (start=…, current=python)`). Kill the session
-   and start it again with `zeph hermes` to recover.
+   `start_command`: all the listener sees then is the interpreter Hermes
+   execs (`python3.11` at time of writing), which names no agent. `zeph
+   listener` run in the foreground prints the reason (`no agent in pane
+   (start=…, current=python3.11)`). Kill the session and start it again
+   with `zeph hermes` to recover.
 
    The first `zeph cc` on a machine **auto-spawns a background
    listener** (singleton, PID file at `~/.zeph/listener.pid`,
