@@ -8,7 +8,7 @@
 
 **Your agent works, hits a decision, and asks your phone. You tap a button (or type a reply), and the answer lands back in the live session — so the agent keeps going.**
 
-`@zeph-to/cli` is the terminal side of that round trip: a zero-dependency push SDK, a `zeph` CLI that wires up 8 AI agents in one command, and a resident listener that lets your phone **drive Claude Code / Codex / Cursor / Gemini sessions** by typing straight into named tmux sessions.
+`@zeph-to/cli` is the terminal side of that round trip: a zero-dependency push SDK, a `zeph` CLI that wires up 8 AI agents in one command, and a resident listener that lets your phone **drive any agent session it can start** by typing straight into named tmux sessions.
 
 <p align="center">
   <img src="https://zeph.to/readme/demo.gif" alt="Agent asks 'Deploy to prod?' on your phone; you tap Deploy; the session ships" width="560"><br>
@@ -83,13 +83,13 @@ To **send** notifications:
 zeph notify --title "Deploy done" --body "v2.1.0 shipped"
 ```
 
-To **drive a Claude Code / Codex / Cursor / Gemini session from your phone**, see
+To **drive an agent session from your phone**, see
 [Remote Control](#remote-control) below.
 
 ## Remote Control
 
-> Send messages from your phone *into* a live Claude Code / Codex /
-> Gemini session — even after a `zeph_ask` polling window has expired.
+> Send messages from your phone *into* a live agent session — even after
+> a `zeph_ask` polling window has expired.
 
 <p align="center">
   <img src="https://zeph.to/readme/ask-phone.png" alt="A Zeph hook on the phone: a question with tappable answer buttons and a text field" width="300">
