@@ -914,6 +914,69 @@ describe('buildStreamFrame (stream E2EE)', () => {
         const frame = await buildStreamFrame({ content: 'pane', truncated: false }, 'zeph-a');
         expect(frame).not.toHaveProperty('historyLines');
     });
+
+    // The viewer needs the pane's total scrollback depth to know where this
+    // frame's window sits in the buffer — without it, working out which lines
+    // scrolled away is a text-matching guess that a redrawing TUI defeats.
+    it('tells the viewer how deep the pane scrollback is', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const frame = await buildStreamFrame(
+            { content: 'pane', truncated: false }, 'zeph-a', undefined, { historySize: 842 },
+        );
+        expect(frame).toMatchObject({ historySize: 842 });
+    });
+
+    it('leaves the depth out when tmux would not say', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const frame = await buildStreamFrame(
+            { content: 'pane', truncated: false }, 'zeph-a', undefined, { historyLines: 3 },
+        );
+        expect(frame).not.toHaveProperty('historySize');
+    });
+});
+
+/**
+ * The one tmux read the frame path already makes per tick carries the cursor,
+ * the pane height and — now — the scrollback depth. Parsing is its own function
+ * because the failure that matters is a partial answer: a tmux that does not
+ * report one field must not cost the viewer the cursor as well.
+ */
+describe('parsePaneGeometry', () => {
+    it('reads cursor, pane height and scrollback depth', async () => {
+        const { parsePaneGeometry } = await import('./listener.js');
+        expect(parsePaneGeometry('12,3,62,842\n')).toEqual({ x: 12, y: 3, height: 62, historySize: 842 });
+    });
+
+    it('keeps the cursor when the depth is missing', async () => {
+        const { parsePaneGeometry } = await import('./listener.js');
+        expect(parsePaneGeometry('12,3,62\n')).toEqual({ x: 12, y: 3, height: 62 });
+    });
+
+    it('keeps the cursor when the depth is not a number', async () => {
+        const { parsePaneGeometry } = await import('./listener.js');
+        expect(parsePaneGeometry('12,3,62,#{history_size}')).toEqual({ x: 12, y: 3, height: 62 });
+    });
+
+    it('reports a pane with no scrollback as a depth of zero, not as missing', async () => {
+        const { parsePaneGeometry } = await import('./listener.js');
+        expect(parsePaneGeometry('0,0,62,0')).toEqual({ x: 0, y: 0, height: 62, historySize: 0 });
+    });
+
+    // A depth of zero is how a just-cleared pane answers, and the viewer treats
+    // the drop to zero as that clear. An empty field must not arrive as one:
+    // `Number('')` is 0, so an unchecked convert would fake a clear on every
+    // frame tmux answered thinly.
+    it('does not read an empty depth field as a depth of zero', async () => {
+        const { parsePaneGeometry } = await import('./listener.js');
+        expect(parsePaneGeometry('12,3,62,')).toEqual({ x: 12, y: 3, height: 62 });
+    });
+
+    it('refuses an answer with no usable geometry', async () => {
+        const { parsePaneGeometry } = await import('./listener.js');
+        expect(parsePaneGeometry('')).toBeNull();
+        expect(parsePaneGeometry('12,3')).toBeNull();
+        expect(parsePaneGeometry('a,b,c,d')).toBeNull();
+    });
 });
 
 describe('historyLinesIn', () => {
