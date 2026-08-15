@@ -126,6 +126,26 @@ export const rememberSessions = (
     writeAll(entries);
 };
 
+/**
+ * Forget one session, by name. Returns false when this machine never knew it.
+ *
+ * This is what deleting a past session means on the machine that ran it: the
+ * entry leaves the file, so the phone stops being offered the session AND —
+ * since this file is the resume whitelist — stops being able to start it.
+ * That is the intended pair, not a side effect.
+ *
+ * It stays forgotten: `rememberSessions` only writes down sessions that are
+ * running, so nothing re-adds an entry for a session that has ended. Running
+ * that name again is what brings it back, which is also the only way back.
+ */
+export const forgetSession = (name: string): boolean => {
+    const entries = readAll();
+    const kept = entries.filter((e) => e.name !== name);
+    if (kept.length === entries.length) return false;
+    writeAll(kept);
+    return true;
+};
+
 /** Whether the registry knows this name — the resume whitelist check. */
 export const isKnownSession = (name: string, now: number = Date.now()): boolean =>
     recallSession(name, now) !== null;
