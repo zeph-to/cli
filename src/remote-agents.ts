@@ -62,6 +62,35 @@ export interface RemoteAgent {
 }
 
 /**
+ * A per-key TTL cache, bounded so a long-lived listener that has seen many keys
+ * cannot grow without limit. `get` returns a wrapper rather than the value so a
+ * cached `null` is distinguishable from a miss, and `set` returns what it stored
+ * so callers read as one expression.
+ *
+ * Eviction drops the first key in insertion order, which is the oldest entry a
+ * key was FIRST written under — refreshing a key does not move it. With a bound
+ * of 64 keys against a handful of live panes that never matters; a workload that
+ * genuinely cycles more keys than the bound would want a real LRU.
+ */
+const keyedTtlCache = <K, V>(ttlMs: number, max = 64) => {
+    const entries = new Map<K, { value: V; expiresAt: number }>();
+    return {
+        get: (key: K): { value: V } | undefined => {
+            const hit = entries.get(key);
+            return hit && hit.expiresAt > Date.now() ? hit : undefined;
+        },
+        set: (key: K, value: V): V => {
+            if (entries.size >= max) {
+                const oldest = entries.keys().next().value;
+                if (oldest !== undefined) entries.delete(oldest);
+            }
+            entries.set(key, { value, expiresAt: Date.now() + ttlMs });
+            return value;
+        },
+    };
+};
+
+/**
  * A name is only worth carrying if it has visible characters. Renderers treat
  * `''` as falsy and fall back on their own, but the change fingerprints on both
  * sides of the wire collapse `undefined`/`null` and would ship a blank string as
@@ -88,8 +117,7 @@ const CLAUDE_PROJECTS_DIR = join(homedir(), '.claude', 'projects');
  * in that directory (rare, on the order of hours), so a 60-second TTL
  * is safe and cuts the per-cycle stat count by ~12×.
  */
-const claudeSessionCache = new Map<string, { sessionId: string | null; expiresAt: number }>();
-const CLAUDE_SESSION_CACHE_TTL_MS = 60_000;
+const claudeSessionCache = keyedTtlCache<string, string | null>(60_000);
 
 const doDetectClaudeSessionId = (cwd: string): string | null => {
     try {
@@ -120,22 +148,9 @@ const doDetectClaudeSessionId = (cwd: string): string | null => {
  * claudeSessionCache.
  */
 export const detectClaudeSessionId = (cwd: string): string | null => {
-    const now = Date.now();
     const cached = claudeSessionCache.get(cwd);
-    if (cached && cached.expiresAt > now) return cached.sessionId;
-
-    // Cap cache size so a long-lived listener that's seen many cwds
-    // doesn't grow unbounded. 64 is plenty for any realistic setup.
-    if (claudeSessionCache.size >= 64) {
-        // Evict the oldest-expiring entry — Map iteration order is
-        // insertion order, so the first key we hit is the oldest.
-        const firstKey = claudeSessionCache.keys().next().value;
-        if (firstKey !== undefined) claudeSessionCache.delete(firstKey);
-    }
-
-    const sessionId = doDetectClaudeSessionId(cwd);
-    claudeSessionCache.set(cwd, { sessionId, expiresAt: now + CLAUDE_SESSION_CACHE_TTL_MS });
-    return sessionId;
+    if (cached) return cached.value;
+    return claudeSessionCache.set(cwd, doDetectClaudeSessionId(cwd));
 };
 
 // ── Claude Code pid → session resolver ───────────────────────────
@@ -274,39 +289,25 @@ const walkDescendants = (rootPid: number, children: Map<number, number[]>): Set<
 
 /**
  * Per-pane process tree, memoized for the same window as the `ps` snapshot it
- * walks. The snapshot itself is already shared across the cycle (readPsChildren),
- * but the walk was not: each resolver on a row ran its own BFS, so asking a pane
- * for both its session id and its session name doubled the work on the path
- * whose CPU cost is the reason these caches exist (see claudeSessionCache).
+ * walks. The snapshot itself is already shared across the cycle, but the walk was
+ * not: each resolver on a row ran its own BFS, so asking a pane for both its
+ * session id and its session name doubled the work on the path whose CPU cost is
+ * the reason these caches exist (see claudeSessionCache).
  *
  * Callers must treat the returned Set as read-only — it is shared.
  */
-const descendantCache = new Map<number, { pids: Set<number>; expiresAt: number }>();
+const descendantCache = keyedTtlCache<number, Set<number>>(SNAPSHOT_TTL_MS);
 
 /** pid set of `rootPid` + all descendants, from one `ps` snapshot. */
-export const collectDescendantPids = (rootPid: number, psOutput?: string): Set<number> => {
-    // An explicit table is a caller supplying its own snapshot — never cached,
-    // since the cache key says nothing about which table it came from.
-    if (psOutput !== undefined) return walkDescendants(rootPid, parseProcTable(psOutput).children);
-
-    const now = Date.now();
+export const collectDescendantPids = (rootPid: number): Set<number> => {
     const cached = descendantCache.get(rootPid);
-    if (cached && cached.expiresAt > now) return cached.pids;
+    if (cached) return cached.value;
 
-    const children = readPsSnapshot()?.children ?? null;
+    const children = readPsSnapshot()?.children;
     // A failed `ps` is not cached: the next cycle should retry rather than
     // serve "this pane has no children" for the whole TTL.
-    if (children === null) return new Set([rootPid]);
-
-    // Same bound and eviction as claudeSessionCache — a long-lived listener sees
-    // many pane pids over its lifetime and none of them come back.
-    if (descendantCache.size >= 64) {
-        const oldest = descendantCache.keys().next().value;
-        if (oldest !== undefined) descendantCache.delete(oldest);
-    }
-    const pids = walkDescendants(rootPid, children);
-    descendantCache.set(rootPid, { pids, expiresAt: now + SNAPSHOT_TTL_MS });
-    return pids;
+    if (children === undefined) return new Set([rootPid]);
+    return descendantCache.set(rootPid, walkDescendants(rootPid, children));
 };
 
 /** Test seam for the pid-based resolver. */
@@ -369,17 +370,16 @@ export const detectClaudeSessionNameByPid = (
 const PROC_MATCH_TOLERANCE_MS = 10_000;
 
 /**
- * The row whose timestamp is closest to when one of `pids` started, within
- * `tolMs`. Null when nothing qualifies — including when no pid in the tree has a
- * known start time, which is why the start times are read before any row is
- * compared rather than defaulted to zero.
+ * The row whose timestamp is closest to when one of the pane's processes started,
+ * within {@link PROC_MATCH_TOLERANCE_MS}. Null when nothing qualifies — including
+ * when no pid in the tree has a known start time, which is why the start times
+ * are collected before any row is compared rather than defaulted to zero.
  */
 export const pickRowByProcStart = <T>(
     rows: readonly T[],
     tsMsOf: (row: T) => number | null,
     startTimes: Map<number, number>,
     pids: Set<number>,
-    tolMs: number = PROC_MATCH_TOLERANCE_MS,
 ): T | null => {
     const procStarts = [...pids]
         .map((pid) => startTimes.get(pid))
@@ -391,7 +391,7 @@ export const pickRowByProcStart = <T>(
         const at = tsMsOf(row);
         if (at === null || !Number.isFinite(at)) continue;
         const distance = Math.min(...procStarts.map((start) => Math.abs(at - start)));
-        if (distance > tolMs) continue;
+        if (distance > PROC_MATCH_TOLERANCE_MS) continue;
         if (best === null || distance < best.distance) best = { row, distance };
     }
     return best?.row ?? null;

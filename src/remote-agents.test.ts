@@ -276,13 +276,11 @@ describe('collectDescendantPids caching', () => {
         expect(second).toBe(first);
     });
 
-    it('never caches a caller-supplied table (the key says nothing about which snapshot)', async () => {
+    it('answers with the root alone for a pid that has no children', async () => {
         const { collectDescendantPids } = await import('./remote-agents.js');
-        const tree = collectDescendantPids(90, '90 1\n95 90\n100 95');
-        expect([...tree].sort((a, b) => a - b)).toEqual([90, 95, 100]);
-        // A different table for the same root must be walked again, not served
-        // from the pane's cache entry.
-        expect([...collectDescendantPids(90, '90 1')]).toEqual([90]);
+        // pid 1 is init/launchd's parent-of-everything, so an unused high pid is
+        // the reliable childless case on a live machine.
+        expect([...collectDescendantPids(0x7ff_ffff)]).toEqual([0x7ff_ffff]);
     });
 });
 
