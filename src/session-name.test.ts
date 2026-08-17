@@ -14,8 +14,8 @@ describe('pickRowByProcStart', () => {
     const pids = new Set([90, 95, 100]);
     const ts = (r: { at: number | null }) => r.at;
 
-    const pick = <T>(rows: readonly T[], tsMsOf: (r: T) => number | null, tol = 10_000) =>
-        pickRowByProcStart(rows, tsMsOf, startTimes, pids, tol);
+    const pick = <T>(rows: readonly T[], tsMsOf: (r: T) => number | null) =>
+        pickRowByProcStart(rows, tsMsOf, startTimes, pids);
 
     it('picks the row written when this pane\'s process started', () => {
         const rows = [{ at: PROC + 1_200, id: 'live' }, { at: PROC - 3_600_000, id: 'an hour ago' }];
@@ -58,14 +58,14 @@ describe('pickRowByProcStart', () => {
      * a NaN comparison that quietly matches or quietly rejects everything.
      */
     it('returns null when no pid in the tree has a known start time', () => {
-        expect(pickRowByProcStart([{ at: PROC }], ts, new Map(), pids, 10_000)).toBeNull();
-        expect(pickRowByProcStart([{ at: PROC }], ts, startTimes, new Set([90]), 10_000)).toBeNull();
+        expect(pickRowByProcStart([{ at: PROC }], ts, new Map(), pids)).toBeNull();
+        expect(pickRowByProcStart([{ at: PROC }], ts, startTimes, new Set([90]))).toBeNull();
     });
 
     it('matches against any pid in the tree, not only the pane root', () => {
         // The agent is a grandchild of the pane: pane 90 → shell 95 → agent 100.
         const deep = new Map([[100, PROC]]);
-        expect(pickRowByProcStart([{ at: PROC + 500, id: 'deep' }], ts, deep, pids, 10_000)?.id).toBe('deep');
+        expect(pickRowByProcStart([{ at: PROC + 500, id: 'deep' }], ts, deep, pids)?.id).toBe('deep');
     });
 });
 
