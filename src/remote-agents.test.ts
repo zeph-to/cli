@@ -65,7 +65,18 @@ describe('remote-agents.ts: table invariants', () => {
         for (const a of REMOTE_AGENTS) {
             if (a.kind === 'cursor' || a.kind === 'gemini') expect(a.resolveSessionName).toBeUndefined();
         }
-        expect(typeof REMOTE_AGENTS.find((a) => a.kind === 'claude')?.resolveSessionName).toBe('function');
+    });
+
+    /**
+     * The rows are the only thing wiring a resolver into the report — every
+     * resolver test calls the function directly, so a row that never got its
+     * `resolveSessionName` leaves the whole feature dead with a green suite.
+     */
+    it('every agent with a readable name store is wired to its resolver', () => {
+        for (const kind of ['claude', 'hermes'] as const) {
+            const row = REMOTE_AGENTS.find((a) => a.kind === kind);
+            expect(typeof row?.resolveSessionName, `${kind} row lost its name resolver`).toBe('function');
+        }
     });
 });
 
@@ -201,6 +212,54 @@ describe('detectClaudeSessionIdByPid', () => {
             records, descendants: new Set([90, 300]),
         });
         expect(r).toBe('sess-other');
+    });
+});
+
+describe('parseProcTable', () => {
+    // `ps -axo pid=,ppid=,lstart=` on macOS: two spaces before a single-digit
+    // day, trailing padding after the year. Measured with `cat -A`, not guessed.
+    const REAL = '    1     0 Fri Aug  7 11:12:59 2026    \n  182     1 Tue Aug 11 18:13:52 2026    ';
+
+    it('reads both the parent links and the start times from one table', async () => {
+        const { parseProcTable } = await import('./remote-agents.js');
+        const { children, startTimes } = parseProcTable(REAL);
+        expect(children.get(0)).toEqual([1]);
+        expect(children.get(1)).toEqual([182]);
+        expect(Number.isFinite(startTimes.get(1))).toBe(true);
+        // Aug 11 started after Aug 7 — an ordering the parse cannot fake by
+        // returning a constant, and one that holds in any timezone.
+        expect(startTimes.get(182)!).toBeGreaterThan(startTimes.get(1)!);
+    });
+
+    /**
+     * THE regression this file exists for. A start time that this machine's
+     * locale cannot parse must cost only the start time. If it took the parent
+     * links with it, `collectDescendantPids` would fall back to `{rootPid}` for
+     * every pane, `detectClaudeSessionIdByPid` would return null across the
+     * board, and Claude Code would silently drop to the mtime heuristic — the
+     * identity theft the pid join was built to end (see the comment above
+     * CLAUDE_SESSIONS_DIR).
+     */
+    it('keeps the parent links when the start time is unparseable', async () => {
+        const { parseProcTable } = await import('./remote-agents.js');
+        const { children, startTimes } = parseProcTable('  95     1 not a date at all\n 100    95 also not a date');
+        expect(children.get(1)).toEqual([95]);
+        expect(children.get(95)).toEqual([100]);
+        expect(startTimes.has(95)).toBe(false);
+    });
+
+    it('still reads a two-field table (a caller that asked for no start times)', async () => {
+        const { parseProcTable } = await import('./remote-agents.js');
+        const { children, startTimes } = parseProcTable('90 1\n95 90\n100 95');
+        expect(children.get(90)).toEqual([95]);
+        expect(startTimes.size).toBe(0);
+    });
+
+    it('ignores lines that are not a process row', async () => {
+        const { parseProcTable } = await import('./remote-agents.js');
+        const { children } = parseProcTable('PID PPID STARTED\n\n  90     1 Fri Aug  7 11:12:59 2026');
+        expect(children.get(1)).toEqual([90]);
+        expect(children.size).toBe(1);
     });
 });
 
