@@ -537,6 +537,17 @@ const readCodexThreads = ttlMemo(SNAPSHOT_TTL_MS, (): unknown[] | null => {
     );
 });
 
+/**
+ * No `source` filter, unlike the Hermes reader's `source = 'cli'`. The column
+ * exists here too (alongside `thread_source`), but Codex is unauthenticated on
+ * every machine measured so far and its `threads` table is empty, so which
+ * values mark a terminal session is unknown — and a wrong guess filters out
+ * every row, which fails as "no name ever" rather than loudly. A thread from a
+ * non-terminal frontend is therefore eligible to match, and it lands in the same
+ * accepted misjoin as two terminals in the same directory: it needs the same cwd
+ * AND a creation time within the tolerance of a process in this pane. Add the
+ * filter once the values can be observed.
+ */
 export const detectCodexSessionName = (
     paneCwd: string,
     panePid?: number,
@@ -579,6 +590,8 @@ const REMOTE_AGENT_TABLE = [
         displayName: 'Codex CLI',
         binary: 'codex',
         subcommands: ['codex'],
+        // Name only, like the hermes row: the store's thread id is a UUID this
+        // resolver could return, but nothing on the wire consumes it yet.
         resolveSessionName: detectCodexSessionName,
     },
     {
