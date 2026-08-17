@@ -482,6 +482,81 @@ export const detectHermesSessionName = (
     return nonBlank(row?.title ?? undefined) ?? nonBlank(row?.display_name ?? undefined);
 };
 
+// ── Codex ────────────────────────────────────────────────────────
+
+const CODEX_DIR = join(homedir(), '.codex');
+const CODEX_STATE_DB = /^state_(\d+)\.sqlite$/;
+
+/**
+ * The highest-numbered match, numerically. Codex versions its state file
+ * (`state_5.sqlite` today) and moves to the next number on a schema migration,
+ * so hard-coding a name would silently stop reading after an upgrade. Sorting
+ * the strings would break at `state_10` vs `state_9`.
+ */
+export const newestVersionedDb = (entries: readonly string[], pattern: RegExp): string | null => {
+    let best: { entry: string; version: number } | null = null;
+    for (const entry of entries) {
+        const m = entry.match(pattern);
+        if (!m) continue;
+        const version = Number(m[1]);
+        if (best === null || version > best.version) best = { entry, version };
+    }
+    return best?.entry ?? null;
+};
+
+/**
+ * `threads` rows for this machine. `name` is what the user set (`codex resume`
+ * takes it), `title` is generated and NOT NULL — but with no default, so `''`
+ * is reachable.
+ *
+ * `created_at_ms` was added after `created_at` (seconds) and is backfilled by an
+ * insert trigger, so rows written before it carry NULL there — hence both
+ * columns are selected and the fallback happens in JS.
+ */
+interface CodexThreadRow {
+    cwd?: string | null;
+    name?: string | null;
+    title?: string | null;
+    archived?: number | null;
+    created_at?: number | null;
+    created_at_ms?: number | null;
+}
+
+const readCodexThreads = ttlMemo(SNAPSHOT_TTL_MS, (): unknown[] | null => {
+    let entries: string[];
+    try {
+        entries = readdirSync(CODEX_DIR);
+    } catch {
+        return null; // codex never installed here
+    }
+    const db = newestVersionedDb(entries, CODEX_STATE_DB);
+    if (db === null) return null;
+    return sqliteJson(
+        join(CODEX_DIR, db),
+        'SELECT cwd, name, title, archived, created_at, created_at_ms FROM threads',
+    );
+});
+
+export const detectCodexSessionName = (
+    paneCwd: string,
+    panePid?: number,
+    deps: StoreResolveDeps = {},
+): string | null => {
+    if (panePid === undefined) return null;
+    const raw = deps.rows !== undefined ? deps.rows : readCodexThreads();
+    if (raw === null) return null;
+
+    const rows = (raw as CodexThreadRow[]).filter((r) => r.cwd === paneCwd && !r.archived);
+    if (rows.length === 0) return null;
+    const row = pickRowByProcStart(
+        rows,
+        (r) => r.created_at_ms ?? (typeof r.created_at === 'number' ? r.created_at * 1_000 : null),
+        deps.startTimes ?? psStartTimes(),
+        deps.descendants ?? collectDescendantPids(panePid),
+    );
+    return nonBlank(row?.name ?? undefined) ?? nonBlank(row?.title ?? undefined);
+};
+
 // ── The registry ─────────────────────────────────────────────────
 
 const REMOTE_AGENT_TABLE = [
@@ -504,6 +579,7 @@ const REMOTE_AGENT_TABLE = [
         displayName: 'Codex CLI',
         binary: 'codex',
         subcommands: ['codex'],
+        resolveSessionName: detectCodexSessionName,
     },
     {
         // The pane binary is `cursor-agent`, Cursor's terminal TUI — NOT the

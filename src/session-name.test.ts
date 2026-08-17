@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { detectHermesSessionName, pickRowByProcStart } from './remote-agents.js';
+import { detectCodexSessionName, detectHermesSessionName, newestVersionedDb, pickRowByProcStart } from './remote-agents.js';
 
 /**
  * Hermes and Codex keep no pid in their session stores, so a pane is matched to
@@ -130,5 +130,71 @@ describe('detectHermesSessionName', () => {
     it('returns null without a pane pid — there is no other way to identify the row', () => {
         const rows = [{ cwd: '/proj', title: 'Fix listener race', display_name: null, started_at: STARTED_SEC }];
         expect(detectHermesSessionName('/proj', undefined, deps(rows))).toBeNull();
+    });
+});
+
+/**
+ * Codex keeps threads in `~/.codex/state_<N>.sqlite`, where N is the schema
+ * version — the filename moves on upgrade. A thread carries both a user-set
+ * `name` and an auto-generated `title`, and no pid.
+ */
+describe('detectCodexSessionName', () => {
+    const CREATED_MS = 1_786_676_108_000;
+    const deps = (rows: unknown[] | null) => ({
+        rows,
+        startTimes: new Map([[100, CREATED_MS]]),
+        descendants: new Set([90, 95, 100]),
+    });
+
+    it('prefers the name the user set over the generated title', () => {
+        const rows = [{ cwd: '/proj', name: 'deploy audit', title: 'Investigate flaky deploy', archived: 0, created_at_ms: CREATED_MS, created_at: null }];
+        expect(detectCodexSessionName('/proj', 90, deps(rows))).toBe('deploy audit');
+    });
+
+    it('uses the generated title when no name was set', () => {
+        const rows = [{ cwd: '/proj', name: null, title: 'Investigate flaky deploy', archived: 0, created_at_ms: CREATED_MS, created_at: null }];
+        expect(detectCodexSessionName('/proj', 90, deps(rows))).toBe('Investigate flaky deploy');
+    });
+
+    /**
+     * `created_at_ms` was added after `created_at` and is backfilled by an insert
+     * trigger, so rows written before it exist with NULL there. Reading only that
+     * column turns those rows into NaN comparisons that match nothing.
+     */
+    it('falls back to the older seconds column when created_at_ms is NULL', () => {
+        const rows = [{ cwd: '/proj', name: 'legacy row', title: '', archived: 0, created_at_ms: null, created_at: CREATED_MS / 1_000 }];
+        expect(detectCodexSessionName('/proj', 90, deps(rows))).toBe('legacy row');
+    });
+
+    // `title` is NOT NULL but has no default, so '' is reachable — and an empty
+    // name must read as no name rather than blanking the label.
+    it('treats an empty title as no name', () => {
+        const rows = [{ cwd: '/proj', name: null, title: '', archived: 0, created_at_ms: CREATED_MS, created_at: null }];
+        expect(detectCodexSessionName('/proj', 90, deps(rows))).toBeNull();
+    });
+
+    it('ignores archived threads', () => {
+        const rows = [{ cwd: '/proj', name: 'shelved', title: 'x', archived: 1, created_at_ms: CREATED_MS, created_at: null }];
+        expect(detectCodexSessionName('/proj', 90, deps(rows))).toBeNull();
+    });
+
+    it('returns null for an empty store and for an unreadable one', () => {
+        expect(detectCodexSessionName('/proj', 90, deps([]))).toBeNull();
+        expect(detectCodexSessionName('/proj', 90, deps(null))).toBeNull();
+    });
+});
+
+describe('newestVersionedDb', () => {
+    // `state_5.sqlite` today; the next schema bump makes it `state_6`. Ordering
+    // has to be numeric — lexical ordering puts `state_10` before `state_9`.
+    it('picks the highest schema version, numerically', () => {
+        expect(newestVersionedDb(['state_5.sqlite', 'state_10.sqlite', 'state_9.sqlite'], /^state_(\d+)\.sqlite$/))
+            .toBe('state_10.sqlite');
+    });
+
+    it('ignores files that do not carry a version and returns null when none do', () => {
+        expect(newestVersionedDb(['state_5.sqlite', 'state.sqlite', 'logs_2.sqlite'], /^state_(\d+)\.sqlite$/))
+            .toBe('state_5.sqlite');
+        expect(newestVersionedDb(['config.toml'], /^state_(\d+)\.sqlite$/)).toBeNull();
     });
 });
