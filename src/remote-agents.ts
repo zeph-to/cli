@@ -203,23 +203,58 @@ const ttlMemo = <T,>(ttlMs: number, compute: () => T): (() => T) => {
     };
 };
 
-const parseChildren = (table: string): Map<number, number[]> => {
+export interface ProcTable {
+    /** ppid → its direct children, for walking a pane's process tree. */
+    children: Map<number, number[]>;
+    /** pid → process start time in epoch ms. Only pids whose `lstart` parsed. */
+    startTimes: Map<number, number>;
+}
+
+/**
+ * Parse `ps -axo pid=,ppid=,lstart=`. A row is `<pid> <ppid> [<lstart>]`, e.g.
+ * `    1     0 Fri Aug  7 11:12:59 2026    ` — note the two spaces before a
+ * single-digit day and the trailing padding.
+ *
+ * The third field is OPTIONAL in the pattern, and that is load-bearing rather
+ * than defensive. Requiring it would mean that on any machine whose `ps` prints
+ * a different `lstart` shape, EVERY row fails to match, `children` comes back
+ * empty, `collectDescendantPids` answers `{rootPid}`, and
+ * `detectClaudeSessionByPid` finds nothing — dropping Claude Code back to the
+ * mtime heuristic and its identity theft (see CLAUDE_SESSIONS_DIR above). The
+ * parent links must survive an unreadable timestamp; only the start time is
+ * allowed to go missing, and every consumer of `startTimes` treats an absent
+ * entry as "no match" rather than guessing.
+ */
+export const parseProcTable = (table: string): ProcTable => {
     const children = new Map<number, number[]>();
+    const startTimes = new Map<number, number>();
     for (const line of table.split('\n')) {
-        const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+        const m = line.trim().match(/^(\d+)\s+(\d+)(?:\s+(.*))?$/);
         if (!m) continue;
         const [pid, ppid] = [Number(m[1]), Number(m[2])];
         const list = children.get(ppid) ?? [];
         list.push(pid);
         children.set(ppid, list);
+        if (m[3] === undefined) continue;
+        const started = Date.parse(m[3].trim());
+        if (Number.isFinite(started)) startTimes.set(pid, started);
     }
-    return children;
+    return { children, startTimes };
 };
 
-const readPsChildren = ttlMemo(SNAPSHOT_TTL_MS, (): Map<number, number[]> | null => {
-    const r = spawnSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
-    return r.status === 0 ? parseChildren(r.stdout ?? '') : null;
+/**
+ * One process-table snapshot per report cycle, shared by every pane. `lstart`
+ * rides along because the agents without a pid registry (Hermes, Codex) are
+ * matched to their session row by when their process started, and paying for a
+ * second `ps` spawn to learn that would undo what this memo is for.
+ */
+const readPsSnapshot = ttlMemo(SNAPSHOT_TTL_MS, (): ProcTable | null => {
+    const r = spawnSync('ps', ['-axo', 'pid=,ppid=,lstart='], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+    return r.status === 0 ? parseProcTable(r.stdout ?? '') : null;
 });
+
+/** Start times for this cycle's snapshot. Empty when `ps` is unavailable. */
+export const psStartTimes = (): Map<number, number> => readPsSnapshot()?.startTimes ?? new Map();
 
 const cachedPidSessionRecords = ttlMemo(SNAPSHOT_TTL_MS, readPidSessionRecords);
 
@@ -252,13 +287,13 @@ const descendantCache = new Map<number, { pids: Set<number>; expiresAt: number }
 export const collectDescendantPids = (rootPid: number, psOutput?: string): Set<number> => {
     // An explicit table is a caller supplying its own snapshot — never cached,
     // since the cache key says nothing about which table it came from.
-    if (psOutput !== undefined) return walkDescendants(rootPid, parseChildren(psOutput));
+    if (psOutput !== undefined) return walkDescendants(rootPid, parseProcTable(psOutput).children);
 
     const now = Date.now();
     const cached = descendantCache.get(rootPid);
     if (cached && cached.expiresAt > now) return cached.pids;
 
-    const children = readPsChildren();
+    const children = readPsSnapshot()?.children ?? null;
     // A failed `ps` is not cached: the next cycle should retry rather than
     // serve "this pane has no children" for the whole TTL.
     if (children === null) return new Set([rootPid]);
@@ -320,6 +355,133 @@ export const detectClaudeSessionNameByPid = (
     deps: PidResolveDeps = {},
 ): string | null => nonBlank(detectClaudeSessionByPid(panePid, paneCwd, deps)?.name);
 
+// ── Agents whose session store keeps no pid ──────────────────────
+//
+// Hermes and Codex both record a session per cwd with a creation timestamp and
+// no pid, so a pane cannot be joined to its row the exact way Claude Code's
+// `<pid>.json` allows. What is left is time: both stores stamp the row when the
+// session starts, so the row belonging to this pane is the one stamped when a
+// process in this pane started. The window has to be narrow — two agents opened
+// in the same directory within it are indistinguishable — and a miss must stay a
+// miss, since a wrong name shown confidently is worse than the computed label.
+
+/** How far a row's creation time may sit from a process start time. */
+const PROC_MATCH_TOLERANCE_MS = 10_000;
+
+/**
+ * The row whose timestamp is closest to when one of `pids` started, within
+ * `tolMs`. Null when nothing qualifies — including when no pid in the tree has a
+ * known start time, which is why the start times are read before any row is
+ * compared rather than defaulted to zero.
+ */
+export const pickRowByProcStart = <T>(
+    rows: readonly T[],
+    tsMsOf: (row: T) => number | null,
+    startTimes: Map<number, number>,
+    pids: Set<number>,
+    tolMs: number = PROC_MATCH_TOLERANCE_MS,
+): T | null => {
+    const procStarts = [...pids]
+        .map((pid) => startTimes.get(pid))
+        .filter((t): t is number => t !== undefined && Number.isFinite(t));
+    if (procStarts.length === 0) return null;
+
+    let best: { row: T; distance: number } | null = null;
+    for (const row of rows) {
+        const at = tsMsOf(row);
+        if (at === null || !Number.isFinite(at)) continue;
+        const distance = Math.min(...procStarts.map((start) => Math.abs(at - start)));
+        if (distance > tolMs) continue;
+        if (best === null || distance < best.distance) best = { row, distance };
+    }
+    return best?.row ?? null;
+};
+
+/**
+ * Read rows from a SQLite file as JSON. Null on every failure — no `sqlite3` on
+ * PATH, a locked or corrupt database, a schema that moved — because a missing
+ * name costs the computed label and nothing else.
+ *
+ * The query carries no parameters BY DESIGN: SQL passed to the `sqlite3` binary
+ * as an argv string has nowhere to bind `?` to, so interpolating a cwd would
+ * make this file the place that has to know SQLite quoting rules. Callers select
+ * the columns they need and filter in JS instead; the stores hold tens of rows,
+ * not millions. The `timeout` keeps a locked database from holding up a report
+ * cycle that runs every five seconds.
+ */
+export const sqliteJson = (dbPath: string, sql: string): unknown[] | null => {
+    const r = spawnSync('sqlite3', ['-readonly', '-json', dbPath, sql], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 1_000,
+    });
+    if (r.status !== 0) return null;
+    const out = (r.stdout ?? '').trim();
+    if (out === '') return []; // no rows — sqlite3 prints nothing, not `[]`
+    try {
+        const parsed = JSON.parse(out);
+        return Array.isArray(parsed) ? parsed : null;
+    } catch {
+        return null;
+    }
+};
+
+/** Test seam for the store-backed resolvers. `rows: null` = the read failed. */
+export interface StoreResolveDeps {
+    rows?: unknown[] | null;
+    startTimes?: Map<number, number>;
+    descendants?: Set<number>;
+}
+
+// ── Hermes ───────────────────────────────────────────────────────
+
+const HERMES_STATE_DB = join(homedir(), '.hermes', 'state.db');
+
+/**
+ * `sessions` rows for CLI sessions. `started_at` is REAL **seconds** (e.g.
+ * `1786676108.657766`), not milliseconds — the one unit mistake that would make
+ * every comparison miss by decades without erroring.
+ *
+ * `ended_at IS NULL` is deliberately NOT a filter: measured rows for sessions
+ * that died days ago still have a null `ended_at`, so it says nothing about
+ * liveness. The process-start match is the only thing that does.
+ */
+interface HermesSessionRow {
+    cwd?: string | null;
+    title?: string | null;
+    display_name?: string | null;
+    started_at?: number | null;
+}
+
+const readHermesSessions = ttlMemo(SNAPSHOT_TTL_MS, (): unknown[] | null => sqliteJson(
+    HERMES_STATE_DB,
+    "SELECT cwd, title, display_name, started_at FROM sessions WHERE source = 'cli'",
+));
+
+export const detectHermesSessionName = (
+    paneCwd: string,
+    panePid?: number,
+    deps: StoreResolveDeps = {},
+): string | null => {
+    // Without the pane's pid there is no process tree to match against, and this
+    // store offers no other key — no name is the only honest answer.
+    if (panePid === undefined) return null;
+    const raw = deps.rows !== undefined ? deps.rows : readHermesSessions();
+    if (raw === null) return null;
+
+    const rows = (raw as HermesSessionRow[]).filter((r) => r.cwd === paneCwd);
+    if (rows.length === 0) return null;
+    const row = pickRowByProcStart(
+        rows,
+        (r) => (typeof r.started_at === 'number' ? r.started_at * 1_000 : null),
+        deps.startTimes ?? psStartTimes(),
+        deps.descendants ?? collectDescendantPids(panePid),
+    );
+    // The auto-title is written asynchronously after the first response, so an
+    // untitled row is a young session, not a broken one.
+    return nonBlank(row?.title ?? undefined) ?? nonBlank(row?.display_name ?? undefined);
+};
+
 // ── The registry ─────────────────────────────────────────────────
 
 const REMOTE_AGENT_TABLE = [
@@ -370,6 +532,9 @@ const REMOTE_AGENT_TABLE = [
         displayName: 'Hermes',
         binary: 'hermes',
         subcommands: ['hermes'],
+        // No `resolveSessionId` counterpart: the store's own id is a
+        // `<timestamp>_<hash>` string, and nothing on the wire consumes it yet.
+        resolveSessionName: detectHermesSessionName,
     },
 ] as const satisfies readonly RemoteAgent[];
 
