@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { detectClaudeSessionIdByPid, findAgentBySubcommand, matchAgentByPaneCommand, REMOTE_AGENTS } from './remote-agents.js';
+import { detectClaudeSessionIdByPid, detectClaudeSessionNameByPid, findAgentBySubcommand, matchAgentByPaneCommand, REMOTE_AGENTS } from './remote-agents.js';
 
 // Top-level CLI commands the registry's subcommands must never collide
 // with — dispatch checks the registry BEFORE the switch, so a collision
@@ -55,6 +55,17 @@ describe('remote-agents.ts: table invariants', () => {
             if (a.kind === 'claude') expect(typeof a.resolveSessionId).toBe('function');
             else expect(a.resolveSessionId).toBeUndefined();
         }
+    });
+
+    // Twin of the invariant above, for the name axis. Gemini and Cursor store no
+    // session name at all (their state files carry ids and timestamps only), so a
+    // resolver appearing on those rows means someone invented a name — which is
+    // exactly the drift this table is here to notice.
+    it('cursor and gemini never carry a session-name resolver (no name exists to read)', () => {
+        for (const a of REMOTE_AGENTS) {
+            if (a.kind === 'cursor' || a.kind === 'gemini') expect(a.resolveSessionName).toBeUndefined();
+        }
+        expect(typeof REMOTE_AGENTS.find((a) => a.kind === 'claude')?.resolveSessionName).toBe('function');
     });
 });
 
@@ -190,5 +201,72 @@ describe('detectClaudeSessionIdByPid', () => {
             records, descendants: new Set([90, 300]),
         });
         expect(r).toBe('sess-other');
+    });
+});
+
+describe('collectDescendantPids caching', () => {
+    // Two resolvers now ask the same pane for its process tree in one report
+    // cycle (session id + session name). The `ps` snapshot was already shared;
+    // the walk over it was not, so without this memo a pane pays for two BFS
+    // passes every five seconds — on the path whose CPU cost is why the caches
+    // in this file exist.
+    it('serves the same walk to repeated calls for one pane within the snapshot window', async () => {
+        const { collectDescendantPids } = await import('./remote-agents.js');
+        const first = collectDescendantPids(process.pid);
+        const second = collectDescendantPids(process.pid);
+        expect(second).toBe(first);
+    });
+
+    it('never caches a caller-supplied table (the key says nothing about which snapshot)', async () => {
+        const { collectDescendantPids } = await import('./remote-agents.js');
+        const tree = collectDescendantPids(90, '90 1\n95 90\n100 95');
+        expect([...tree].sort((a, b) => a - b)).toEqual([90, 95, 100]);
+        // A different table for the same root must be walked again, not served
+        // from the pane's cache entry.
+        expect([...collectDescendantPids(90, '90 1')]).toEqual([90]);
+    });
+});
+
+describe('detectClaudeSessionNameByPid', () => {
+    // Names as Claude Code actually writes them: `<cwd-basename>-<hex2>` when
+    // derived, free text when the session was named.
+    const records = [
+        { pid: 100, sessionId: 'sess-tmux', cwd: '/proj', name: 'proj-95' },
+        { pid: 200, sessionId: 'sess-plain', cwd: '/proj', name: 'cleanup-pr-rules' },
+        { pid: 300, sessionId: 'sess-nameless', cwd: '/elsewhere' },
+    ];
+
+    it('returns the name of the session inside the pane process tree', () => {
+        expect(detectClaudeSessionNameByPid(90, '/proj', {
+            records, descendants: new Set([90, 95, 100]),
+        })).toBe('proj-95');
+    });
+
+    it('reads the same record the id resolver picked (one lookup, two fields)', () => {
+        const deps = { records, descendants: new Set([90, 95, 200]) };
+        expect(detectClaudeSessionIdByPid(90, '/proj', deps)).toBe('sess-plain');
+        expect(detectClaudeSessionNameByPid(90, '/proj', deps)).toBe('cleanup-pr-rules');
+    });
+
+    it('returns null when the matched record carries no name (older CC)', () => {
+        expect(detectClaudeSessionNameByPid(90, null, {
+            records, descendants: new Set([90, 300]),
+        })).toBeNull();
+    });
+
+    it('returns null when no record matches the tree', () => {
+        expect(detectClaudeSessionNameByPid(90, '/proj', {
+            records, descendants: new Set([90]),
+        })).toBeNull();
+    });
+
+    // A blank name must not reach the wire: renderers treat '' as falsy and fall
+    // back, but the change fingerprints collapse only null/undefined, so '' would
+    // ride along as a meaningless "change".
+    it('normalizes blank and whitespace-only names to null', () => {
+        const blank = [{ pid: 100, sessionId: 's', cwd: '/proj', name: '   ' }];
+        expect(detectClaudeSessionNameByPid(90, '/proj', {
+            records: blank, descendants: new Set([90, 100]),
+        })).toBeNull();
     });
 });

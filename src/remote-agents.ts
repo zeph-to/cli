@@ -48,7 +48,29 @@ export interface RemoteAgent {
      * then reports agentSessionId: null.
      */
     resolveSessionId?: (paneCwd: string, panePid?: number) => string | null;
+    /**
+     * Resolve the name the agent calls this session by — what the user sees in
+     * their own terminal, which the phone shows instead of the computed
+     * `<project> · <Agent> #N` label.
+     *
+     * Same shape as `resolveSessionId` and the same EXTENSION POINT rule: a row
+     * carries this only once that agent's name store is confirmed. Cursor and
+     * Gemini never will — their state files hold ids, cwds and timestamps and no
+     * name at all, so there is nothing to read and the computed label stands.
+     */
+    resolveSessionName?: (paneCwd: string, panePid?: number) => string | null;
 }
+
+/**
+ * A name is only worth carrying if it has visible characters. Renderers treat
+ * `''` as falsy and fall back on their own, but the change fingerprints on both
+ * sides of the wire collapse `undefined`/`null` and would ship a blank string as
+ * a real change — a report per cycle that says nothing.
+ */
+const nonBlank = (value: string | undefined): string | null => {
+    const trimmed = value?.trim();
+    return trimmed ? trimmed : null;
+};
 
 // ── Claude Code session resolver ─────────────────────────────────
 
@@ -127,10 +149,16 @@ export const detectClaudeSessionId = (cwd: string): string | null => {
 
 const CLAUDE_SESSIONS_DIR = join(homedir(), '.claude', 'sessions');
 
-interface PidSessionRecord {
+export interface PidSessionRecord {
     pid: number;
     sessionId: string;
     cwd: string;
+    /**
+     * What Claude Code calls this session (`zeph-to-95` when derived from the
+     * cwd, free text once named). Optional: an older CC writes the record
+     * without it, and a record without a name is still a valid id match.
+     */
+    name?: string;
 }
 
 const readPidSessionRecords = (): PidSessionRecord[] => {
@@ -141,7 +169,12 @@ const readPidSessionRecords = (): PidSessionRecord[] => {
             try {
                 const raw = JSON.parse(readFileSync(join(CLAUDE_SESSIONS_DIR, entry), 'utf-8')) as Partial<PidSessionRecord>;
                 if (typeof raw.pid === 'number' && typeof raw.sessionId === 'string' && typeof raw.cwd === 'string') {
-                    out.push({ pid: raw.pid, sessionId: raw.sessionId, cwd: raw.cwd });
+                    out.push({
+                        pid: raw.pid,
+                        sessionId: raw.sessionId,
+                        cwd: raw.cwd,
+                        ...(typeof raw.name === 'string' ? { name: raw.name } : {}),
+                    });
                 }
             } catch { /* partial write / corrupt — skip */ }
         }
@@ -190,10 +223,7 @@ const readPsChildren = ttlMemo(SNAPSHOT_TTL_MS, (): Map<number, number[]> | null
 
 const cachedPidSessionRecords = ttlMemo(SNAPSHOT_TTL_MS, readPidSessionRecords);
 
-/** pid set of `rootPid` + all descendants, from one `ps` snapshot. */
-const collectDescendantPids = (rootPid: number, psOutput?: string): Set<number> => {
-    const children = psOutput !== undefined ? parseChildren(psOutput) : readPsChildren();
-    if (children === null) return new Set([rootPid]);
+const walkDescendants = (rootPid: number, children: Map<number, number[]>): Set<number> => {
     const found = new Set<number>([rootPid]);
     const queue = [rootPid];
     while (queue.length > 0) {
@@ -207,6 +237,43 @@ const collectDescendantPids = (rootPid: number, psOutput?: string): Set<number> 
     return found;
 };
 
+/**
+ * Per-pane process tree, memoized for the same window as the `ps` snapshot it
+ * walks. The snapshot itself is already shared across the cycle (readPsChildren),
+ * but the walk was not: each resolver on a row ran its own BFS, so asking a pane
+ * for both its session id and its session name doubled the work on the path
+ * whose CPU cost is the reason these caches exist (see claudeSessionCache).
+ *
+ * Callers must treat the returned Set as read-only — it is shared.
+ */
+const descendantCache = new Map<number, { pids: Set<number>; expiresAt: number }>();
+
+/** pid set of `rootPid` + all descendants, from one `ps` snapshot. */
+export const collectDescendantPids = (rootPid: number, psOutput?: string): Set<number> => {
+    // An explicit table is a caller supplying its own snapshot — never cached,
+    // since the cache key says nothing about which table it came from.
+    if (psOutput !== undefined) return walkDescendants(rootPid, parseChildren(psOutput));
+
+    const now = Date.now();
+    const cached = descendantCache.get(rootPid);
+    if (cached && cached.expiresAt > now) return cached.pids;
+
+    const children = readPsChildren();
+    // A failed `ps` is not cached: the next cycle should retry rather than
+    // serve "this pane has no children" for the whole TTL.
+    if (children === null) return new Set([rootPid]);
+
+    // Same bound and eviction as claudeSessionCache — a long-lived listener sees
+    // many pane pids over its lifetime and none of them come back.
+    if (descendantCache.size >= 64) {
+        const oldest = descendantCache.keys().next().value;
+        if (oldest !== undefined) descendantCache.delete(oldest);
+    }
+    const pids = walkDescendants(rootPid, children);
+    descendantCache.set(rootPid, { pids, expiresAt: now + SNAPSHOT_TTL_MS });
+    return pids;
+};
+
 /** Test seam for the pid-based resolver. */
 export interface PidResolveDeps {
     records?: PidSessionRecord[];
@@ -218,19 +285,40 @@ export interface PidResolveDeps {
  * process tree AND whose cwd matches (guards against OS pid reuse
  * leaving a stale record pointing elsewhere). Null → caller falls back
  * to the mtime heuristic.
+ *
+ * Returns the whole record so the id and the name come from one lookup — they
+ * describe the same session, and reading the directory twice per cycle to get
+ * them separately is what the cache above exists to avoid.
  */
+export const detectClaudeSessionByPid = (
+    panePid: number,
+    paneCwd: string | null,
+    deps: PidResolveDeps = {},
+): PidSessionRecord | null => {
+    const records = deps.records ?? cachedPidSessionRecords();
+    if (records.length === 0) return null;
+    const descendants = deps.descendants ?? collectDescendantPids(panePid);
+    return records.find((r) =>
+        descendants.has(r.pid) && (paneCwd === null || r.cwd === paneCwd)) ?? null;
+};
+
 export const detectClaudeSessionIdByPid = (
     panePid: number,
     paneCwd: string | null,
     deps: PidResolveDeps = {},
-): string | null => {
-    const records = deps.records ?? cachedPidSessionRecords();
-    if (records.length === 0) return null;
-    const descendants = deps.descendants ?? collectDescendantPids(panePid);
-    const match = records.find((r) =>
-        descendants.has(r.pid) && (paneCwd === null || r.cwd === paneCwd));
-    return match?.sessionId ?? null;
-};
+): string | null => detectClaudeSessionByPid(panePid, paneCwd, deps)?.sessionId ?? null;
+
+/**
+ * The name of the session running in this pane. No mtime fallback exists here:
+ * the transcript filenames the heuristic walks carry a UUID and nothing else,
+ * so an older CC without `~/.claude/sessions` yields no name and the phone
+ * keeps the computed label.
+ */
+export const detectClaudeSessionNameByPid = (
+    panePid: number,
+    paneCwd: string | null,
+    deps: PidResolveDeps = {},
+): string | null => nonBlank(detectClaudeSessionByPid(panePid, paneCwd, deps)?.name);
 
 // ── The registry ─────────────────────────────────────────────────
 
@@ -246,6 +334,8 @@ const REMOTE_AGENT_TABLE = [
         resolveSessionId: (paneCwd, panePid) =>
             (panePid !== undefined ? detectClaudeSessionIdByPid(panePid, paneCwd) : null)
             ?? detectClaudeSessionId(paneCwd),
+        resolveSessionName: (paneCwd, panePid) =>
+            panePid !== undefined ? detectClaudeSessionNameByPid(panePid, paneCwd) : null,
     },
     {
         kind: 'codex',
