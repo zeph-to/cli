@@ -29,6 +29,7 @@ const {
     knownSessions,
     isKnownSession,
     knownSessionsPath,
+    forgetSession,
     MAX_KNOWN_SESSIONS,
     KNOWN_SESSION_TTL_MS,
 } = await import('./session-registry.js');
@@ -140,5 +141,40 @@ describe('session registry', () => {
         // The registry names the user's project directories; other accounts on
         // the machine have no business reading them.
         expect(statSync(knownSessionsPath()).mode & 0o077).toBe(0);
+    });
+});
+
+/**
+ * Forgetting is what "delete" means on this side: the entry leaves the file,
+ * so the session stops being offered and — because this file is the resume
+ * whitelist — stops being startable. `rememberSessions` only writes down
+ * sessions that are running, so a session that has ended stays forgotten.
+ */
+describe('forgetSession', () => {
+    it('drops the named session and keeps the rest', () => {
+        rememberSessions([live(), live({ name: 'zeph-web', cwd: '/Users/tak/work/web' })], T0);
+
+        expect(forgetSession('zeph-api')).toBe(true);
+        expect(knownSessions(T0).map((e) => e.name)).toEqual(['zeph-web']);
+    });
+
+    it('takes the session out of the resume whitelist', () => {
+        rememberSessions([live()], T0);
+
+        forgetSession('zeph-api');
+
+        expect(isKnownSession('zeph-api', T0)).toBe(false);
+        expect(recallSession('zeph-api', T0)).toBeNull();
+    });
+
+    it('says so when it never knew the name, and writes nothing', () => {
+        rememberSessions([live()], T0);
+
+        expect(forgetSession('zeph-never')).toBe(false);
+        expect(knownSessions(T0).map((e) => e.name)).toEqual(['zeph-api']);
+    });
+
+    it('is safe on a machine with no registry at all', () => {
+        expect(forgetSession('zeph-api')).toBe(false);
     });
 });

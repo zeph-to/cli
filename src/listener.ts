@@ -40,6 +40,7 @@ import {
 } from './listener-process.js';
 import { projectHash, remoteDigest, remoteMarkerPath, stateDir } from './gate.js';
 import {
+    forgetSession,
     knownSessions,
     recallSession,
     rememberSessions,
@@ -1410,6 +1411,71 @@ export const handleSessionExitRequest = (
     return true;
 };
 
+export interface SessionForgetRequest {
+    subtype?: string;
+    targetDeviceId?: string;
+    sessionName?: string;
+    requestId?: string;
+}
+
+export interface SessionForgetResult {
+    subtype: 'agent.session.forget.result';
+    requestId: string;
+    sessionName: string;
+    forgotten?: true;
+    error?: string;
+    at: string;
+}
+
+/**
+ * Delete one ended session from this machine's record, and say what happened.
+ * Returns true when the message was ours to answer.
+ *
+ * The mirror of resume, and destructive where that one is constructive: it
+ * takes the entry out of the registry, which is the same file resume reads its
+ * whitelist from. After this the session is neither offered nor startable, and
+ * nothing puts it back — `rememberSessions` only writes down sessions that are
+ * running, so only actually running that name again restores it.
+ *
+ * The refusals: unknown name is nothing to delete rather than something to
+ * guess at. Still running means it is not a past session at all — the phone is
+ * looking at a live one, and ending it is a different request that this must
+ * not quietly stand in for.
+ */
+export const handleSessionForgetRequest = (
+    req: SessionForgetRequest,
+    send: (data: Record<string, unknown>) => void,
+): boolean => {
+    if (req.subtype !== 'agent.session.forget.request') return false;
+    if (!req.requestId || !req.sessionName) return false;
+    if (req.targetDeviceId !== computeListenerDeviceId()) return false;
+
+    const sessionName = req.sessionName;
+    const reply = (fields: Partial<SessionForgetResult>): true => {
+        send({
+            subtype: 'agent.session.forget.result' as const,
+            requestId: req.requestId,
+            sessionName,
+            at: new Date().toISOString(),
+            ...fields,
+        });
+        return true;
+    };
+
+    // Charged like a submitted command: it writes to disk and is irreversible,
+    // so it shares the budget with the paths that start and stop processes.
+    if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return reply({ error: 'rate_limited' });
+
+    if (sessionExists(sessionName)) return reply({ error: 'still_running' });
+    if (!forgetSession(sessionName)) {
+        log(`✗ forget ${sessionName}: never seen on this machine`);
+        return reply({ error: 'unknown_session' });
+    }
+
+    log(`🗑 forget ${sessionName}: dropped from this machine's record`);
+    return reply({ forgotten: true });
+};
+
 /** Whether tmux already holds a session by this name. */
 const sessionExists = (name: string): boolean =>
     spawnSync('tmux', tmuxArgs(['has-session', '-t', name]), {
@@ -1642,23 +1708,57 @@ const capturePane = (
  * tmux reports the position separately; `pane_height` is what turns a
  * pane-relative row into a row of the captured text, since the capture reaches
  * back into scrollback and the visible pane is only its last `pane_height`
- * lines.
+ * lines. `history_size` rides along in the same answer — one format string,
+ * no second spawn — and tells the viewer how deep the buffer under that
+ * window is.
  *
  * Read only for frames that are actually about to be sent — one extra tmux
  * spawn per SENT frame rather than per tick.
  */
-const capturePaneCursor = (
-    sessionName: string,
-): { x: number; y: number; height: number } | null => {
+const capturePaneCursor = (sessionName: string): PaneGeometry | null => {
     const r = spawnSync(
         'tmux',
-        tmuxArgs(['display-message', '-p', '-t', sessionName, '#{cursor_x},#{cursor_y},#{pane_height}']),
+        tmuxArgs([
+            'display-message', '-p', '-t', sessionName,
+            '#{cursor_x},#{cursor_y},#{pane_height},#{history_size}',
+        ]),
         { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] },
     );
     if (r.status !== 0) return null;
-    const [x, y, height] = (r.stdout ?? '').trim().split(',').map(Number);
+    return parsePaneGeometry(r.stdout ?? '');
+};
+
+export interface PaneGeometry {
+    x: number;
+    y: number;
+    height: number;
+    /** Lines of scrollback the pane holds above the visible rows. Tells the
+     *  viewer where this frame's window sits in the buffer, which is what lets
+     *  it record the lines that scroll past without matching text. Absent when
+     *  tmux did not answer with a usable number. */
+    historySize?: number;
+}
+
+/**
+ * Read the one tmux answer the frame path already asks for per tick.
+ *
+ * The depth is parsed separately from the cursor on purpose: a tmux that does
+ * not report `history_size` still reports the cursor, and refusing the whole
+ * answer over the missing field would cost every frame its cursor — a
+ * regression in exchange for a feature.
+ */
+export const parsePaneGeometry = (raw: string): PaneGeometry | null => {
+    const fields = raw.trim().split(',');
+    const [x, y, height] = fields.map(Number);
     if (![x, y, height].every((n) => Number.isSafeInteger(n) && n >= 0)) return null;
-    return { x, y, height };
+    // An absent field is NOT a depth of zero, and `Number('')` is 0 — so the
+    // raw field has to be checked before it is converted. Zero is the answer a
+    // freshly cleared pane gives, and the viewer reads a drop to zero as that
+    // clear; letting an empty answer arrive as one would fake the clear and
+    // make the viewer re-record output it already holds.
+    const depth = fields.length > 3 && fields[3] !== '' ? Number(fields[3]) : NaN;
+    if (!Number.isSafeInteger(depth) || depth < 0) return { x, y, height };
+    return { x, y, height, historySize: depth };
 };
 
 /**
@@ -2028,6 +2128,15 @@ export type StreamFramePayload = {
      *  constant. Plaintext for the same reason the cursor is: a line count
      *  without the lines says nothing. */
     historyLines?: number;
+    /** How much scrollback the PANE holds above its visible rows — the depth
+     *  this frame's window sits in, where `historyLines` is only the slice of
+     *  it the frame carries. Together they place the frame's top edge in the
+     *  buffer, which is what lets a viewer record the lines that scroll past
+     *  without matching text (a redrawing TUI defeats text matching), and lets
+     *  it see the buffer being cleared as the depth dropping. Absent when tmux
+     *  would not say. Plaintext for the same reason the cursor is: a line count
+     *  without the lines says nothing. */
+    historySize?: number;
     /** Plaintext pane content — only on unencrypted streams. */
     content?: string;
     /** E2EE envelope — replaces `content` on encrypted streams. */
@@ -2105,7 +2214,11 @@ export const buildStreamFrame = async (
     captured: { content: string; truncated: boolean },
     sessionName: string,
     subscriberPublicKey?: string,
-    meta?: { cursor?: { line: number; col: number } | null; historyLines?: number },
+    meta?: {
+        cursor?: { line: number; col: number } | null;
+        historyLines?: number;
+        historySize?: number;
+    },
 ): Promise<StreamFramePayload | null> => {
     const cursor = meta?.cursor;
     const base = {
@@ -2115,6 +2228,7 @@ export const buildStreamFrame = async (
         truncated: captured.truncated,
         ...(cursor ? { cursorLine: cursor.line, cursorCol: cursor.col } : {}),
         ...(meta?.historyLines === undefined ? {} : { historyLines: meta.historyLines }),
+        ...(meta?.historySize === undefined ? {} : { historySize: meta.historySize }),
     };
     if (!subscriberPublicKey) return { ...base, content: captured.content };
     try {
@@ -2279,10 +2393,13 @@ export const handleStreamControl = (
         const cursorAt = capturePaneCursor(sessionName);
         const cursor = cursorAt ? cursorLineFor(captured.content, cursorAt) : null;
         // Same read gives the pane height, which is what separates this frame's
-        // scrollback from its visible rows — the offset a history pull starts at.
+        // scrollback from its visible rows — the offset a history pull starts at —
+        // and the pane's total scrollback depth, which places that window in the
+        // buffer for a viewer recording the lines that scroll past it.
         const historyLines = cursorAt
             ? historyLinesIn(captured.content, cursorAt.height)
             : undefined;
+        const historySize = cursorAt?.historySize;
         const cursorKey = cursor ? `${cursor.line},${cursor.col}` : '';
         if (captured.content === lastContent && cursorKey === lastCursor) {
             stats.skipped++;
@@ -2309,7 +2426,7 @@ export const handleStreamControl = (
         // guaranteed under load; the receiver drops any seq it has already
         // painted past.
         const seq = ++wireSeq;
-        void buildStreamFrame(captured, sessionName, subscriberPublicKey, { cursor, historyLines }).then((frame) => {
+        void buildStreamFrame(captured, sessionName, subscriberPublicKey, { cursor, historyLines, historySize }).then((frame) => {
             // Stream stopped or restarted while this frame was in flight —
             // `stats` is unique per start, so it doubles as the identity
             // token. Don't send into a dead/replaced stream or skew its stats.
@@ -3573,6 +3690,9 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                     // rest comes from what this machine wrote down itself.
                     && !handleSessionResumeRequest(m.data as SessionResumeRequest, sendEphemeral)
                     && !handleSessionExitRequest(m.data as SessionExitRequest, sendEphemeral)
+                    // Forget is the same envelope pointed the other way: it
+                    // takes a name out of the record resume reads from.
+                    && !handleSessionForgetRequest(m.data as SessionForgetRequest, sendEphemeral)
                     // Reading the session's changes: read-only git in the repo
                     // the registry recorded, never a path or command from here.
                     && !handleDiffFilesRequest(m.data as DiffFilesRequest, sendEphemeral)

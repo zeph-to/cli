@@ -28,7 +28,7 @@ const fakeTmux = (args: readonly string[]) => {
         if (a[4] === '#{pane_current_command}') return { status: 0, stdout: 'node', stderr: '' };
         // Unset by default, which fails to parse — the same "pane reports no
         // cursor" path every other test in this file runs on.
-        if (a[4] === '#{cursor_x},#{cursor_y},#{pane_height}') {
+        if (a[4] === '#{cursor_x},#{cursor_y},#{pane_height},#{history_size}') {
             return { status: 0, stdout: cursorProbe, stderr: '' };
         }
         return { status: 0, stdout: ['node', 'claude', '/tmp/proj', '1234'].join(FIELD_SEP), stderr: '' };
