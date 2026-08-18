@@ -37,3 +37,35 @@ describe('rules-sync: generated core is wired into the templates', () => {
         expect(tmpl.AIDER_RULE).toContain('Sticky REMOTE mode');
     });
 });
+
+// The core scopes Rules 3/4/10/11 to REMOTE and tells NORMAL it owes no
+// zeph_ask. That is safe exactly where a prompt-submit hook can announce the
+// phone message that starts REMOTE. Only Gemini and Codex have that hook; for
+// every other agent a zeph_ask answer is the sole way in, so their rule file
+// must keep asking after real work or the phone loop can never begin.
+describe('rules-sync: REMOTE entry for agents without a prompt-submit hook', () => {
+    const ENTRY = 'Entering REMOTE without a prompt hook';
+
+    it('agents with no prompt hook restore the after-work ask', async () => {
+        const tmpl = await import('./templates.js');
+        for (const rule of [tmpl.CURSOR_RULE, tmpl.WINDSURF_RULE, tmpl.COPILOT_RULE, tmpl.CLINE_RULE, tmpl.AIDER_RULE]) {
+            expect(rule).toContain(ENTRY);
+            expect(rule).toContain('overrides the "In NORMAL, end with nothing" clause');
+        }
+    });
+
+    it('agents WITH the prompt hook rely on it and get no override', async () => {
+        const tmpl = await import('./templates.js');
+        // The hook exists — asserted on the hook config, not assumed.
+        expect(JSON.stringify(tmpl.GEMINI_HOOKS)).toContain('remote-hook gemini');
+        expect(JSON.stringify(tmpl.CODEX_HOOKS)).toContain('remote-hook codex');
+        expect(tmpl.GEMINI_RULE).not.toContain(ENTRY);
+        expect(tmpl.CODEX_RULE).not.toContain(ENTRY);
+    });
+
+    it('the preamble sits before the core so the override reads first', async () => {
+        const tmpl = await import('./templates.js');
+        const rule = tmpl.CURSOR_RULE;
+        expect(rule.indexOf(ENTRY)).toBeLessThan(rule.indexOf('Sticky REMOTE mode'));
+    });
+});

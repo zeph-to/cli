@@ -146,6 +146,13 @@ an answerable `zeph_ask`).
 Detection is exact-match: a terminal keystroke racing a phone message
 can never false-flag. Muted projects are never flagged.
 
+Agents without that hook (Cursor, Windsurf, Copilot, Cline, Aider) have one
+other way in: a `zeph_ask` answer that is not a Done-like button. Their rule
+files therefore keep the after-real-work `zeph_ask` — the "Entering REMOTE
+without a prompt hook" preamble in `src/templates.ts` — so the phone always
+has a button to tap that starts the loop. Agents with the hook drop that
+obligation while at the terminal.
+
 `zeph cursor` has no remote-origin hook, so it never enters sticky REMOTE
 mode by itself. **Just ask for it** — one line, once per session:
 
