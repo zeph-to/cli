@@ -1155,6 +1155,23 @@ describe('sessions report gate (idle-cost throttle)', () => {
         expect(a).toBe(b);
     });
 
+    // The provider's own session name is a display value the phone shows, so a
+    // rename in Claude Code has to reach the server on the next cycle rather
+    // than wait out the heartbeat. Both this gate and the server's
+    // REPORTED_SESSION_FIELDS must carry the field; either one omitting it
+    // swallows the rename.
+    it('a provider session-name change changes the fingerprint', () => {
+        const before = sessionsFingerprint([{ ...base, providerSessionName: 'app-1e' } as never]);
+        const after = sessionsFingerprint([{ ...base, providerSessionName: 'app-95' } as never]);
+        expect(before).not.toBe(after);
+    });
+
+    it('an absent provider session name (older cli) does not force a report', () => {
+        const absent = sessionsFingerprint([{ ...base } as never]);
+        const explicitNull = sessionsFingerprint([{ ...base, providerSessionName: null } as never]);
+        expect(absent).toBe(explicitNull);
+    });
+
     it('state transition changes the fingerprint', () => {
         const idle = sessionsFingerprint([{ ...base, state: 'idle' } as never]);
         const working = sessionsFingerprint([{ ...base, state: 'working' } as never]);

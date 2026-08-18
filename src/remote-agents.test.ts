@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { detectClaudeSessionIdByPid, findAgentBySubcommand, matchAgentByPaneCommand, REMOTE_AGENTS } from './remote-agents.js';
+import { detectClaudeSessionIdByPid, detectClaudeSessionNameByPid, findAgentBySubcommand, matchAgentByPaneCommand, REMOTE_AGENTS } from './remote-agents.js';
 
 // Top-level CLI commands the registry's subcommands must never collide
 // with — dispatch checks the registry BEFORE the switch, so a collision
@@ -54,6 +54,28 @@ describe('remote-agents.ts: table invariants', () => {
         for (const a of REMOTE_AGENTS) {
             if (a.kind === 'claude') expect(typeof a.resolveSessionId).toBe('function');
             else expect(a.resolveSessionId).toBeUndefined();
+        }
+    });
+
+    // Twin of the invariant above, for the name axis. Gemini and Cursor store no
+    // session name at all (their state files carry ids and timestamps only), so a
+    // resolver appearing on those rows means someone invented a name — which is
+    // exactly the drift this table is here to notice.
+    it('cursor and gemini never carry a session-name resolver (no name exists to read)', () => {
+        for (const a of REMOTE_AGENTS) {
+            if (a.kind === 'cursor' || a.kind === 'gemini') expect(a.resolveSessionName).toBeUndefined();
+        }
+    });
+
+    /**
+     * The rows are the only thing wiring a resolver into the report — every
+     * resolver test calls the function directly, so a row that never got its
+     * `resolveSessionName` leaves the whole feature dead with a green suite.
+     */
+    it('every agent with a readable name store is wired to its resolver', () => {
+        for (const kind of ['claude', 'hermes', 'codex'] as const) {
+            const row = REMOTE_AGENTS.find((a) => a.kind === kind);
+            expect(typeof row?.resolveSessionName, `${kind} row lost its name resolver`).toBe('function');
         }
     });
 });
@@ -190,5 +212,118 @@ describe('detectClaudeSessionIdByPid', () => {
             records, descendants: new Set([90, 300]),
         });
         expect(r).toBe('sess-other');
+    });
+});
+
+describe('parseProcTable', () => {
+    // `ps -axo pid=,ppid=,lstart=` on macOS: two spaces before a single-digit
+    // day, trailing padding after the year. Measured with `cat -A`, not guessed.
+    const REAL = '    1     0 Fri Aug  7 11:12:59 2026    \n  182     1 Tue Aug 11 18:13:52 2026    ';
+
+    it('reads both the parent links and the start times from one table', async () => {
+        const { parseProcTable } = await import('./remote-agents.js');
+        const { children, startTimes } = parseProcTable(REAL);
+        expect(children.get(0)).toEqual([1]);
+        expect(children.get(1)).toEqual([182]);
+        expect(Number.isFinite(startTimes.get(1))).toBe(true);
+        // Aug 11 started after Aug 7 — an ordering the parse cannot fake by
+        // returning a constant, and one that holds in any timezone.
+        expect(startTimes.get(182)!).toBeGreaterThan(startTimes.get(1)!);
+    });
+
+    /**
+     * THE regression this file exists for. A start time that this machine's
+     * locale cannot parse must cost only the start time. If it took the parent
+     * links with it, `collectDescendantPids` would fall back to `{rootPid}` for
+     * every pane, `detectClaudeSessionIdByPid` would return null across the
+     * board, and Claude Code would silently drop to the mtime heuristic — the
+     * identity theft the pid join was built to end (see the comment above
+     * CLAUDE_SESSIONS_DIR).
+     */
+    it('keeps the parent links when the start time is unparseable', async () => {
+        const { parseProcTable } = await import('./remote-agents.js');
+        const { children, startTimes } = parseProcTable('  95     1 not a date at all\n 100    95 also not a date');
+        expect(children.get(1)).toEqual([95]);
+        expect(children.get(95)).toEqual([100]);
+        expect(startTimes.has(95)).toBe(false);
+    });
+
+    it('still reads a two-field table (a caller that asked for no start times)', async () => {
+        const { parseProcTable } = await import('./remote-agents.js');
+        const { children, startTimes } = parseProcTable('90 1\n95 90\n100 95');
+        expect(children.get(90)).toEqual([95]);
+        expect(startTimes.size).toBe(0);
+    });
+
+    it('ignores lines that are not a process row', async () => {
+        const { parseProcTable } = await import('./remote-agents.js');
+        const { children } = parseProcTable('PID PPID STARTED\n\n  90     1 Fri Aug  7 11:12:59 2026');
+        expect(children.get(1)).toEqual([90]);
+        expect(children.size).toBe(1);
+    });
+});
+
+describe('collectDescendantPids caching', () => {
+    // Two resolvers now ask the same pane for its process tree in one report
+    // cycle (session id + session name). The `ps` snapshot was already shared;
+    // the walk over it was not, so without this memo a pane pays for two BFS
+    // passes every five seconds — on the path whose CPU cost is why the caches
+    // in this file exist.
+    it('serves the same walk to repeated calls for one pane within the snapshot window', async () => {
+        const { collectDescendantPids } = await import('./remote-agents.js');
+        const first = collectDescendantPids(process.pid);
+        const second = collectDescendantPids(process.pid);
+        expect(second).toBe(first);
+    });
+
+    it('answers with the root alone for a pid that has no children', async () => {
+        const { collectDescendantPids } = await import('./remote-agents.js');
+        // pid 1 is init/launchd's parent-of-everything, so an unused high pid is
+        // the reliable childless case on a live machine.
+        expect([...collectDescendantPids(0x7ff_ffff)]).toEqual([0x7ff_ffff]);
+    });
+});
+
+describe('detectClaudeSessionNameByPid', () => {
+    // Names as Claude Code actually writes them: `<cwd-basename>-<hex2>` when
+    // derived, free text when the session was named.
+    const records = [
+        { pid: 100, sessionId: 'sess-tmux', cwd: '/proj', name: 'proj-95' },
+        { pid: 200, sessionId: 'sess-plain', cwd: '/proj', name: 'cleanup-pr-rules' },
+        { pid: 300, sessionId: 'sess-nameless', cwd: '/elsewhere' },
+    ];
+
+    it('returns the name of the session inside the pane process tree', () => {
+        expect(detectClaudeSessionNameByPid(90, '/proj', {
+            records, descendants: new Set([90, 95, 100]),
+        })).toBe('proj-95');
+    });
+
+    it('reads the same record the id resolver picked (one lookup, two fields)', () => {
+        const deps = { records, descendants: new Set([90, 95, 200]) };
+        expect(detectClaudeSessionIdByPid(90, '/proj', deps)).toBe('sess-plain');
+        expect(detectClaudeSessionNameByPid(90, '/proj', deps)).toBe('cleanup-pr-rules');
+    });
+
+    it('returns null when the matched record carries no name (older CC)', () => {
+        expect(detectClaudeSessionNameByPid(90, null, {
+            records, descendants: new Set([90, 300]),
+        })).toBeNull();
+    });
+
+    it('returns null when no record matches the tree', () => {
+        expect(detectClaudeSessionNameByPid(90, '/proj', {
+            records, descendants: new Set([90]),
+        })).toBeNull();
+    });
+
+    // A blank name must not reach the wire: renderers treat '' as falsy and fall
+    // back, but the change fingerprints collapse only null/undefined, so '' would
+    // ride along as a meaningless "change".
+    it('normalizes blank and whitespace-only names to null', () => {
+        const blank = [{ pid: 100, sessionId: 's', cwd: '/proj', name: '   ' }];
+        expect(detectClaudeSessionNameByPid(90, '/proj', {
+            records: blank, descendants: new Set([90, 100]),
+        })).toBeNull();
     });
 });
