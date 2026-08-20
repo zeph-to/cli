@@ -57,6 +57,22 @@ wrapper. `npm i -g`는 디스크의 패키지만 바꾸고 상주 프로세스�
 빌드라는 뜻). 두 파일은 `listener-process.ts` 한 곳에서만 쓰고 지운다 — listener와 wrapper가
 각자 경로를 재구현하면 drift 판정이 갈린다.
 
+### Login-time service = listener 소유권 이전 (`listener-service.ts`)
+`zeph listener --install-service`가 launchd LaunchAgent(`to.zeph.listener`)를 심으면
+**프로세스 소유자가 launchd로 바뀐다**. 이후 `zeph cc`(`ensureListenerRunning`)와
+`zeph listener --stop|--restart`는 spawn/SIGTERM 대신 `launchctl kickstart|bootout`으로
+위임한다 — launchd 자식을 직접 죽이면 launchd가 대체본을 띄우는 동시에 호출자도 하나
+띄워, 싱글턴 가드에서 진 쪽이 exit 0 하고 `KeepAlive:{SuccessfulExit:false}`가 그걸
+"의도된 정지"로 읽어 로그인 세션 내내 포기한다. 설치 시 **기존 데몬을 먼저 stop**하는
+이유도 같다.
+
+plist는 node·cli.js 절대경로와 **tmux가 잡히는 PATH**를 설치 시점에 굽는다 — launchd가
+주는 PATH는 `/usr/bin:/bin:/usr/sbin:/sbin`뿐이고 `verifyTmux()`는 tmux 없으면
+`exit 127`이다. 정지는 `bootout`만 쓴다(`disable`은 영속 DB라 로그인을 넘어 살아남음).
+로그 회전이 rename이 아니라 copy-truncate인 것도 여기서 나온다 — launchd가
+`StandardOutPath` fd를 쥐고 있어 rename하면 같은 inode에 계속 쓴다.
+`listener-service.ts`는 **node 빌트인만** import한다 (wrapper 핫패스가 읽는다).
+
 ### Agent key whitelist (3-site 동기)
 `ALLOWED_KEYS` (listener.ts, phone→pane 키 주입) is mirrored in two other repos'
 files that MUST change together, else a new key is rejected before it reaches the
