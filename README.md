@@ -244,7 +244,8 @@ block here.
    `zeph listener` by hand — every `zeph cc` checks the PID file and
    skips the spawn when one is already alive, so opening a dozen
    terminals doesn't create a dozen daemons. The daemon survives
-   between `zeph cc` invocations.
+   between `zeph cc` invocations — but not a reboot, which is what the
+   login-time service below is for.
 
    Project name resolves from `CLAUDE_PROJECT_DIR` /
    `CURSOR_PROJECT_DIR` / `WINDSURF_PROJECT_DIR` if set, else the git
@@ -270,6 +271,40 @@ block here.
    skips the outer tmux and runs the agent in the current pane — the
    listener can't target an unnamed session that way, but you keep your
    existing multiplexer setup.
+
+### Starting the listener at login (macOS)
+
+A reboot ends the daemon, and nothing starts it again until you open a
+terminal and run `zeph cc`. Until you do, the phone shows **no agents** —
+the machine is on, the past sessions are on disk, and the app has no one
+to hear from.
+
+```bash
+zeph listener --install-service
+```
+
+That registers a launchd LaunchAgent (`to.zeph.listener`) that starts the
+listener at every login. `--uninstall-service` removes it and
+`--service-status` shows what the installed one points at; `zeph install`
+offers it during setup and `zeph uninstall` takes it away again.
+
+What you get back after a reboot is your **past sessions**, ready to
+resume from the phone — not live agents. tmux does not survive a reboot
+either, and this doesn't try to bring those sessions back to life.
+
+Two details worth knowing:
+
+- It fires at **user login**, not at boot. Without automatic login, the
+  machine stays silent while it sits on the login screen.
+- The plist bakes in absolute paths for node, the CLI, and a `PATH` that
+  can reach tmux. launchd gives a job `/usr/bin:/bin:/usr/sbin:/sbin` and
+  nothing else, so without that the daemon would exit 127 at every login.
+  If node moves (a version-manager upgrade, say), `zeph verify` says so —
+  re-run `--install-service` to repoint it.
+
+With the service installed, launchd owns the process: `zeph cc` and
+`zeph listener --stop|--restart` ask launchd rather than signalling the
+PID, so there is never a second daemon racing the first.
 
 ### Diagnostics
 
