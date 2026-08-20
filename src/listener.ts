@@ -3940,6 +3940,12 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     writeListenerPid();
     process.on('exit', removeListenerPid);
 
+    // Rotate before writing anything, so this run's first line lands in the
+    // file the user tails rather than being copied straight into `.old`. The
+    // daemon owns this: under the login-time LaunchAgent nothing else runs
+    // first — launchd opens StandardOutPath and execs us directly.
+    rotateListenerLogIfLarge();
+
     // Version on the first line: the only way to tell which build a
     // long-lived daemon is actually running (an `npm i -g` days ago says
     // nothing about the process that's been up since before it).
@@ -3973,7 +3979,6 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     // file, but the login-time LaunchAgent never goes through that function —
     // launchd opens StandardOutPath itself. Left alone, a daemon that survives
     // logins for weeks writes an unbounded log, so the daemon rotates itself.
-    rotateListenerLogIfLarge();
     const logRotateTimer = setInterval(rotateListenerLogIfLarge, 60 * 60 * 1000);
     logRotateTimer.unref();
 
