@@ -422,3 +422,78 @@ export const restartService = (deps: ServiceOpDeps = defaultServiceOpDeps): Serv
     }
     return { ok: true, notes: [`restarted ${SERVICE_LABEL}`] };
 };
+
+// ─── Health ──────────────────────────────────────────────────────────
+
+export interface ServiceHealthRow {
+    readonly label: string;
+    readonly state: 'pass' | 'warn' | 'fail';
+}
+
+/** The two live facts a health check can't read off the plist. */
+export interface ServiceProbe {
+    /** Can a process started with this PATH find tmux? */
+    readonly tmuxOnPath: (pathEnv: string) => boolean;
+    /** Is launchd actually running the job right now? */
+    readonly loaded: () => boolean;
+}
+
+const pathHasTmux = (pathEnv: string): boolean =>
+    pathEnv.split(':').filter(Boolean).some((dir) => existsSync(join(dir, 'tmux')));
+
+const jobIsLoaded = (): boolean => runLaunchctl(['print', serviceTarget()]).ok;
+
+export const defaultServiceProbe: ServiceProbe = { tmuxOnPath: pathHasTmux, loaded: jobIsLoaded };
+
+/**
+ * Why this exists: every way the service breaks leaves it looking installed.
+ * `launchctl list` shows the job whether or not its interpreter still exists,
+ * and a PATH without tmux makes the daemon exit 127 at every login while the
+ * registration sits there unchanged. None of that is visible without asking.
+ */
+export const serviceHealthChecks = (
+    status: ServiceStatus,
+    probe: ServiceProbe = defaultServiceProbe,
+): ServiceHealthRow[] => {
+    if (!status.supported) return [];
+    if (!status.installed) {
+        return [
+            {
+                label: 'no login-time service — after a reboot the phone sees nothing until you run `zeph cc` '
+                    + '(add it: zeph listener --install-service)',
+                state: 'warn',
+            },
+        ];
+    }
+
+    const rows: ServiceHealthRow[] = [{ label: `${status.label} registered`, state: 'pass' }];
+
+    if (status.missing.length > 0) {
+        rows.push({
+            label: `service points at ${status.missing.join(', ')} — gone. Re-run: zeph listener --install-service`,
+            state: 'fail',
+        });
+    } else {
+        rows.push({ label: 'service programs still exist', state: 'pass' });
+    }
+
+    // launchd hands the job its own bare PATH, so tmux has to come from what
+    // the plist baked in. Without it verifyTmux() exits 127 at every login.
+    if (status.pathEnv && probe.tmuxOnPath(status.pathEnv)) {
+        rows.push({ label: 'tmux reachable from the service PATH', state: 'pass' });
+    } else {
+        rows.push({
+            label: 'tmux NOT on the service PATH — the daemon exits 127 at login. '
+                + 'Re-run: zeph listener --install-service',
+            state: 'fail',
+        });
+    }
+
+    rows.push(
+        probe.loaded()
+            ? { label: 'launchd is running the job', state: 'pass' }
+            : { label: 'registered but launchd is not running it — it returns at the next login', state: 'warn' },
+    );
+
+    return rows;
+};

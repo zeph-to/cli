@@ -3,6 +3,7 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { detectAgents, hasCommand } from './agents.js';
 import { loadConfig, resolvedEnv, resolveHookId, VERSION } from './config.js';
+import { serviceHealthChecks, serviceStatus } from './listener-service.js';
 import { ZephHook } from './zeph-hook.js';
 
 const HOME = homedir();
@@ -73,6 +74,15 @@ export const handleVerify = async (args: Record<string, string | boolean>): Prom
         ? 'zeph CLI on PATH'
         : 'zeph CLI not on PATH (hooks fall back to npx — slower first call)',
         hasCommand('zeph') ? 'pass' : 'warn');
+
+    // ── Login-time service ───────────────────────────────────────
+    // Optional, so a missing one is a warning. A broken one is not: every way
+    // it breaks still looks installed from the outside.
+    const serviceRows = serviceHealthChecks(serviceStatus());
+    if (serviceRows.length > 0) {
+        console.log('\n  Login-time service:');
+        for (const row of serviceRows) record(row.label, row.state);
+    }
 
     // ── Per-agent config ─────────────────────────────────────────
     console.log('\n  Agents:');
