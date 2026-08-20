@@ -11,6 +11,28 @@ const proc = vi.hoisted(() => ({
     clearStaleListenerRuntime: vi.fn(),
 }));
 
+const svc = vi.hoisted(() => ({
+    installService: vi.fn(async () => ({ ok: true, notes: [] as string[] })),
+    uninstallService: vi.fn(async () => ({ ok: true, notes: [] as string[] })),
+    serviceStatus: vi.fn(() => ({
+        supported: true,
+        installed: false,
+        label: 'to.zeph.listener',
+        plistPath: '/tmp/to.zeph.listener.plist',
+        nodePath: null as string | null,
+        cliPath: null as string | null,
+        pathEnv: null as string | null,
+        missing: [] as string[],
+    })),
+}));
+
+vi.mock('./listener-service.js', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('./listener-service.js')>()),
+    installService: () => svc.installService(),
+    uninstallService: () => svc.uninstallService(),
+    serviceStatus: () => svc.serviceStatus(),
+}));
+
 vi.mock('./listener-process.js', async (importOriginal) => ({
     ...(await importOriginal<typeof import('./listener-process.js')>()),
     runningListenerPid: () => proc.runningListenerPid(),
@@ -74,5 +96,49 @@ describe('zeph listener --restart', () => {
     it('fails loudly when the cli entry cannot be resolved', async () => {
         proc.spawnListenerDetached.mockReturnValue(false);
         expect(await handleListener({ restart: true })).toBe(1);
+    });
+});
+
+// The login-time service is what stops a reboot from emptying the phone's
+// picker. Its flags must route before verifyTmux and before anything that
+// would start a daemon in *this* process.
+describe('zeph listener service flags', () => {
+    it('installs the service without starting a daemon here', async () => {
+        expect(await handleListener({ 'install-service': true })).toBe(0);
+        expect(svc.installService).toHaveBeenCalled();
+        expect(proc.spawnListenerDetached).not.toHaveBeenCalled();
+    });
+
+    // A failed install must be a non-zero exit: the whole point of the
+    // post-install check is that a silent failure looks identical to success.
+    it('reports a failed install as an error exit', async () => {
+        svc.installService.mockResolvedValueOnce({ ok: false, reason: 'tmux not found', notes: [] } as never);
+        expect(await handleListener({ 'install-service': true })).toBe(1);
+    });
+
+    it('removes the service on --uninstall-service', async () => {
+        expect(await handleListener({ 'uninstall-service': true })).toBe(0);
+        expect(svc.uninstallService).toHaveBeenCalled();
+    });
+
+    it('reports when no service is installed', async () => {
+        expect(await handleListener({ 'service-status': true })).toBe(0);
+        expect(svc.serviceStatus).toHaveBeenCalled();
+    });
+
+    // Registered but pointing at a node that a version upgrade removed. The
+    // job still shows in `launchctl list`, so the exit code is the signal.
+    it('exits non-zero when the installed service points at something gone', async () => {
+        svc.serviceStatus.mockReturnValueOnce({
+            supported: true,
+            installed: true,
+            label: 'to.zeph.listener',
+            plistPath: '/tmp/to.zeph.listener.plist',
+            nodePath: '/gone/node',
+            cliPath: '/tmp/cli.js',
+            pathEnv: '/usr/bin',
+            missing: ['/gone/node'],
+        });
+        expect(await handleListener({ 'service-status': true })).toBe(1);
     });
 });

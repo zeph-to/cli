@@ -1,8 +1,8 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { LISTENER_LOG_FILE, resolveCliPath } from './listener-process.js';
+import { LISTENER_LOG_FILE, resolveCliPath, runningListenerPid, stopListener } from './listener-process.js';
 
 /**
  * The listener as an OS service: a launchd LaunchAgent that starts it at user
@@ -275,4 +275,150 @@ export const serviceStatus = (): ServiceStatus => {
     const [nodePath = null, cliPath = null] = readProgramArguments(xml);
     const missing = [nodePath, cliPath].filter((p): p is string => !!p && !existsSync(p));
     return { ...base, installed: true, nodePath, cliPath, pathEnv: readPathEnv(xml), missing };
+};
+
+// ─── Service operations ──────────────────────────────────────────────
+
+/**
+ * Side effects the service operations need, injectable so tests can drive the
+ * launchd sequence without a launchd.
+ */
+export interface ServiceOpDeps {
+    readonly supported: () => boolean;
+    readonly resolveSpec: () => SpecResolution;
+    /** PID of a listener running right now, or null. */
+    readonly runningPid: () => number | null;
+    readonly stopListener: (pid: number) => Promise<boolean>;
+    readonly launchctl: (args: string[]) => { ok: boolean; stderr: string };
+    readonly settle: (ms: number) => Promise<void>;
+}
+
+export type ServiceOpResult =
+    | { readonly ok: true; readonly notes: readonly string[] }
+    | { readonly ok: false; readonly reason: string; readonly notes: readonly string[] };
+
+/** How long to give launchd to get the daemon up before calling the install
+ *  a failure. Generous: the daemon writes its pid file as its first act. */
+const POST_INSTALL_SETTLE_MS = 3_000;
+
+const runLaunchctl = (args: string[]): { ok: boolean; stderr: string } => {
+    try {
+        execFileSync('launchctl', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+        return { ok: true, stderr: '' };
+    } catch (err) {
+        const stderr = (err as { stderr?: Buffer }).stderr?.toString().trim() ?? '';
+        return { ok: false, stderr };
+    }
+};
+
+export const defaultServiceOpDeps: ServiceOpDeps = {
+    supported: serviceSupported,
+    resolveSpec: () => resolveServiceSpec(),
+    runningPid: runningListenerPid,
+    stopListener,
+    launchctl: runLaunchctl,
+    settle: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
+const UNSUPPORTED =
+    'the login-time service needs launchd — only macOS is supported today ' +
+    '(run `zeph listener` yourself, or keep using `zeph cc` to autostart it)';
+
+/**
+ * Register the LaunchAgent and get the daemon running under it.
+ *
+ * The order is load-bearing, not incidental:
+ *
+ * - **Any listener already running is stopped first.** `handleListener` exits
+ *   **0** when it finds another listener alive, and it only does so quietly
+ *   under ZEPH_LISTENER_AUTOSTART, which a launchd job does not have. So a
+ *   kickstart into a live `zeph cc` daemon produces a clean exit, and
+ *   `KeepAlive:{SuccessfulExit:false}` reads a clean exit as "stay down" —
+ *   for the whole login session. `launchctl list` shows the job; nothing runs.
+ * - **Nothing is written until the spec resolves.** A refusal leaves the
+ *   machine exactly as it was.
+ * - **The daemon is confirmed alive afterwards.** Without that check the
+ *   failure above ships silently.
+ */
+export const installService = async (deps: ServiceOpDeps = defaultServiceOpDeps): Promise<ServiceOpResult> => {
+    const notes: string[] = [];
+    if (!deps.supported()) return { ok: false, reason: UNSUPPORTED, notes };
+
+    const spec = deps.resolveSpec();
+    if (!spec.ok) return { ok: false, reason: spec.reason, notes };
+    if (spec.warning) notes.push(spec.warning);
+
+    const running = deps.runningPid();
+    if (running !== null) {
+        await deps.stopListener(running);
+        notes.push(`stopped the listener already running (pid ${running}) so launchd can own it`);
+    }
+
+    // Nothing to unload before a first install — that failure is the normal path.
+    deps.launchctl(['bootout', serviceTarget()]);
+
+    const plistPath = servicePlistPath();
+    mkdirSync(dirname(plistPath), { recursive: true });
+    writeFileSync(plistPath, renderLaunchAgentPlist(spec.value));
+    notes.push(`wrote ${plistPath}`);
+
+    const bootstrap = deps.launchctl(['bootstrap', serviceDomain(), plistPath]);
+    if (!bootstrap.ok) {
+        return { ok: false, reason: `launchctl bootstrap failed: ${bootstrap.stderr || 'no detail'}`, notes };
+    }
+    // Best-effort: a job disabled by an earlier `launchctl disable` (ours never
+    // calls it, but a user's hand might have) would otherwise refuse to start.
+    deps.launchctl(['enable', serviceTarget()]);
+
+    const kickstart = deps.launchctl(['kickstart', '-k', serviceTarget()]);
+    if (!kickstart.ok) {
+        return { ok: false, reason: `launchctl kickstart failed: ${kickstart.stderr || 'no detail'}`, notes };
+    }
+
+    await deps.settle(POST_INSTALL_SETTLE_MS);
+    if (deps.runningPid() === null) {
+        return {
+            ok: false,
+            reason: `the service was registered but the listener did not stay up — see ${LISTENER_LOG_FILE}`,
+            notes,
+        };
+    }
+    return { ok: true, notes };
+};
+
+/** Unregister the job and remove the plist. Doing only one of the two leaves
+ *  either a running service with no plist or a plist launchd ignores. */
+export const uninstallService = async (deps: ServiceOpDeps = defaultServiceOpDeps): Promise<ServiceOpResult> => {
+    const notes: string[] = [];
+    const plistPath = servicePlistPath();
+    if (!existsSync(plistPath)) return { ok: true, notes: ['service not installed — nothing to remove'] };
+
+    deps.launchctl(['bootout', serviceTarget()]);
+    notes.push(`unloaded ${SERVICE_LABEL}`);
+    rmSync(plistPath, { force: true });
+    notes.push(`removed ${plistPath}`);
+    return { ok: true, notes };
+};
+
+/**
+ * Stop the service until the next login.
+ *
+ * `bootout` and not `disable`: disable writes to launchd's persistent disabled
+ * database, survives logins, and leaves no obvious way back — a `--stop` that
+ * quietly becomes permanent. Session-scoped is what stopping should mean.
+ */
+export const stopService = (deps: ServiceOpDeps = defaultServiceOpDeps): ServiceOpResult => {
+    const result = deps.launchctl(['bootout', serviceTarget()]);
+    if (!result.ok) return { ok: false, reason: `launchctl bootout failed: ${result.stderr || 'no detail'}`, notes: [] };
+    return { ok: true, notes: [`unloaded ${SERVICE_LABEL} — it comes back at the next login`] };
+};
+
+/** Restart the service in place. `-k` kills the running instance first, so this
+ *  is also how a version-drifted daemon is replaced. */
+export const restartService = (deps: ServiceOpDeps = defaultServiceOpDeps): ServiceOpResult => {
+    const result = deps.launchctl(['kickstart', '-k', serviceTarget()]);
+    if (!result.ok) {
+        return { ok: false, reason: `launchctl kickstart failed: ${result.stderr || 'no detail'}`, notes: [] };
+    }
+    return { ok: true, notes: [`restarted ${SERVICE_LABEL}`] };
 };

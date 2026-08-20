@@ -47,6 +47,7 @@ import {
     sessionDirectoryExists,
 } from './session-registry.js';
 import { matchAgentByPaneCommand, REMOTE_AGENTS, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
+import { installService, SERVICE_LABEL, serviceStatus, uninstallService } from './listener-service.js';
 import { advanceState, evaluateState, findPatternMatch, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
 import { decryptEphemeral, encryptEphemeral, getDevicePublicKey, initDeviceCrypto, type EncryptedEphemeralPayload } from './crypto.js';
@@ -3811,7 +3812,66 @@ const handleListenerLifecycle = async (restart: boolean): Promise<number> => {
     return 0;
 };
 
+/**
+ * `--install-service` / `--uninstall-service` / `--service-status`: the
+ * LaunchAgent that starts this daemon at login. Runs before verifyTmux for the
+ * same reason the lifecycle flags do — reporting or removing a service must not
+ * need a healthy tmux (and installing does its own, better, tmux check).
+ */
+const handleServiceFlags = async (args: Record<string, string | boolean>): Promise<number> => {
+    const say = (notes: readonly string[]): void => {
+        for (const note of notes) console.log(`  ${note}`);
+    };
+
+    if (args['install-service'] === true) {
+        const result = await installService();
+        say(result.notes);
+        if (!result.ok) {
+            console.error(`zeph listener: ${result.reason}`);
+            return 1;
+        }
+        console.log(`zeph listener: ${SERVICE_LABEL} installed — the listener now starts at every login.`);
+        return 0;
+    }
+
+    if (args['uninstall-service'] === true) {
+        const result = await uninstallService();
+        say(result.notes);
+        if (!result.ok) {
+            console.error(`zeph listener: ${result.reason}`);
+            return 1;
+        }
+        console.log('zeph listener: login-time service removed. `zeph cc` still autostarts the daemon.');
+        return 0;
+    }
+
+    const status = serviceStatus();
+    if (!status.supported) {
+        console.log('zeph listener: login-time service is macOS-only (launchd).');
+        return 0;
+    }
+    if (!status.installed) {
+        console.log('zeph listener: no login-time service — run `zeph listener --install-service`.');
+        return 0;
+    }
+    console.log(`zeph listener: ${status.label} installed`);
+    console.log(`  plist: ${status.plistPath}`);
+    console.log(`  node:  ${status.nodePath ?? '(unreadable)'}`);
+    console.log(`  cli:   ${status.cliPath ?? '(unreadable)'}`);
+    console.log(`  PATH:  ${status.pathEnv ?? '(unreadable)'}`);
+    if (status.missing.length > 0) {
+        console.error(`  ! missing: ${status.missing.join(', ')} — re-run \`zeph listener --install-service\``);
+        return 1;
+    }
+    return 0;
+};
+
 export const handleListener = async (args: Record<string, string | boolean>): Promise<number> => {
+    // Service flags first: they neither need nor start a daemon in this process.
+    if (args['install-service'] === true || args['uninstall-service'] === true || args['service-status'] === true) {
+        return handleServiceFlags(args);
+    }
+
     // Lifecycle flags run before verifyTmux — stopping a daemon shouldn't
     // require a healthy tmux.
     if (args.stop === true || args.restart === true) return handleListenerLifecycle(args.restart === true);
