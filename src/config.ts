@@ -13,10 +13,18 @@ export interface ZephConfig {
   deviceId?: string;
 }
 
-export const resolvedEnv = (key: string): string | undefined => {
-  const val = process.env[key];
+export const resolvedEnv = (key: string, env: NodeJS.ProcessEnv = process.env): string | undefined => {
+  const val = env[key];
   return val && !val.startsWith('${') ? val : undefined;
 };
+
+/**
+ * The two-way hook id: `ZEPH_HOOK_ID` when it carries a real value, else
+ * `hookId` from ~/.zeph/config.json — what `zeph setup` writes. The plugin's
+ * gate.sh `zeph_hook_id` and the MCP server resolve it in the same order.
+ */
+export const resolveHookId = (env: NodeJS.ProcessEnv = process.env): string | undefined =>
+  resolvedEnv('ZEPH_HOOK_ID', env) || loadConfig().hookId;
 
 // Per-agent project-dir env vars, in precedence order. Deliberately NOT part
 // of the remote-agent registry: Cursor/Windsurf carry project-dir envs but

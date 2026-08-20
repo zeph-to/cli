@@ -16,7 +16,7 @@
  * and dies with the tool call, so a socket would cost a handshake it cannot
  * amortise; plain polling is the whole protocol here.
  */
-import { loadConfig, resolvedEnv } from './config.js';
+import { loadConfig, resolvedEnv, resolveHookId } from './config.js';
 
 /** Server-side hook trigger + event read. Kept narrow on purpose — this
  *  module needs two routes, not an API client. */
@@ -175,7 +175,7 @@ export const handleAsk = async (args: Record<string, string | boolean>): Promise
     // hook maps that to DENY — a command blocked for a reason that has nothing
     // to do with the user. Every other command in cli.ts resolves env this way.
     const apiKey = (args['api-key'] as string) || resolvedEnv('ZEPH_API_KEY') || config.apiKey;
-    const hookId = (args.hook as string) || resolvedEnv('ZEPH_HOOK_ID') || config.hookId;
+    const hookId = (args.hook as string) || resolveHookId();
     const title = (args.title as string) || '';
 
     if (!apiKey || !hookId || !title) {

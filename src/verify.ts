@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { detectAgents, hasCommand } from './agents.js';
-import { loadConfig, resolvedEnv, VERSION } from './config.js';
+import { loadConfig, resolvedEnv, resolveHookId, VERSION } from './config.js';
 import { ZephHook } from './zeph-hook.js';
 
 const HOME = homedir();
@@ -56,7 +56,7 @@ export const handleVerify = async (args: Record<string, string | boolean>): Prom
     console.log('  Credentials:');
     const config = loadConfig();
     const apiKey = resolvedEnv('ZEPH_API_KEY') || config.apiKey;
-    const hookId = resolvedEnv('ZEPH_HOOK_ID') || config.hookId;
+    const hookId = resolveHookId();
     record(apiKey ? 'ZEPH_API_KEY is set' : 'ZEPH_API_KEY not set (env or ~/.zeph/config.json)',
         apiKey ? 'pass' : 'fail');
     record(hookId
