@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
- * Who owns the listener process when the login-time service is installed.
+ * Who owns the listener process, from the `zeph cc` side.
+ * (The `zeph listener --stop|--restart` side lives in listener-lifecycle.test.ts,
+ * next to the rest of handleListenerLifecycle.)
  *
  * launchd is the owner. Anything that SIGTERMs its child makes launchd restart
  * that child while the caller spawns its own, and the two race through the
@@ -42,7 +44,6 @@ vi.mock('./listener-service.js', async (importOriginal) => ({
 }));
 
 const { ensureListenerRunning } = await import('./wrapper.js');
-const { handleListener } = await import('./listener.js');
 
 beforeEach(() => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -103,29 +104,5 @@ describe('ensureListenerRunning without the service', () => {
         await ensureListenerRunning();
         expect(proc.stopListener).toHaveBeenCalledWith(4242);
         expect(proc.spawnListenerDetached).toHaveBeenCalled();
-    });
-});
-
-describe('zeph listener --stop/--restart with the service installed', () => {
-    it('unloads through launchd instead of signalling the pid', async () => {
-        svc.serviceInstalled.mockReturnValue(true);
-        proc.runningListenerPid.mockReturnValue(4242);
-        expect(await handleListener({ stop: true })).toBe(0);
-        expect(svc.stopService).toHaveBeenCalled();
-        expect(proc.stopListener).not.toHaveBeenCalled();
-    });
-
-    it('restarts through launchd instead of spawning', async () => {
-        svc.serviceInstalled.mockReturnValue(true);
-        proc.runningListenerPid.mockReturnValue(4242);
-        expect(await handleListener({ restart: true })).toBe(0);
-        expect(svc.restartService).toHaveBeenCalled();
-        expect(proc.spawnListenerDetached).not.toHaveBeenCalled();
-    });
-
-    it('reports a launchd failure as an error exit', async () => {
-        svc.serviceInstalled.mockReturnValue(true);
-        svc.restartService.mockReturnValue({ ok: false, reason: 'not loaded', notes: [] } as never);
-        expect(await handleListener({ restart: true })).toBe(1);
     });
 });

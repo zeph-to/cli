@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { LISTENER_LOG_FILE, resolveCliPath, runningListenerPid, stopListener } from './listener-process.js';
+import { LISTENER_LOG_FILE, resolveCliPath, runningListenerPid, sleep, stopListener } from './listener-process.js';
 
 /**
  * The listener as an OS service: a launchd LaunchAgent that starts it at user
@@ -349,7 +349,7 @@ export const defaultServiceOpDeps: ServiceOpDeps = {
     runningPid: runningListenerPid,
     stopListener,
     launchctl: runLaunchctl,
-    settle: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    settle: sleep,
 };
 
 const UNSUPPORTED =

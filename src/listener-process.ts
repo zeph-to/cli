@@ -27,7 +27,7 @@ export const LISTENER_PID_FILE = join(ZEPH_DIR, 'listener.pid');
 export const LISTENER_VERSION_FILE = join(ZEPH_DIR, 'listener.version');
 export const LISTENER_LOG_FILE = join(ZEPH_DIR, 'listener.log');
 
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+export const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * PID of the listener on record, or null when the file is missing or stale.

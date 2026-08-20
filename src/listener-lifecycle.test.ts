@@ -14,6 +14,9 @@ const proc = vi.hoisted(() => ({
 const svc = vi.hoisted(() => ({
     installService: vi.fn(async () => ({ ok: true, notes: [] as string[] })),
     uninstallService: vi.fn(async () => ({ ok: true, notes: [] as string[] })),
+    serviceInstalled: vi.fn(() => false),
+    restartService: vi.fn(() => ({ ok: true, notes: ['restarted'] })),
+    stopService: vi.fn(() => ({ ok: true, notes: ['unloaded'] })),
     serviceStatus: vi.fn(() => ({
         supported: true,
         installed: false,
@@ -31,6 +34,9 @@ vi.mock('./listener-service.js', async (importOriginal) => ({
     installService: () => svc.installService(),
     uninstallService: () => svc.uninstallService(),
     serviceStatus: () => svc.serviceStatus(),
+    serviceInstalled: () => svc.serviceInstalled(),
+    restartService: () => svc.restartService(),
+    stopService: () => svc.stopService(),
 }));
 
 vi.mock('./listener-process.js', async (importOriginal) => ({
@@ -53,6 +59,8 @@ afterEach(() => {
     vi.restoreAllMocks();
     proc.runningListenerPid.mockReturnValue(null);
     proc.spawnListenerDetached.mockReturnValue(true);
+    svc.serviceInstalled.mockReturnValue(false);
+    svc.restartService.mockReturnValue({ ok: true, notes: ['restarted'] });
 });
 
 describe('zeph listener --stop', () => {
@@ -140,5 +148,29 @@ describe('zeph listener service flags', () => {
             missing: ['/gone/node'],
         });
         expect(await handleListener({ 'service-status': true })).toBe(1);
+    });
+});
+
+describe('zeph listener --stop/--restart with the service installed', () => {
+    it('unloads through launchd instead of signalling the pid', async () => {
+        svc.serviceInstalled.mockReturnValue(true);
+        proc.runningListenerPid.mockReturnValue(4242);
+        expect(await handleListener({ stop: true })).toBe(0);
+        expect(svc.stopService).toHaveBeenCalled();
+        expect(proc.stopListener).not.toHaveBeenCalled();
+    });
+
+    it('restarts through launchd instead of spawning', async () => {
+        svc.serviceInstalled.mockReturnValue(true);
+        proc.runningListenerPid.mockReturnValue(4242);
+        expect(await handleListener({ restart: true })).toBe(0);
+        expect(svc.restartService).toHaveBeenCalled();
+        expect(proc.spawnListenerDetached).not.toHaveBeenCalled();
+    });
+
+    it('reports a launchd failure as an error exit', async () => {
+        svc.serviceInstalled.mockReturnValue(true);
+        svc.restartService.mockReturnValue({ ok: false, reason: 'not loaded', notes: [] } as never);
+        expect(await handleListener({ restart: true })).toBe(1);
     });
 });
