@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, openSync, readFileSync, statSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -152,7 +152,14 @@ export const resolveCliPath = (): string | null => {
 /**
  * Rotate the listener log once it grows past 5 MB. The daemon runs for days
  * and writes 2-3 lines per 5-s cycle, so without rotation the file climbs
- * into the tens of megabytes. Keep the previous run's tail under `.old`.
+ * into the tens of megabytes. Keep the previous window under `.old`.
+ *
+ * Copy-truncate rather than rename, because the writer is not always ours.
+ * Under the login-time LaunchAgent, launchd opens `StandardOutPath` itself
+ * and holds that fd for the life of the job: a rename moves the directory
+ * entry and leaves launchd appending to the very same inode, now called
+ * `.old`. The log the user tails would never shrink. Emptying the file in
+ * place keeps the inode — and the fd — valid.
  */
 const LISTENER_LOG_MAX_BYTES = 5 * 1024 * 1024;
 
@@ -160,7 +167,8 @@ export const rotateListenerLogIfLarge = (): void => {
     try {
         if (!existsSync(LISTENER_LOG_FILE)) return;
         if (statSync(LISTENER_LOG_FILE).size <= LISTENER_LOG_MAX_BYTES) return;
-        renameSync(LISTENER_LOG_FILE, LISTENER_LOG_FILE + '.old');
+        copyFileSync(LISTENER_LOG_FILE, LISTENER_LOG_FILE + '.old');
+        truncateSync(LISTENER_LOG_FILE, 0);
     } catch { /* best-effort */ }
 };
 

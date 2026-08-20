@@ -33,6 +33,7 @@ import {
     clearStaleListenerRuntime,
     LISTENER_LOG_FILE,
     LISTENER_PID_FILE,
+    rotateListenerLogIfLarge,
     runningListenerPid,
     spawnListenerDetached,
     stopListener,
@@ -47,7 +48,15 @@ import {
     sessionDirectoryExists,
 } from './session-registry.js';
 import { matchAgentByPaneCommand, REMOTE_AGENTS, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
-import { installService, SERVICE_LABEL, serviceStatus, uninstallService } from './listener-service.js';
+import {
+    installService,
+    restartService,
+    SERVICE_LABEL,
+    serviceInstalled,
+    serviceStatus,
+    stopService,
+    uninstallService,
+} from './listener-service.js';
 import { advanceState, evaluateState, findPatternMatch, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
 import { decryptEphemeral, encryptEphemeral, getDevicePublicKey, initDeviceCrypto, type EncryptedEphemeralPayload } from './crypto.js';
@@ -3793,6 +3802,19 @@ const removeListenerPid = (): void => clearListenerRuntime(process.pid);
  * to it.
  */
 const handleListenerLifecycle = async (restart: boolean): Promise<number> => {
+    // launchd owns the process when the login-time service is installed:
+    // signalling the pid ourselves would have launchd start a replacement
+    // behind our back. `bootout` and not `disable` — see listener-service.ts.
+    if (serviceInstalled()) {
+        const result = restart ? restartService() : stopService();
+        if (!result.ok) {
+            console.error(`zeph listener: ${result.reason}`);
+            return 1;
+        }
+        for (const note of result.notes) console.log(`zeph listener: ${note}`);
+        return 0;
+    }
+
     const pid = otherListenerAlive();
     if (pid) {
         const stopped = await stopListener(pid);
@@ -3946,6 +3968,14 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     sweepAttachments();
     const gcTimer = setInterval(sweepAttachments, 60 * 60 * 1000);
     gcTimer.unref();
+
+    // Rotate our own log. `spawnListenerDetached` rotates before it opens the
+    // file, but the login-time LaunchAgent never goes through that function —
+    // launchd opens StandardOutPath itself. Left alone, a daemon that survives
+    // logins for weeks writes an unbounded log, so the daemon rotates itself.
+    rotateListenerLogIfLarge();
+    const logRotateTimer = setInterval(rotateListenerLogIfLarge, 60 * 60 * 1000);
+    logRotateTimer.unref();
 
     // Agent detection rules: disk cache immediately (offline-safe),
     // then a background OTA refresh now and every 6 h (§S7).
