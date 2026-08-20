@@ -147,6 +147,10 @@ Install options:
    to manual key entry)
   --key <api-key>    API key (non-interactive; skips browser login)
   --hook <hook-id>   Hook ID (non-interactive)
+  --service          Install the login-time listener service without
+                     asking (macOS). Interactive runs offer it anyway;
+                     scripted runs need this flag
+  --no-service       Never install it
   --base-url <url>   Base URL (non-interactive)
   --relogin          Force a fresh browser sign-in even if a login is
                      already saved (switch account)

@@ -8,6 +8,7 @@ import { loadConfig, resolvedEnv, saveConfig, CONFIG_FILE, VERSION } from './con
 import type { ZephConfig } from './config.js';
 import { runLoginFlow, resolveWebUrl, resolveTimeoutSec } from './login.js';
 import { detectAgents } from './agents.js';
+import { installService, serviceSupported } from './listener-service.js';
 import type { Agent } from './agents.js';
 import {
   CURSOR_HOOKS, CURSOR_RULE,
@@ -35,6 +36,7 @@ interface InstallArgs {
 
 const ok = (msg: string) => console.log(`    + ${msg}`);
 const fail = (msg: string) => console.log(`    - ${msg}`);
+const skipNote = (msg: string) => console.log(`    · ${msg}`);
 
 /**
  * True when install should auto-open browser login (ADR 0002): interactive
@@ -431,6 +433,56 @@ const collectCredentials = async (
   return { apiKey, hookId: hookInput || undefined, baseUrl: existing.baseUrl };
 };
 
+// ── Login-time service ───────────────────────────────────────────
+
+/**
+ * Whether this install should register the LaunchAgent that starts the
+ * listener at login.
+ *
+ * Interactive installs offer it and default to yes: an empty phone picker
+ * after every reboot is precisely the kind of thing a default should fix.
+ * Scripted installs (`--key`, CI, provisioning) get it only when asked —
+ * planting a background job on a machine whose operator only wanted an API
+ * key written is a surprise, not a convenience.
+ */
+export const serviceInstallChoice = (
+  args: Record<string, string | boolean>,
+  nonInteractive: boolean,
+): 'yes' | 'no' | 'ask' => {
+  if (args['no-service'] === true) return 'no';
+  if (!serviceSupported()) return 'no';
+  if (args.service === true) return 'yes';
+  return nonInteractive ? 'no' : 'ask';
+};
+
+/** Run the choice: ask when it should be asked, then install if wanted. */
+const applyServiceChoice = async (choice: 'yes' | 'no' | 'ask'): Promise<void> => {
+  if (choice === 'no') return;
+
+  let wanted = choice === 'yes';
+  if (choice === 'ask') {
+    try {
+      const { confirm } = await import('@inquirer/prompts');
+      wanted = await confirm({
+        message: 'Start the listener at every login? (so the phone sees this machine after a reboot)',
+        default: true,
+      });
+    } catch {
+      // Ctrl-C or no TTY — an unanswered question is not a yes.
+      wanted = false;
+    }
+  }
+  if (!wanted) {
+    skipNote('login-time service not installed (add it later: zeph listener --install-service)');
+    return;
+  }
+
+  const result = await installService();
+  for (const note of result.notes) ok(note);
+  if (result.ok) ok('listener starts at every login');
+  else fail(`login-time service: ${result.reason}`);
+};
+
 // ── Main Install Flow ────────────────────────────────────────────
 
 export const handleInstall = async (args: Record<string, string | boolean>): Promise<number> => {
@@ -502,6 +554,9 @@ export const handleInstall = async (args: Record<string, string | boolean>): Pro
     if (selected.length === 0) {
       console.log('    (no agents selected — only the config file will be saved)');
     }
+    if (serviceInstallChoice(args, nonInteractive) !== 'no') {
+      console.log('    - Offer to start the listener at every login');
+    }
     console.log('    - Test connection');
   }
 
@@ -525,7 +580,11 @@ export const handleInstall = async (args: Record<string, string | boolean>): Pro
     if (installer) installer();
   }
 
-  // 7. Test connection
+  // 7. Login-time service — the only thing that makes the phone see this
+  //    machine after a reboot without a terminal being opened first.
+  await applyServiceChoice(serviceInstallChoice(args, nonInteractive));
+
+  // 8. Test connection
   console.log('\n  Testing connection...');
   await testConnection(apiKey, baseUrl);
 

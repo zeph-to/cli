@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { detectAgents } from './agents.js';
+import { SERVICE_LABEL, serviceInstalled, uninstallService } from './listener-service.js';
 import { isZephHookGroup, removeManagedBlock } from './templates.js';
 import { CONFIG_FILE, VERSION } from './config.js';
 
@@ -205,6 +206,21 @@ const AGENT_UNINSTALLERS: Record<string, (dry: boolean) => void> = {
     ]),
 };
 
+/**
+ * Remove the login-time LaunchAgent, if one is installed.
+ *
+ * Async, so it does not fit the sync `Step` shape the per-agent uninstallers
+ * use — launchctl has to be waited on. Returns the same "one line or null"
+ * contract those steps do.
+ */
+export const removeServiceStep = async (dry: boolean): Promise<string | null> => {
+    if (!serviceInstalled()) return null;
+    if (dry) return `would remove the login-time service (${SERVICE_LABEL})`;
+    const result = await uninstallService();
+    if (!result.ok) return `could not remove the login-time service: ${result.reason}`;
+    return `removed the login-time service (${SERVICE_LABEL})`;
+};
+
 // ── Entry point ──────────────────────────────────────────────────
 
 export const handleUninstall = async (args: Record<string, string | boolean>): Promise<number> => {
@@ -222,6 +238,12 @@ export const handleUninstall = async (args: Record<string, string | boolean>): P
         console.log(`  ${agent.name}:`);
         AGENT_UNINSTALLERS[agent.id]?.(dry);
     }
+
+    // The LaunchAgent outlives every agent's rules, so removing it is part of
+    // uninstall and not of any one agent's teardown.
+    console.log('\n  Login-time service:');
+    const serviceLine = await removeServiceStep(dry);
+    if (serviceLine) ok(serviceLine); else skip('not installed');
 
     // ~/.zeph/config.json holds the API key — kept by default so a
     // re-install doesn't need the key re-entered. --purge removes it.
