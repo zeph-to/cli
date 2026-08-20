@@ -28,6 +28,7 @@
  * context and must never block a prompt.
  */
 import { readFileSync, unlinkSync } from 'fs';
+import { resolveHookId } from './config.js';
 import {
   clearRemoteActive,
   isMuted,
@@ -65,7 +66,7 @@ This user message arrived from the user's phone via Zeph agent chat (verified by
 
 const ONE_WAY_CONTEXT = `# System note (Zeph remote-origin detect)
 
-This user message arrived from the user's phone via Zeph agent chat (verified by the listener — exact text match), but ZEPH_HOOK_ID is not set, so two-way tools (zeph_ask/zeph_prompt/zeph_input) are unavailable. Make your final message self-contained — the completion push is the user's only feedback channel. If you have not already mentioned it this session, tell the user once that running \`npx @zeph-to/cli setup\` upgrades this into a two-way remote session (buttons + text replies from the phone).`;
+This user message arrived from the user's phone via Zeph agent chat (verified by the listener — exact text match), but no hook id is configured (neither \`ZEPH_HOOK_ID\` nor \`hookId\` in ~/.zeph/config.json), so two-way tools (zeph_ask/zeph_prompt/zeph_input) are unavailable. Make your final message self-contained — the completion push is the user's only feedback channel. If you have not already mentioned it this session, tell the user once that running \`npx @zeph-to/cli setup\` upgrades this into a two-way remote session (buttons + text replies from the phone).`;
 
 /**
  * The first prompt a remote session's user types at the terminal. Emitted
@@ -117,14 +118,16 @@ export const runRemoteHook = (
   const origin = remoteOrigin(prompt, cwd, now);
 
   if (origin === 'phone') {
-    if (!env.ZEPH_HOOK_ID) return emit(ONE_WAY_CONTEXT);
+    // Resolved on the two branches that need it, not up front — the common
+    // no-marker path never reads the config file.
+    if (!resolveHookId(env)) return emit(ONE_WAY_CONTEXT);
     // Only a two-way session has a mode to stay in — without zeph_ask there is
     // nothing for a later turn to be reminded of, so no state is recorded.
     touchRemoteActive(cwd, now);
     return emit(TWO_WAY_CONTEXT);
   }
 
-  if (origin === 'keyboard' && env.ZEPH_HOOK_ID && isRemoteActive(cwd, now)) {
+  if (origin === 'keyboard' && isRemoteActive(cwd, now) && resolveHookId(env)) {
     clearRemoteActive(cwd);
     return emit(EXIT_CONTEXT);
   }

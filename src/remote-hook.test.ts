@@ -1,10 +1,30 @@
-import { describe, expect, it, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { projectHash } from './gate.js';
 import { writeRemoteMarker } from './listener.js';
 import { isRemoteHookAgent, runRemoteHook } from './remote-hook.js';
+
+// config.ts binds ~/.zeph/config.json to $HOME at import time, so HOME moves
+// BEFORE the imports run (vi.hoisted) — the same real-$HOME seam cli.test.ts
+// uses, without a module mock. The dir is created/removed around the suite.
+const HOME = vi.hoisted(() => {
+    const saved = process.env.HOME;
+    process.env.HOME = `${process.env.TMPDIR || '/tmp'}/zeph-remote-hook-home-${process.pid}`;
+    return { dir: process.env.HOME, saved };
+});
+const CONFIG_FILE = `${HOME.dir}/.zeph/config.json`;
+/** ~/.zeph/config.json as `zeph setup` leaves it; no id = a notify-only install. */
+const writeConfig = (hookId?: string): void => {
+    mkdirSync(`${HOME.dir}/.zeph`, { recursive: true });
+    writeFileSync(CONFIG_FILE, JSON.stringify({ apiKey: 'k', ...(hookId ? { hookId } : {}) }));
+};
+afterAll(() => {
+    if (HOME.saved === undefined) delete process.env.HOME;
+    else process.env.HOME = HOME.saved;
+    rmSync(HOME.dir, { recursive: true, force: true });
+});
 
 /**
  * TS twin of plugin/tests/test-zeph-remote.sh — same scenarios, same
@@ -23,6 +43,7 @@ describe('runRemoteHook (ADR-0002, gemini/codex)', () => {
         stateHome = mkdtempSync(join(tmpdir(), 'zeph-remote-hook-'));
         savedXdg = process.env.XDG_STATE_HOME;
         process.env.XDG_STATE_HOME = stateHome;
+        rmSync(CONFIG_FILE, { force: true });
     });
 
     afterEach(() => {
@@ -73,6 +94,35 @@ describe('runRemoteHook (ADR-0002, gemini/codex)', () => {
         expect(ctx).toContain('npx @zeph-to/cli setup');
         expect(ctx).not.toContain('end EVERY response');
         expect(existsSync(markerPath(cwd))).toBe(false);
+    });
+
+    it('ZEPH_HOOK_ID unset but hookId in config.json → two-way, state recorded', () => {
+        const cwd = '/proj/config-only';
+        writeConfig('hook_cfg');
+        writeRemoteMarker(cwd, 'from the phone, config only', () => NOW);
+        const ctx = contextOf(runRemoteHook('gemini', stdin('from the phone, config only', cwd), ONE_WAY, () => NOW));
+        expect(ctx).toContain('end EVERY response');
+        expect(ctx).not.toContain('npx @zeph-to/cli setup');
+        expect(existsSync(statePath(cwd))).toBe(true);
+    });
+
+    it('unresolved ${ZEPH_HOOK_ID} placeholder → treated as unset (one-way when config has no id)', () => {
+        const cwd = '/proj/placeholder';
+        writeConfig();
+        writeRemoteMarker(cwd, 'placeholder in env', () => NOW);
+        const env = { ZEPH_HOOK_ID: '${ZEPH_HOOK_ID}' } as NodeJS.ProcessEnv;
+        const ctx = contextOf(runRemoteHook('gemini', stdin('placeholder in env', cwd), env, () => NOW));
+        expect(ctx).toContain('npx @zeph-to/cli setup');
+        expect(ctx).not.toContain('end EVERY response');
+    });
+
+    it('state alive, env unset, hookId in config.json → a terminal turn still ends REMOTE', () => {
+        const cwd = '/proj/sticky-config';
+        writeConfig('hook_cfg');
+        seedState(cwd);
+        const ctx = contextOf(runRemoteHook('gemini', stdin('typed at the terminal', cwd), ONE_WAY, () => NOW));
+        expect(ctx).toContain('LEFT sticky REMOTE mode');
+        expect(existsSync(statePath(cwd))).toBe(false);
     });
 
     it('text mismatch → silent, marker kept (terminal race cannot false-match)', () => {
