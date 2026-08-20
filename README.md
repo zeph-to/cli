@@ -296,11 +296,14 @@ Two details worth knowing:
 
 - It fires at **user login**, not at boot. Without automatic login, the
   machine stays silent while it sits on the login screen.
-- The plist bakes in absolute paths for node, the CLI, and a `PATH` that
-  can reach tmux. launchd gives a job `/usr/bin:/bin:/usr/sbin:/sbin` and
-  nothing else, so without that the daemon would exit 127 at every login.
-  If node moves (a version-manager upgrade, say), `zeph verify` says so —
-  re-run `--install-service` to repoint it.
+- The plist bakes in absolute paths for node and the CLI, a `PATH` that
+  can reach tmux, and a UTF-8 `LANG`. launchd gives a job
+  `/usr/bin:/bin:/usr/sbin:/sbin` and no locale at all: without the PATH
+  the daemon exits 127 at every login, and without the locale tmux
+  escapes the separator the session list is split on, so every session is
+  silently dropped while everything else looks healthy. If any of that
+  drifts — a version-manager node upgrade, say — `zeph verify` names it,
+  and re-running `--install-service` repoints the plist.
 
 With the service installed, launchd owns the process: `zeph cc` and
 `zeph listener --stop|--restart` ask launchd rather than signalling the

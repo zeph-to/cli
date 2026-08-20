@@ -18,6 +18,7 @@ const statusFor = (over: Partial<ServiceStatus> = {}): ServiceStatus => ({
     nodePath: '/usr/local/bin/node',
     cliPath: '/usr/local/lib/node_modules/@zeph-to/cli/dist/cli.js',
     pathEnv: '/opt/homebrew/bin:/usr/bin:/bin',
+    langEnv: 'en_US.UTF-8',
     missing: [],
     ...over,
 });
@@ -59,6 +60,13 @@ describe('serviceHealthChecks', () => {
     it('fails when the baked PATH cannot reach tmux', () => {
         const rows = serviceHealthChecks(statusFor(), { ...healthyProbe, tmuxOnPath: () => false });
         expect(rows.some((r) => r.state === 'fail' && /tmux/.test(r.label))).toBe(true);
+    });
+
+    // The silent killer: the daemon runs, tmux answers, and every session is
+    // discarded because the separator came back as `_`.
+    it('fails when the service locale is not UTF-8', () => {
+        const rows = serviceHealthChecks(statusFor({ langEnv: null }), healthyProbe);
+        expect(rows.some((r) => r.state === 'fail' && /UTF-8|locale/i.test(r.label))).toBe(true);
     });
 
     // Registered but not loaded: what `--stop` leaves behind until the next
