@@ -111,10 +111,11 @@ export const servicePlistPath = (): string =>
 
 export const serviceInstalled = (): boolean => existsSync(servicePlistPath());
 
-/** launchd domain target for this user's GUI session. */
-export const serviceTarget = (): string => `gui/${process.getuid?.() ?? 0}/${SERVICE_LABEL}`;
-
-export const serviceDomain = (): string => `gui/${process.getuid?.() ?? 0}`;
+/** This user's launchd GUI domain, and our job within it. Not exported: every
+ *  launchctl call lives in this file, and the label is an implementation
+ *  detail of that. */
+const serviceDomain = (): string => `gui/${process.getuid?.() ?? 0}`;
+const serviceTarget = (): string => `${serviceDomain()}/${SERVICE_LABEL}`;
 
 const nodeMajorOf = (path: string): number | null => {
     try {
@@ -292,6 +293,7 @@ export const serviceStatus = (): ServiceStatus => {
     try {
         xml = readFileSync(plistPath, 'utf-8');
     } catch {
+        // The plist is there but unreadable — installed, nothing knowable.
         return { ...base, ...NOT_INSTALLED, installed: true };
     }
     const [nodePath = null, cliPath = null] = readProgramArguments(xml);
@@ -430,6 +432,14 @@ export const uninstallService = async (deps: ServiceOpDeps = defaultServiceOpDep
     return { ok: true, notes };
 };
 
+/** One launchctl call reported as a ServiceOpResult, naming the subcommand in
+ *  the failure so the user sees which step launchd refused. */
+const askLaunchd = (deps: ServiceOpDeps, args: string[], note: string): ServiceOpResult => {
+    const result = deps.launchctl(args);
+    if (result.ok) return { ok: true, notes: [note] };
+    return { ok: false, reason: `launchctl ${args[0]} failed: ${result.stderr || 'no detail'}`, notes: [] };
+};
+
 /**
  * Stop the service until the next login.
  *
@@ -437,21 +447,13 @@ export const uninstallService = async (deps: ServiceOpDeps = defaultServiceOpDep
  * database, survives logins, and leaves no obvious way back — a `--stop` that
  * quietly becomes permanent. Session-scoped is what stopping should mean.
  */
-export const stopService = (deps: ServiceOpDeps = defaultServiceOpDeps): ServiceOpResult => {
-    const result = deps.launchctl(['bootout', serviceTarget()]);
-    if (!result.ok) return { ok: false, reason: `launchctl bootout failed: ${result.stderr || 'no detail'}`, notes: [] };
-    return { ok: true, notes: [`unloaded ${SERVICE_LABEL} — it comes back at the next login`] };
-};
+export const stopService = (deps: ServiceOpDeps = defaultServiceOpDeps): ServiceOpResult =>
+    askLaunchd(deps, ['bootout', serviceTarget()], `unloaded ${SERVICE_LABEL} — it comes back at the next login`);
 
 /** Restart the service in place. `-k` kills the running instance first, so this
  *  is also how a version-drifted daemon is replaced. */
-export const restartService = (deps: ServiceOpDeps = defaultServiceOpDeps): ServiceOpResult => {
-    const result = deps.launchctl(['kickstart', '-k', serviceTarget()]);
-    if (!result.ok) {
-        return { ok: false, reason: `launchctl kickstart failed: ${result.stderr || 'no detail'}`, notes: [] };
-    }
-    return { ok: true, notes: [`restarted ${SERVICE_LABEL}`] };
-};
+export const restartService = (deps: ServiceOpDeps = defaultServiceOpDeps): ServiceOpResult =>
+    askLaunchd(deps, ['kickstart', '-k', serviceTarget()], `restarted ${SERVICE_LABEL}`);
 
 // ─── Health ──────────────────────────────────────────────────────────
 

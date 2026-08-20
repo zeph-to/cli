@@ -183,7 +183,6 @@ export const spawnListenerDetached = (): boolean => {
     if (!cliPath) return false;
     try {
         mkdirSync(ZEPH_DIR, { recursive: true });
-        rotateListenerLogIfLarge();
         const out = openSync(LISTENER_LOG_FILE, 'a');
         const child = spawn(process.execPath, [cliPath, 'listener'], {
             detached: true,
