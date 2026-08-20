@@ -20,6 +20,7 @@ import {
     spawnListenerDetached,
     stopListener,
 } from './listener-process.js';
+import { restartService, serviceInstalled } from './listener-service.js';
 import type { RemoteAgent } from './remote-agents.js';
 
 const FALLBACK_NAME = 'project';
@@ -139,9 +140,28 @@ export const listenerVersionDrifted = (running: string | null, installed: string
  */
 export const ensureListenerRunning = async (): Promise<void> => {
     const pid = runningListenerPid();
+    const running = pid === null ? null : runningListenerVersion();
+    if (pid !== null && !listenerVersionDrifted(running, VERSION)) return;
+
+    // When the login-time service is installed, launchd owns this process.
+    // Stopping its child makes launchd start a replacement while we spawn our
+    // own, and the two race through the singleton guard in handleListener —
+    // whichever loses exits 0, and if that is launchd's child, KeepAlive
+    // either flaps it every ThrottleInterval or reads the clean exit as
+    // deliberate and gives up for the rest of the login session. Ask launchd
+    // to do it instead; `kickstart -k` replaces a drifted daemon in one step.
+    if (serviceInstalled()) {
+        const result = restartService();
+        if (!result.ok) {
+            console.error(`zeph: could not start the listener service — ${result.reason}`);
+            return;
+        }
+        if (pid === null) console.log(`zeph: listener started by launchd (log: ${LISTENER_LOG_FILE})`);
+        else console.log(`zeph: listener ${running ?? '(pre-1.26)'} is stale — launchd restarting on ${VERSION}`);
+        return;
+    }
+
     if (pid !== null) {
-        const running = runningListenerVersion();
-        if (!listenerVersionDrifted(running, VERSION)) return;
         console.log(`zeph: listener ${running ?? '(pre-1.26)'} is stale — restarting on ${VERSION}`);
         await stopListener(pid);
     }
