@@ -3,7 +3,7 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { detectAgents, hasCommand } from './agents.js';
 import { loadConfig, resolvedEnv, resolveHookId, VERSION } from './config.js';
-import { serviceHealthChecks, serviceStatus } from './listener-service.js';
+import { serviceHealthChecks, serviceStatus, type ServiceHealthRow } from './listener-service.js';
 import { ZephHook } from './zeph-hook.js';
 
 const HOME = homedir();
@@ -12,10 +12,9 @@ const pass = (msg: string) => console.log(`    ✓ ${msg}`);
 const warn = (msg: string) => console.log(`    ! ${msg}`);
 const failMsg = (msg: string) => console.log(`    ✗ ${msg}`);
 
-interface Check {
-    label: string;
-    state: 'pass' | 'warn' | 'fail';
-}
+// The service health rows already carry exactly this shape, and every check
+// here is recorded the same way — one declaration, not two kept in step by hand.
+type Check = ServiceHealthRow;
 
 /** Does a shared rule file contain the Zeph managed block? */
 const hasManagedBlock = (filePath: string): boolean => {
