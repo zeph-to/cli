@@ -102,6 +102,15 @@ ${usageAgentLines()}
                   --restart  stop it and relaunch in the background
                              (needed after an upgrade: 'npm i -g' swaps
                               the package but never the live process)
+                  --install-service
+                             start the listener at every login (macOS
+                             launchd). Without it the daemon only exists
+                             after a 'zeph cc', so a reboot leaves the
+                             phone picker empty until you open a terminal
+                  --uninstall-service
+                             remove the login-time service
+                  --service-status
+                             show what the installed service points at
 
 Notify options:
   --title <text>     Push title
