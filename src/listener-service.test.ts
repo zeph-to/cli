@@ -34,6 +34,7 @@ const envFor = (opts: {
     tmux?: string | null;
     cli?: string | null;
     nodeMajor?: (path: string) => number | null;
+    lang?: string | undefined;
 }) => {
     const present = new Set(opts.files);
     return {
@@ -41,6 +42,7 @@ const envFor = (opts: {
         nodeMajor: opts.nodeMajor ?? (() => 22),
         whichTmux: () => opts.tmux ?? null,
         cliPath: () => opts.cli ?? null,
+        lang: () => ('lang' in opts ? opts.lang : 'en_US.UTF-8'),
     };
 };
 
@@ -143,6 +145,7 @@ describe('renderLaunchAgentPlist', () => {
         tmuxPath: BREW_TMUX,
         logPath: '/Users/someone/.zeph/listener.log',
         pathEnv: '/opt/homebrew/bin:/Users/someone/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+        lang: 'en_US.UTF-8',
     };
 
     // The landmine this whole feature turns on: verifyTmux() exits 127 when
@@ -201,6 +204,7 @@ describe('serviceStatus', () => {
                 tmuxPath: BREW_TMUX,
                 logPath: join(m.home, '.zeph', 'listener.log'),
                 pathEnv: `${dirname(BREW_TMUX)}:/usr/bin`,
+                lang: 'en_US.UTF-8',
             }),
         );
         const status = m.serviceStatus();
@@ -226,9 +230,55 @@ describe('serviceStatus', () => {
                 tmuxPath: BREW_TMUX,
                 logPath: join(m.home, '.zeph', 'listener.log'),
                 pathEnv: '/usr/bin',
+                lang: 'en_US.UTF-8',
             }),
         );
         const status = m.serviceStatus();
         expect(status.missing).toEqual([goneNode]);
+    });
+});
+
+describe('resolveServiceSpec — locale', () => {
+    // launchd hands a job no LANG at all. tmux then runs in the C locale and
+    // mangles every non-ASCII byte in its format output to `_` — including the
+    // U+241F field separator the session inventory is split on. The daemon
+    // starts, tmux answers, and every session is dropped as unparseable: the
+    // phone shows nothing while everything looks healthy.
+    it('bakes the shell locale when it is UTF-8', async () => {
+        const m = await load();
+        const r = m.resolveServiceSpec(envFor({ files: [PREFIX_NODE, BREW_TMUX], cli: CLI, tmux: BREW_TMUX, lang: 'ko_KR.UTF-8' }));
+        expect(r.ok).toBe(true);
+        if (!r.ok) return;
+        expect(r.value.lang).toBe('ko_KR.UTF-8');
+    });
+
+    it('falls back to a UTF-8 locale when the shell has none', async () => {
+        const m = await load();
+        const r = m.resolveServiceSpec(envFor({ files: [PREFIX_NODE, BREW_TMUX], cli: CLI, tmux: BREW_TMUX, lang: undefined }));
+        expect(r.ok).toBe(true);
+        if (!r.ok) return;
+        expect(r.value.lang).toMatch(/UTF-8$/);
+    });
+
+    it('never carries a non-UTF-8 locale into the plist', async () => {
+        const m = await load();
+        const r = m.resolveServiceSpec(envFor({ files: [PREFIX_NODE, BREW_TMUX], cli: CLI, tmux: BREW_TMUX, lang: 'C' }));
+        expect(r.ok).toBe(true);
+        if (!r.ok) return;
+        expect(r.value.lang).toMatch(/UTF-8$/);
+    });
+
+    it('puts LANG in the plist environment', async () => {
+        const m = await load();
+        const xml = m.renderLaunchAgentPlist({
+            nodePath: PREFIX_NODE,
+            cliPath: CLI,
+            tmuxPath: BREW_TMUX,
+            logPath: '/tmp/l.log',
+            pathEnv: '/usr/bin',
+            lang: 'en_US.UTF-8',
+        });
+        expect(xml).toContain('<key>LANG</key>');
+        expect(xml).toContain('<string>en_US.UTF-8</string>');
     });
 });

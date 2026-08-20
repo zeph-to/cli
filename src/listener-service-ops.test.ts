@@ -23,6 +23,7 @@ const SPEC = {
     tmuxPath: '/opt/homebrew/bin/tmux',
     logPath: '/tmp/listener.log',
     pathEnv: '/opt/homebrew/bin:/usr/bin',
+    lang: 'en_US.UTF-8',
 };
 
 /**

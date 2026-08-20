@@ -41,6 +41,17 @@ const LAUNCHD_BASE_PATH = ['/usr/bin', '/bin', '/usr/sbin', '/sbin'];
 /** Interpreters to try when the CLI's own install prefix has none. */
 const NODE_FALLBACKS = ['/opt/homebrew/bin/node', '/usr/local/bin/node'];
 
+/**
+ * Locale to fall back on when the shell has none, or has a non-UTF-8 one.
+ *
+ * launchd hands a job no LANG at all. tmux then runs in the C locale and
+ * escapes every non-ASCII byte of its format output to `_` — including the
+ * U+241F separator the session inventory is split on. The daemon starts
+ * clean, tmux answers, and every session is discarded as unparseable: the
+ * phone shows nothing while `launchctl list` and the log both look healthy.
+ */
+const FALLBACK_LANG = 'en_US.UTF-8';
+
 /** tmux locations to try when the shell can't answer `command -v`. */
 const TMUX_FALLBACKS = ['/opt/homebrew/bin/tmux', '/usr/local/bin/tmux', '/usr/bin/tmux'];
 
@@ -55,6 +66,8 @@ export interface ServiceSpec {
     readonly logPath: string;
     /** PATH baked into the job: tmux dir, node dir, then launchd's own. */
     readonly pathEnv: string;
+    /** UTF-8 locale baked into the job. Always UTF-8 — see resolveServiceSpec. */
+    readonly lang: string;
 }
 
 export type SpecResolution =
@@ -70,6 +83,8 @@ export interface ServiceEnv {
     /** Absolute tmux path from the invoking shell's PATH, or null. */
     readonly whichTmux: () => string | null;
     readonly cliPath: () => string | null;
+    /** The invoking shell's LANG, or undefined when it has none. */
+    readonly lang: () => string | undefined;
 }
 
 export interface ServiceStatus {
@@ -81,6 +96,7 @@ export interface ServiceStatus {
     readonly nodePath: string | null;
     readonly cliPath: string | null;
     readonly pathEnv: string | null;
+    readonly langEnv: string | null;
     /** Programs the plist names that are no longer on disk. The shape a node
      *  upgrade leaves behind: registered, listed by launchctl, unable to run. */
     readonly missing: readonly string[];
@@ -129,6 +145,7 @@ export const defaultServiceEnv: ServiceEnv = {
     nodeMajor: nodeMajorOf,
     whichTmux: whichTmuxFromShell,
     cliPath: resolveCliPath,
+    lang: () => process.env.LANG,
 };
 
 /**
@@ -176,7 +193,9 @@ export const resolveServiceSpec = (env: ServiceEnv = defaultServiceEnv): SpecRes
     }
 
     const pathEnv = dedupe([dirname(tmuxPath), dirname(nodePath), ...LAUNCHD_BASE_PATH]).join(':');
-    const spec: ServiceSpec = { nodePath, cliPath, tmuxPath, logPath: LISTENER_LOG_FILE, pathEnv };
+    const shellLang = env.lang();
+    const lang = shellLang && /utf-?8$/i.test(shellLang) ? shellLang : FALLBACK_LANG;
+    const spec: ServiceSpec = { nodePath, cliPath, tmuxPath, logPath: LISTENER_LOG_FILE, pathEnv, lang };
 
     if (isVersionManaged(nodePath)) {
         return {
@@ -225,6 +244,8 @@ export const renderLaunchAgentPlist = (spec: ServiceSpec): string => {
     <dict>
         <key>PATH</key>
         ${s(spec.pathEnv)}
+        <key>LANG</key>
+        ${s(spec.lang)}
         <key>ZEPH_LISTENER_SERVICE</key>
         <string>1</string>
     </dict>
@@ -243,8 +264,8 @@ const readProgramArguments = (xml: string): string[] => {
     return [...block[1].matchAll(/<string>([\s\S]*?)<\/string>/g)].map((m) => unescapeXml(m[1]));
 };
 
-const readPathEnv = (xml: string): string | null => {
-    const found = /<key>PATH<\/key>\s*<string>([\s\S]*?)<\/string>/.exec(xml);
+const readEnvValue = (xml: string, key: string): string | null => {
+    const found = new RegExp(`<key>${key}</key>\\s*<string>([\\s\\S]*?)</string>`).exec(xml);
     return found ? unescapeXml(found[1]) : null;
 };
 
@@ -253,6 +274,7 @@ const NOT_INSTALLED = {
     nodePath: null,
     cliPath: null,
     pathEnv: null,
+    langEnv: null,
     missing: [] as readonly string[],
 } as const;
 
@@ -274,7 +296,15 @@ export const serviceStatus = (): ServiceStatus => {
     }
     const [nodePath = null, cliPath = null] = readProgramArguments(xml);
     const missing = [nodePath, cliPath].filter((p): p is string => !!p && !existsSync(p));
-    return { ...base, installed: true, nodePath, cliPath, pathEnv: readPathEnv(xml), missing };
+    return {
+        ...base,
+        installed: true,
+        nodePath,
+        cliPath,
+        pathEnv: readEnvValue(xml, 'PATH'),
+        langEnv: readEnvValue(xml, 'LANG'),
+        missing,
+    };
 };
 
 // ─── Service operations ──────────────────────────────────────────────
@@ -484,6 +514,19 @@ export const serviceHealthChecks = (
     } else {
         rows.push({
             label: 'tmux NOT on the service PATH — the daemon exits 127 at login. '
+                + 'Re-run: zeph listener --install-service',
+            state: 'fail',
+        });
+    }
+
+    // Without a UTF-8 LANG, tmux escapes the U+241F field separator to `_` and
+    // every session is dropped as unparseable — with nothing in the log that
+    // says so except a raw line the user has no reason to read as fatal.
+    if (status.langEnv && /utf-?8$/i.test(status.langEnv)) {
+        rows.push({ label: 'service locale is UTF-8', state: 'pass' });
+    } else {
+        rows.push({
+            label: 'service LANG is not UTF-8 — tmux mangles the session separator and every session is dropped. '
                 + 'Re-run: zeph listener --install-service',
             state: 'fail',
         });
