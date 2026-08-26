@@ -58,6 +58,7 @@ import {
     uninstallService,
 } from './listener-service.js';
 import { advanceState, evaluateState, findPatternMatch, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
+import { startInventoryOffload, type InventoryOffload } from './inventory-offload.js';
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
 import { decryptEphemeral, encryptEphemeral, getDevicePublicKey, initDeviceCrypto, type EncryptedEphemeralPayload } from './crypto.js';
 import { createInputSequencer, type InputSequencer, type SequencedInput } from './input-sequencer.js';
@@ -938,7 +939,7 @@ export const handleScreenRequest = (req: ScreenRequest): ScreenSnapshot | null =
     if (!checkRateLimit(`screen:${req.sessionName}`)) {
         return { ...base, error: 'rate_limited' };
     }
-    if (!collectSessions().some((s) => s.name === req.sessionName)) {
+    if (!isInventoried(req.sessionName)) {
         return { ...base, error: 'unknown_session' };
     }
     const captured = capturePane(req.sessionName);
@@ -1631,7 +1632,7 @@ export const handleScreenHistoryRequest = (
     const lines = Math.min(asked, SCREEN_HISTORY_MAX_LINES);
 
     if (!checkRateLimit(`screen:${req.sessionName}`)) return reply({ error: 'rate_limited' });
-    if (!collectSessions().some((s) => s.name === req.sessionName)) {
+    if (!isInventoried(req.sessionName)) {
         return reply({ error: 'unknown_session' });
     }
     const stream = activeStreams.get(req.sessionName);
@@ -2327,7 +2328,7 @@ export const handleStreamControl = (
     }
     const sessionName = req.sessionName;
     if (!sessionName) return true;
-    if (!collectSessions().some((s) => s.name === sessionName)) {
+    if (!isInventoried(sessionName)) {
         send(streamErrorFrame(sessionName, 'unknown_session'));
         return true;
     }
@@ -3050,7 +3051,36 @@ export const collectSessionsVerbose = (): CollectResult => {
  * something not registered in remote-agents.ts are filtered out — the
  * phone can't usefully address them.
  */
-export const collectSessions = (): AgentSession[] => collectSessionsVerbose().sessions;
+const collectSessions = (): AgentSession[] => collectSessionsVerbose().sessions;
+
+/** Names from the most recent inventory sweep; null until the first one lands —
+ *  a membership check in that window (the connect burst) still sweeps in-thread. */
+let inventorySnapshot: Set<string> | null = null;
+let inThreadSweepLogged = false;
+export const recordInventory = (sessions: ReadonlyArray<{ name: string }> | null): void => {
+    inventorySnapshot = sessions && new Set(sessions.map((s) => s.name));
+};
+/** The daemon's sweep runner, set for the lifetime of `handleListener`. Null
+ *  outside the daemon (tests, one-shot commands) — sweeps then run in-thread. */
+let inventoryOffload: InventoryOffload | null = null;
+
+/**
+ * Is this session in the inventory? Answered from the last sweep when it can
+ * be: a full sweep is two tmux spawns per session on this thread, and it used
+ * to run again on every stream start and screen request (12% of daemon wall
+ * time, measured 2026-08-26). A miss still sweeps, so a session
+ * younger than one poll interval is not refused, and the inventory filter stays
+ * the security boundary: only zeph-* panes running an agent are reachable.
+ */
+export const isInventoried = (sessionName: string): boolean => {
+    if (inventorySnapshot?.has(sessionName)) return true;
+    // Visible once, so a daemon that keeps sweeping in-thread can be seen doing it.
+    if (inventorySnapshot && !inThreadSweepLogged) {
+        inThreadSweepLogged = true;
+        log(`inventory miss for ${sessionName} — swept in-thread (logged once)`);
+    }
+    return collectSessions().some((s) => s.name === sessionName);
+};
 
 // ─── Push handling ──────────────────────────────────────────────────
 
@@ -3563,9 +3593,23 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
         let lastSentFingerprint: string | null = null;
         let lastSentAtMs = 0;
 
-        const reportSessions = (): void => {
+        let sweepInFlight = false;
+        const reportSessions = async (): Promise<void> => {
             if (sock.readyState !== WebSocket.OPEN) return;
-            const { sessions, rejected } = collectSessionsVerbose();
+            // One sweep at a time: a slow sweep must not stack a second behind it.
+            if (sweepInFlight) return;
+            sweepInFlight = true;
+            try {
+                const inventory = inventoryOffload ? await inventoryOffload.collect() : collectSessionsVerbose();
+                if (sock.readyState === WebSocket.OPEN) publishSessions(inventory);
+            } catch (err) {
+                log(`! session sweep failed, skipping this cycle: ${err instanceof Error ? err.message : String(err)}`);
+            } finally {
+                sweepInFlight = false;
+            }
+        };
+        const publishSessions = ({ sessions, rejected }: CollectResult): void => {
+            recordInventory(sessions);
             // Watch hits are one-shot events — they go out on every poll,
             // independent of the sessions-report gate below.
             // (§S5 v2): probe watched panes and report hits; the server
@@ -3634,8 +3678,8 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             log('connected');
             // Initial inventory so the phone's picker has something to
             // show as soon as the listener comes online.
-            reportSessions();
-            sessionsTimer = setInterval(reportSessions, SESSION_REPORT_INTERVAL_MS);
+            void reportSessions();
+            sessionsTimer = setInterval(() => void reportSessions(), SESSION_REPORT_INTERVAL_MS);
 
             pingTimer = setInterval(() => {
                 if (sock.readyState !== WebSocket.OPEN) return;
@@ -4028,6 +4072,7 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     process.on('SIGINT', () => stop('SIGINT'));
     process.on('SIGTERM', () => stop('SIGTERM'));
 
+    inventoryOffload = startInventoryOffload(collectSessionsVerbose, log);
     let attempt = 0;
     while (!shuttingDown) {
         activeHandle = streamSession(wsUrl, apiKey);
@@ -4036,6 +4081,7 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
 
         if (AUTH_FAILURE_CODES.has(result.closeCode ?? -1)) {
             console.error(`zeph listener: auth failure (${result.closeCode} ${result.reason}). Check API key.`);
+            inventoryOffload.close();
             removeListenerPid();
             return 3;
         }
@@ -4053,6 +4099,7 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
         attempt = Math.min(attempt + 1, 10);
     }
 
+    inventoryOffload.close();
     removeListenerPid();
     return 0;
 };
