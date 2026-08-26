@@ -29,7 +29,7 @@ vi.mock('child_process', async (importOriginal) => {
     };
 });
 
-const { handleStreamControl, stopAllStreams, computeListenerDeviceId, MAX_CONCURRENT_STREAMS, STREAM_LEASE_MS } =
+const { handleStreamControl, stopAllStreams, computeListenerDeviceId, MAX_CONCURRENT_STREAMS, STREAM_LEASE_MS, STREAM_RENEW_FRESH_MS } =
     await import('./listener.js');
 
 /**
@@ -186,6 +186,24 @@ describe('stream lease — a vanished subscriber must free its slot', () => {
         start('zeph-b', false);
         start('zeph-c', false);
         expect(start('zeph-d')).toEqual([]);
+    });
+
+    it('hands a ghost slot over after one missed renew beat, before the lease lapses', () => {
+        // Three terminals open; the user swipes zeph-c away — its WebView dies
+        // without a stop, but its lease is still live for STREAM_LEASE_MS.
+        start('zeph-a');
+        start('zeph-b');
+        start('zeph-c');
+        // One renew beat passes. The live viewers renew; the ghost cannot.
+        vi.advanceTimersByTime(STREAM_RENEW_FRESH_MS + 500);
+        renew('zeph-a');
+        renew('zeph-b');
+        expect(STREAM_RENEW_FRESH_MS).toBeLessThan(STREAM_LEASE_MS);
+        // The next open takes the ghost's slot NOW — not after the full lease.
+        expect(start('zeph-d')).toEqual([]);
+        // If zeph-c's viewer were actually alive, its next renew tells it to
+        // re-subscribe instead of leaving it painting under a LIVE badge.
+        expect(renew('zeph-c').sent[0]).toMatchObject({ error: 'stream_gone' });
     });
 
     it('still refuses when every holder is actively renewing', () => {
