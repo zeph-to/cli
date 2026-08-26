@@ -73,6 +73,13 @@ plist는 node·cli.js 절대경로와 **tmux가 잡히는 PATH**를 설치 시�
 `StandardOutPath` fd를 쥐고 있어 rename하면 같은 inode에 계속 쓴다.
 `listener-service.ts`는 **node 빌트인만** import한다 (wrapper 핫패스가 읽는다).
 
+### Inventory worker = listener.ts를 두 번째 스레드에서 import (`inventory-worker.ts`)
+5초 세션 스윕(`collectSessionsVerbose`)은 worker thread에서 돈다 — 동기 tmux spawn이
+메인 루프를 막아 소켓이 초 단위로 멈추던 것이 원인이었다. worker는 `listener.js` 모듈
+전체를 로드하므로 **listener.ts는 import 시점에 아무 일도 하지 않아야 한다**(모듈 스코프에
+소켓·타이머·spawn 금지). 스윕 결과의 세션 이름 스냅샷이 메인 스레드의 멤버십 판정
+(`isInventoried`)을 답하고, miss일 때만 in-thread 스윕으로 폴백한다.
+
 ### Agent key whitelist (3-site 동기)
 `ALLOWED_KEYS` (listener.ts, phone→pane 키 주입) is mirrored in two other repos'
 files that MUST change together, else a new key is rejected before it reaches the
