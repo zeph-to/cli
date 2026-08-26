@@ -1966,6 +1966,15 @@ const STREAM_MAX_MS = 5 * 60_000;
 // 15 seconds. A viewer that loses the race gets its stream reaped and re-
 // subscribes on the next renew (see the stream_gone reply below).
 export const STREAM_LEASE_MS = 15_000;
+// How recent a renew must be for a slot-holder to count as provably watched
+// when the cap needs a victim. Deliberately tighter than the lease: the lease
+// is the self-reap deadline and wants slack for dropped renews, but at the cap
+// that slack is exactly the window in which a swiped-away WebView's ghost
+// answers every new subscriber with stream_limit. One renew beat (the web's
+// 5s cadence) plus jitter is proof enough under contention; a live viewer
+// evicted over a single dropped renew learns via stream_gone on its next
+// renew and re-subscribes.
+export const STREAM_RENEW_FRESH_MS = 8_000;
 // Per-listener concurrency guard: the API Gateway WS stage throttle (50 rps)
 // is SHARED across every user, so a runaway machine (many sessions, or a
 // client re-subscribe bug) streaming at 2.5 fps each can starve push delivery
@@ -2015,6 +2024,9 @@ interface ActiveStream {
     expiresAt: number;
     /** Subscriber renews — i.e. its silence is proof it's gone, not just quiet. */
     renewing: boolean;
+    /** Last proof of watching (start or renew). Eviction freshness reads this;
+     *  the lease above stays the reaping deadline. */
+    renewedAt: number;
     /** Set when the subscriber handed over an E2EE key at start. Outbound
      *  frames are encrypted for it, so inbound plaintext input is refused
      *  rather than typed — the inbound half must not be the one leg in clear. */
@@ -2181,20 +2193,21 @@ export const isStreamCapReached = (activeCount: number): boolean =>
 
 /**
  * At the cap, hand the slot to the new subscriber when the stalest holder
- * can't prove it's still watching — an expired lease, or a client too old to
- * renew at all (those hold a slot for STREAM_MAX_MS on nothing but hope, and
- * a cached web build can keep producing them long after a deploy). Three
- * actively-renewing viewers are all real, so that case still refuses.
+ * can't prove it's still watching — a renew gone stale (STREAM_RENEW_FRESH_MS),
+ * an expired lease, or a client too old to renew at all (those hold a slot for
+ * STREAM_MAX_MS on nothing but hope, and a cached web build can keep producing
+ * them long after a deploy). Three actively-renewing viewers are all real, so
+ * that case still refuses.
  * Returns the evicted session name, or null when every holder is live.
  */
 const evictStalestStream = (now: number): string | null => {
     let victim: { name: string; expiresAt: number } | null = null;
     for (const [name, entry] of activeStreams) {
-        if (entry.renewing && entry.expiresAt > now) continue; // provably watched
+        if (entry.renewing && now - entry.renewedAt < STREAM_RENEW_FRESH_MS) continue; // provably watched
         if (!victim || entry.expiresAt < victim.expiresAt) victim = { name, expiresAt: entry.expiresAt };
     }
     if (!victim) return null;
-    log(`⧉ stream ${victim.name}: evicted — slot handed to a newer subscriber (no live lease)`);
+    log(`⧉ stream ${victim.name}: evicted — slot handed to a newer subscriber (no fresh renew)`);
     stopStream(victim.name);
     return victim.name;
 };
@@ -2285,7 +2298,8 @@ export const handleStreamControl = (
         if (!req.sessionName) return true;
         const entry = activeStreams.get(req.sessionName);
         if (entry) {
-            entry.expiresAt = Date.now() + leaseFor(entry.renewing);
+            entry.renewedAt = Date.now();
+            entry.expiresAt = entry.renewedAt + leaseFor(entry.renewing);
             // Answer it. The renew used to succeed in silence, which left the
             // viewer with no way to tell a healthy quiet stream from a dead
             // one: the capture loop drops unchanged frames, so an agent that
@@ -2524,6 +2538,7 @@ export const handleStreamControl = (
         inputDecryptFailures: 0,
         expiresAt: Date.now() + leaseFor(renewing),
         renewing,
+        renewedAt: Date.now(),
         subscriberPublicKey,
         wake,
     });
