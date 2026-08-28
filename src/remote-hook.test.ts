@@ -133,6 +133,21 @@ describe('runRemoteHook (ADR-0002, gemini/codex)', () => {
         expect(existsSync(statePath(cwd))).toBe(false);
     });
 
+    // Same reason as the preambles (see rules-sync.test.ts): the agents that run
+    // this hook read the renumbered CLI core, so a CORE_RULES number injected
+    // here names a rule their own file numbers differently.
+    it('injected context names rules, never numbers', () => {
+        const remote = '/proj/no-numbers-remote';
+        writeRemoteMarker(remote, 'from the phone', () => NOW);
+        const entry = contextOf(runRemoteHook('gemini', stdin('from the phone', remote), TWO_WAY, () => NOW));
+        const exited = '/proj/no-numbers-exit';
+        seedState(exited);
+        const exit = contextOf(runRemoteHook('gemini', stdin('typed at the terminal', exited), TWO_WAY, () => NOW));
+        for (const ctx of [entry, exit]) {
+            expect(ctx).not.toMatch(/\b[Rr]ules?\s+\d+/);
+        }
+    });
+
     it('text mismatch → silent, marker kept (terminal race cannot false-match)', () => {
         const cwd = '/proj/mismatch';
         writeRemoteMarker(cwd, 'the phone message', () => NOW);
@@ -153,7 +168,7 @@ describe('runRemoteHook (ADR-0002, gemini/codex)', () => {
         expect(existsSync(markerPath(cwd))).toBe(false);
     });
 
-    it('muted project → silent, marker left unconsumed (Rule 12)', () => {
+    it('muted project → silent, marker left unconsumed (mute rule)', () => {
         const cwd = '/proj/muted';
         writeRemoteMarker(cwd, 'while muted', () => NOW);
         writeFileSync(join(stateHome, 'zeph', `muted-${projectHash(cwd)!}`), '');
@@ -291,7 +306,7 @@ describe('runRemoteHook (ADR-0002, gemini/codex)', () => {
         expect(existsSync(statePath(cwd))).toBe(false);
     });
 
-    it('state alive but muted → silent (mute outranks, Rule 12)', () => {
+    it('state alive but muted → silent (mute outranks)', () => {
         const cwd = '/proj/sticky-muted';
         seedState(cwd);
         writeFileSync(join(stateHome, 'zeph', `muted-${projectHash(cwd)!}`), '');

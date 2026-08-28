@@ -5,7 +5,8 @@
 // generated core (src/zeph-core.generated.ts) plus a per-agent
 // notification preamble:
 //
-//   - Hook-driven agents (Cursor, Windsurf, Gemini, Codex, Copilot) have
+//   - Hook-driven agents (Cursor, Windsurf, Gemini, Codex, Copilot, Pi,
+//     OpenCode) have
 //     a Stop-equivalent hook installed that auto-pushes on completion, so
 //     they must NOT manually call zeph_notify for "done".
 //   - Rule-only agents (Cline, Aider) have no Stop hook, so they DO call
@@ -15,9 +16,9 @@
 // all of them — that is the whole point of the shared generated core.
 //
 // One more axis, and it decides who can enter REMOTE at all: the core's
-// Rules 3/4/10/11 are REMOTE-scoped, and REMOTE is entered by a prompt-submit
-// hook note (a phone message) or by a `zeph_ask` answer. Only Gemini and Codex
-// have that hook (remoteHookCmd below). Every other agent's only door is the
+// Rules 1/2/8/9 are REMOTE-scoped, and REMOTE is entered by a prompt-submit
+// hook note (a phone message) or by a `zeph_ask` answer. Only Gemini, Codex
+// and Pi have that hook (remoteHookCmd below). Every other agent's only door is the
 // ask itself — so for them the NORMAL branch must still send one after real
 // work, or the phone loop can never begin. That is REMOTE_ENTRY_NO_HOOK.
 //
@@ -87,7 +88,7 @@ operations (file reads, simple searches). Set priority "high" for
 errors/blockers.`;
 
 // REMOTE-entry preamble — agents with NO prompt-submit hook (Cursor, Windsurf,
-// Copilot, Cline, Aider). The shared core scopes Rules 3/4/10/11 to REMOTE
+// Copilot, Cline, Aider, OpenCode). The shared core scopes Rules 1/2/8/9 to REMOTE
 // and tells a NORMAL session it owes no `zeph_ask`. That is right where a
 // hook can announce the phone message that starts REMOTE; here nothing can,
 // and the only remaining entry is a `zeph_ask` answer that is not Done-like.
@@ -97,7 +98,7 @@ errors/blockers.`;
 // says about NORMAL still holds (no ask on trivial turns, questions may go
 // to the local picker, no `zeph_ask` just to mark a turn finished).
 //
-// This overrides the core's Rule 4 NORMAL clause for these agents. It is a
+// This overrides the core's Rule 2 NORMAL clause for these agents. It is a
 // per-agent preamble, not a fork of the core, for the reason the core's
 // header gives: the rule text must stay one thing.
 const REMOTE_ENTRY_NO_HOOK = `## Entering REMOTE without a prompt hook
@@ -105,14 +106,14 @@ const REMOTE_ENTRY_NO_HOOK = `## Entering REMOTE without a prompt hook
 This agent has no prompt-submit hook, so nothing can tell you when a
 message arrived from the user's phone. The ONLY way this session enters
 REMOTE is a \`zeph_ask\` answer that is not a Done-like button. So — and
-this overrides the "In NORMAL, end with nothing" clause of Rule 4 below —
+this overrides the "In NORMAL, end with nothing" clause below —
 **after substantial work in NORMAL, end the response with \`zeph_ask\`**:
 2–4 \`actions\` carrying the next-step candidates plus a Done-like
 \`fallback\`, \`timeout\` 300–600 s. "Substantial" = file changes, commits,
 builds, tests, deploys, destructive ops, milestone completions. Skip it on
 trivial turns (read-only exploration, a mid-step in an approved plan, a
-typo-sized fix). Once the answer reports \`zephState: "REMOTE"\`, Rule 9
-takes over.`;
+typo-sized fix). Once the answer reports \`zephState: "REMOTE"\`, sticky REMOTE
+mode takes over.`;
 
 // Tool-access preamble — pi only.
 const PI_TOOL_ACCESS = `## Zeph tools via the CLI (no MCP)
