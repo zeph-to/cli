@@ -131,47 +131,39 @@ const addAiderReadDirective = (confPath: string, conventionsPath: string): void 
 
 // ── Per-Agent Installers ─────────────────────────────────────────
 
-const injectMcpJson = (filePath: string): void => {
-  let data: Record<string, unknown> = {};
-  try {
-    data = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
-  } catch { /* new file */ }
-  if (!data.mcpServers) data.mcpServers = {};
-  // Pass through env explicitly so the MCP server doesn't have to rely on
-  // process-env inheritance (which behaves differently per IDE — Cursor and
-  // Windsurf spawn the MCP from a graphical context that may not inherit
-  // shell env). Mirrors plugin/.mcp.json.
-  (data.mcpServers as Record<string, unknown>).zeph = {
-    command: 'npx',
-    args: ['-y', '@zeph-to/mcp-server'],
-    env: { ZEPH_API_KEY: '${ZEPH_API_KEY}' },
-  };
-  mkdirSync(dirname(filePath), { recursive: true });
-  writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n');
+// Pass through env explicitly so the MCP server doesn't have to rely on
+// process-env inheritance (which behaves differently per IDE — Cursor and
+// Windsurf spawn the MCP from a graphical context that may not inherit
+// shell env). Mirrors plugin/.mcp.json.
+const MCP_SERVERS_ENTRY = {
+  command: 'npx',
+  args: ['-y', '@zeph-to/mcp-server'],
+  env: { ZEPH_API_KEY: '${ZEPH_API_KEY}' },
 };
 
 /**
- * opencode.json uses its own MCP schema — top-level `mcp` key (not
- * `mcpServers`), `command` as ARRAY (binary + args), `type: "local"`.
- * Deliberately not a generalization of injectMcpJson: single consumer,
- * every field differs. No `environment` — opencode is a terminal app that
- * inherits shell env, and the MCP server falls back to ~/.zeph/config.json
- * anyway (an unexpanded "${ZEPH_API_KEY}" literal would shadow that
- * fallback with junk). Exported for tests (sibling-preservation semantics).
+ * opencode.json's own MCP schema — top-level `mcp` key (not `mcpServers`),
+ * `command` as ARRAY (binary + args), `type: "local"`. No `environment` —
+ * opencode is a terminal app that inherits shell env, and the MCP server
+ * falls back to ~/.zeph/config.json anyway (an unexpanded "${ZEPH_API_KEY}"
+ * literal would shadow that fallback with junk). Exported for tests (shape pin).
  */
-export const injectOpencodeMcp = (filePath: string): void => {
+export const OPENCODE_MCP_ENTRY = {
+  type: 'local',
+  command: ['npx', '-y', '@zeph-to/mcp-server'],
+  enabled: true,
+};
+
+/** Add the zeph entry under `key` in an MCP registry JSON file, preserving
+ *  everything else in it. Exported for tests (merge semantics). */
+export const injectMcpEntry = (filePath: string, key: string, entry: Record<string, unknown>): void => {
   let data: Record<string, unknown> = {};
   try {
     data = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
   } catch { /* new file */ }
-  if (!isPlainObject(data.mcp)) data.mcp = {};
-  (data.mcp as Record<string, unknown>).zeph = {
-    type: 'local',
-    command: ['npx', '-y', '@zeph-to/mcp-server'],
-    enabled: true,
-  };
-  mkdirSync(dirname(filePath), { recursive: true });
-  writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n');
+  if (!isPlainObject(data[key])) data[key] = {};
+  (data[key] as Record<string, unknown>).zeph = entry;
+  writeFile(filePath, JSON.stringify(data, null, 2));
 };
 
 const installClaude = (): void => {
@@ -188,7 +180,7 @@ const installClaude = (): void => {
 
 const installCursor = (): void => {
   try {
-    injectMcpJson(join(HOME, '.cursor', 'mcp.json'));
+    injectMcpEntry(join(HOME, '.cursor', 'mcp.json'), 'mcpServers', MCP_SERVERS_ENTRY);
     ok('MCP server added');
   } catch {
     fail('MCP injection failed. Manual: add zeph to ~/.cursor/mcp.json');
@@ -209,7 +201,7 @@ const installCursor = (): void => {
 
 const installWindsurf = (): void => {
   try {
-    injectMcpJson(join(HOME, '.codeium', 'windsurf', 'mcp_config.json'));
+    injectMcpEntry(join(HOME, '.codeium', 'windsurf', 'mcp_config.json'), 'mcpServers', MCP_SERVERS_ENTRY);
     ok('MCP server added');
   } catch {
     fail('MCP injection failed. Manual: add zeph to windsurf mcp_config.json');
@@ -344,7 +336,7 @@ const installPi = (): void => {
 
 const installOpencode = (): void => {
   try {
-    injectOpencodeMcp(join(HOME, '.config', 'opencode', 'opencode.json'));
+    injectMcpEntry(join(HOME, '.config', 'opencode', 'opencode.json'), 'mcp', OPENCODE_MCP_ENTRY);
     ok('MCP server added');
   } catch {
     fail('MCP injection failed. Manual: add zeph to ~/.config/opencode/opencode.json');

@@ -26,8 +26,10 @@ const rmFile = (filePath: string, dry: boolean): string | null => {
     return `${verb(dry)} ${filePath}`;
 };
 
-/** Remove just the `zeph` entry from an mcpServers JSON file. */
-const rmMcpEntry = (filePath: string, dry: boolean): string | null => {
+/** Remove just the `zeph` entry from an MCP registry JSON file. `key` is the
+ *  container: `mcpServers` for Cursor/Windsurf, top-level `mcp` for
+ *  opencode.json (opencode's own schema). Exported for tests. */
+export const rmMcpEntry = (filePath: string, dry: boolean, key = 'mcpServers'): string | null => {
     if (!existsSync(filePath)) return null;
     let data: Record<string, unknown>;
     try {
@@ -35,26 +37,7 @@ const rmMcpEntry = (filePath: string, dry: boolean): string | null => {
     } catch {
         return null;
     }
-    const servers = data.mcpServers as Record<string, unknown> | undefined;
-    if (!servers || !('zeph' in servers)) return null;
-    if (!dry) {
-        delete servers.zeph;
-        writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n');
-    }
-    return `${verb(dry)} zeph from ${filePath}`;
-};
-
-/** Remove just the `zeph` entry from opencode.json's top-level `mcp` key
- *  (opencode's own schema — not `mcpServers`). Exported for tests. */
-export const rmOpencodeMcpEntry = (filePath: string, dry: boolean): string | null => {
-    if (!existsSync(filePath)) return null;
-    let data: Record<string, unknown>;
-    try {
-        data = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
-    } catch {
-        return null;
-    }
-    const servers = data.mcp as Record<string, unknown> | undefined;
+    const servers = data[key] as Record<string, unknown> | undefined;
     if (!servers || !('zeph' in servers)) return null;
     if (!dry) {
         delete servers.zeph;
@@ -228,7 +211,7 @@ const AGENT_UNINSTALLERS: Record<string, (dry: boolean) => void> = {
         () => stripManagedRule(join(HOME, '.pi', 'agent', 'AGENTS.md'), dry),
     ]),
     opencode: (dry) => runSteps([
-        () => rmOpencodeMcpEntry(join(HOME, '.config', 'opencode', 'opencode.json'), dry),
+        () => rmMcpEntry(join(HOME, '.config', 'opencode', 'opencode.json'), dry, 'mcp'),
         () => rmFile(join(HOME, '.config', 'opencode', 'plugins', 'zeph.ts'), dry),
         () => stripManagedRule(join(HOME, '.config', 'opencode', 'AGENTS.md'), dry),
     ]),

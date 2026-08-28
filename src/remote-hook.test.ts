@@ -79,14 +79,12 @@ describe('runRemoteHook (ADR-0002, gemini/codex)', () => {
         expect(existsSync(markerPath(cwd))).toBe(false);
     });
 
-    it('fresh marker + matching prompt → REMOTE context, echoes before_agent_start (pi)', () => {
+    it('pi echoes its own hookEventName', () => {
         const cwd = '/proj/pi-happy';
         writeRemoteMarker(cwd, 'fix the login bug', () => NOW);
         const out = runRemoteHook('pi', stdin('fix the login bug', cwd), TWO_WAY, () => NOW);
         const parsed = JSON.parse(out!) as { hookSpecificOutput: { hookEventName: string } };
         expect(parsed.hookSpecificOutput.hookEventName).toBe('before_agent_start');
-        expect(contextOf(out)).toContain('REMOTE mode');
-        expect(existsSync(markerPath(cwd))).toBe(false);
     });
 
     it('codex echoes its own hookEventName', () => {

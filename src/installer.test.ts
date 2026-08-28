@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // Tests for the agent installers. The injectMcpJson regression catalysed
 // the CLI hotfix branch — without the env field, Cursor/Windsurf MCP
@@ -244,16 +245,8 @@ describe('templates.ts: command graceful fallback works at runtime', () => {
 });
 
 describe('templates.ts: pi extension + opencode plugin artifacts', () => {
-    // These are TS source files, not *_HOOKS JSON configs, so the auto-collected
-    // quiet-default guard in templates.test.ts never sees them. The same
-    // invariant (NOTIFY_CMD with the pushmode default) is pinned here instead.
-    it('PI_EXTENSION carries the notify command with the quiet-default escape', async () => {
-        const { PI_EXTENSION } = await import('./templates.js');
-        const { PUSHMODE_DEFAULT_FLAG } = await import('./gate.js');
-        expect(PI_EXTENSION).toContain('command -v zeph');
-        expect(PI_EXTENSION).toContain(`--${PUSHMODE_DEFAULT_FLAG} normal`);
-    });
-
+    // Quiet-default and rule↔hook-registry parity are auto-collected in
+    // templates.test.ts; only the per-artifact facts live here.
     it('PI_EXTENSION wires both events: settle notify + remote detection', async () => {
         const { PI_EXTENSION } = await import('./templates.js');
         expect(PI_EXTENSION).toContain('agent_settled');
@@ -263,34 +256,32 @@ describe('templates.ts: pi extension + opencode plugin artifacts', () => {
 
     it('OPENCODE_PLUGIN filters the generic event hook for session.idle', async () => {
         const { OPENCODE_PLUGIN } = await import('./templates.js');
-        const { PUSHMODE_DEFAULT_FLAG } = await import('./gate.js');
         // The installed plugin API has no per-event keys — only the generic
         // `event` hook. A "session.idle" KEY would silently never fire.
         expect(OPENCODE_PLUGIN).toContain('"session.idle"');
         expect(OPENCODE_PLUGIN).not.toContain('"session.idle":');
-        expect(OPENCODE_PLUGIN).toContain('command -v zeph');
-        expect(OPENCODE_PLUGIN).toContain(`--${PUSHMODE_DEFAULT_FLAG} normal`);
     });
 
-    it('PI_RULE maps zeph tools to the CLI and skips the no-hook REMOTE preamble', async () => {
+    it('PI_RULE maps zeph tools only to CLI flags the CLI actually parses', async () => {
         const { PI_RULE } = await import('./templates.js');
-        expect(PI_RULE).toContain('zeph ask --title');
-        // pi HAS a prompt hook (the extension) — the no-hook entry preamble
-        // would wrongly re-impose end-with-ask in NORMAL.
-        expect(PI_RULE).not.toContain('Entering REMOTE without a prompt hook');
-    });
-
-    it('OPENCODE_RULE keeps the no-hook REMOTE entry preamble (no prompt hook in v1)', async () => {
-        const { OPENCODE_RULE } = await import('./templates.js');
-        expect(OPENCODE_RULE).toContain('Entering REMOTE without a prompt hook');
+        const section = PI_RULE.split('## Zeph tools via the CLI')[1]!.split('\n## ')[0]!;
+        const flags = [...new Set([...section.matchAll(/--([a-z][a-z-]*)/g)].map((m) => m[1]))];
+        expect(flags).toEqual(expect.arrayContaining(['title', 'actions', 'timeout']));
+        // pi has no MCP fallback — a flag renamed in the CLI would strand it
+        // silently, so pin every named flag to the CLI's own arg parsing.
+        const dir = dirname(fileURLToPath(import.meta.url));
+        const cliSrc = readFileSync(join(dir, 'ask.ts'), 'utf-8') + readFileSync(join(dir, 'cli.ts'), 'utf-8');
+        for (const flag of flags) {
+            expect(cliSrc, `--${flag} is not parsed by the CLI`).toContain(`args.${flag}`);
+        }
     });
 });
 
-describe('injectOpencodeMcp — opencode.json mcp schema', () => {
+describe('injectMcpEntry — opencode.json mcp schema', () => {
     it('writes mcp.zeph in opencode shape (array command, type local, enabled)', async () => {
         const file = join(TMP, '.config', 'opencode', 'opencode.json');
-        const { injectOpencodeMcp } = await import('./installer.js');
-        injectOpencodeMcp(file);
+        const { injectMcpEntry, OPENCODE_MCP_ENTRY } = await import('./installer.js');
+        injectMcpEntry(file, 'mcp', OPENCODE_MCP_ENTRY);
         const out = JSON.parse(readFileSync(file, 'utf-8'));
         expect(out.mcp.zeph).toEqual({
             type: 'local',
@@ -306,8 +297,8 @@ describe('injectOpencodeMcp — opencode.json mcp schema', () => {
             theme: 'dark',
             mcp: { 'codebase-memory-mcp': { type: 'local', command: ['/usr/local/bin/cbmem'] } },
         }));
-        const { injectOpencodeMcp } = await import('./installer.js');
-        injectOpencodeMcp(file);
+        const { injectMcpEntry, OPENCODE_MCP_ENTRY } = await import('./installer.js');
+        injectMcpEntry(file, 'mcp', OPENCODE_MCP_ENTRY);
         const out = JSON.parse(readFileSync(file, 'utf-8'));
         expect(out.theme).toBe('dark');
         expect(out.mcp['codebase-memory-mcp'].command).toEqual(['/usr/local/bin/cbmem']);
@@ -316,9 +307,9 @@ describe('injectOpencodeMcp — opencode.json mcp schema', () => {
 
     it('re-run is idempotent', async () => {
         const file = join(TMP, '.config', 'opencode', 'opencode.json');
-        const { injectOpencodeMcp } = await import('./installer.js');
-        injectOpencodeMcp(file);
-        injectOpencodeMcp(file);
+        const { injectMcpEntry, OPENCODE_MCP_ENTRY } = await import('./installer.js');
+        injectMcpEntry(file, 'mcp', OPENCODE_MCP_ENTRY);
+        injectMcpEntry(file, 'mcp', OPENCODE_MCP_ENTRY);
         const out = JSON.parse(readFileSync(file, 'utf-8'));
         expect(Object.keys(out.mcp)).toEqual(['zeph']);
     });
