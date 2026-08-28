@@ -64,10 +64,10 @@ describe('shouldReauth', () => {
     });
 });
 
-describe('templates.ts: NOTIFY_CMD shape', () => {
+describe('templates.ts: completion command shape', () => {
     it('uses graceful zeph || npx fallback', async () => {
         const tmpl = await import('./templates.js');
-        // CURSOR_HOOKS includes the NOTIFY_CMD inline
+        // CURSOR_HOOKS embeds the completion command inline
         expect(tmpl.CURSOR_HOOKS).toContain('command -v zeph');
         expect(tmpl.CURSOR_HOOKS).toContain('npx -y @zeph-to/cli');
     });
