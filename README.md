@@ -605,10 +605,17 @@ this order — first hit wins:
 It is now `quiet`, so upgrading turns the routine per-turn push off until
 you run `/zeph-normal`. Row 4 is why the hooks this CLI installs are
 unaffected: they name `normal` themselves, since a hook that supplies no
-turn counts also supplies no `high` marker, and `quiet` would make it
-permanently silent rather than merely quieter. Row 4 sits *below* the
-state files on purpose — the flag names a default, it does not override a
-dial the user set.
+`high` marker would be permanently silent under `quiet` rather than
+merely quieter. Row 4 sits *below* the state files on purpose — the flag
+names a default, it does not override a dial the user set.
+
+Under `normal` the JSON hook configs push on every turn, because they see
+no per-tool events and so pass no counts — the gate then assumes real
+work. The Pi extension and the OpenCode plugin do see those events, so
+they pass real `--tools` / `--nonreadonly` counts and go quiet where the
+others cannot: a turn with no tool calls, a turn with exactly one (a
+lone edit included — the gate wants two), and a turn whose calls were
+all reads. `/zeph-loud` still pushes on all of them.
 
 A dial file that exists but reads empty resolves to `normal`, not to row
 5: an empty file is a failed write, and resolving breakage to silence

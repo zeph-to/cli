@@ -13,7 +13,8 @@ import { handleAgentSession } from './wrapper.js';
 import { handleListener, computeListenerDeviceId } from './listener.js';
 import { detectProjectDir, loadConfig, resolvedEnv, VERSION } from './config.js';
 import {
-  autoPushMode, decidePush, GATE_DEFAULTS, isMuted, normalizeMarker, PUSHMODE_DEFAULT_FLAG,
+  autoPushMode, decidePush, GATE_DEFAULTS, isMuted, NONREADONLY_COUNT_FLAG, normalizeMarker,
+  PUSHMODE_DEFAULT_FLAG, TOOL_COUNT_FLAG,
 } from './gate.js';
 import { findAgentBySubcommand, REMOTE_AGENTS } from './remote-agents.js';
 import { isRemoteHookAgent, runRemoteHook } from './remote-hook.js';
@@ -295,8 +296,8 @@ const handleNotify = async (args: Record<string, string | boolean>): Promise<num
   // With no dial the mode falls back to --pushmode-default, then to quiet.
   if (args.auto === true) {
     const verdict = decidePush({
-      toolCount: gateCount(args.tools, GATE_DEFAULTS.toolCount),
-      nonReadonlyCount: gateCount(args.nonreadonly, GATE_DEFAULTS.nonReadonlyCount),
+      toolCount: gateCount(args[TOOL_COUNT_FLAG], GATE_DEFAULTS.toolCount),
+      nonReadonlyCount: gateCount(args[NONREADONLY_COUNT_FLAG], GATE_DEFAULTS.nonReadonlyCount),
       alreadyAsked: GATE_DEFAULTS.alreadyAsked,
       marker: normalizeMarker(typeof args.marker === 'string' ? args.marker : undefined),
       pushMode: autoPushMode(projectDir, args[PUSHMODE_DEFAULT_FLAG]),

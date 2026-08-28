@@ -262,6 +262,16 @@ export const PUSHMODE_DEFAULT: GatePushMode = 'quiet';
 export const PUSHMODE_DEFAULT_FLAG = 'pushmode-default';
 
 /**
+ * `notify` flags carrying the turn's tool counts. Only the drop-in artifacts
+ * (pi extension, opencode plugin) can supply them — they are the only installed
+ * hooks that see per-tool events. Shared for the same reason as the flag above:
+ * templates.ts writes them, cli.ts reads them, and a rename on one side alone
+ * would send `gateCount` back to GATE_DEFAULTS with nothing to show for it.
+ */
+export const TOOL_COUNT_FLAG = 'tools';
+export const NONREADONLY_COUNT_FLAG = 'nonreadonly';
+
+/**
  * The user's session push-mode dial (/zeph-quiet | /zeph-loud | /zeph-normal).
  *
  * Three failure shapes, three answers — "no dial" is the only one that gets
