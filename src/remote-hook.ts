@@ -11,7 +11,7 @@
  * record — same project (cksum of the cwd), fresh (≤15 min), and
  * byte-identical trimmed text — the hook emits additionalContext telling
  * the model the user is driving the session from their phone, which enters
- * sticky REMOTE mode (Rule 9).
+ * sticky REMOTE mode.
  *
  * Detection is exact: a terminal keystroke racing a phone message can
  * never false-match. Parity with the writer (listener.ts writeRemoteMarker)
@@ -64,7 +64,7 @@ const FRESH_WINDOW_SEC = 900;
 
 const TWO_WAY_CONTEXT = `# System note (Zeph remote-origin detect)
 
-This user message arrived from the user's phone via Zeph agent chat (verified by the listener — exact text match). The user is driving this session remotely and is NOT at the terminal. Enter sticky REMOTE mode now (CORE_RULES Rule 9): end EVERY response with \`zeph_ask\` (buttons + free-text) until the user exits — an exit signal (done/stop/exit), or a prompt they type at the terminal, which this hook will tell you about. Plain-text questions are invisible to them.`;
+This user message arrived from the user's phone via Zeph agent chat (verified by the listener — exact text match). The user is driving this session remotely and is NOT at the terminal. Enter sticky REMOTE mode now (the "Sticky REMOTE mode" rule in your Zeph rules): end EVERY response with \`zeph_ask\` (buttons + free-text) until the user exits — an exit signal (done/stop/exit), or a prompt they type at the terminal, which this hook will tell you about. Plain-text questions are invisible to them.`;
 
 const ONE_WAY_CONTEXT = `# System note (Zeph remote-origin detect)
 
@@ -78,7 +78,7 @@ This user message arrived from the user's phone via Zeph agent chat (verified by
  */
 const EXIT_CONTEXT = `# System note (Zeph)
 
-The user typed this prompt at the terminal, so this session has LEFT sticky REMOTE mode — answer normally (CORE_RULES Rule 4) and do not end this response with \`zeph_ask\` just to keep the loop alive. Rule 3 still holds: if you actually ask the user something, ask it with \`zeph_ask\`. Re-entry is automatic the moment they send another message from their phone.`;
+The user typed this prompt at the terminal, so this session has LEFT sticky REMOTE mode — answer normally (the NORMAL branch of your Zeph rules) and do not end this response with \`zeph_ask\` just to keep the loop alive. One rule still holds: if you actually ask the user something, ask it with \`zeph_ask\`. Re-entry is automatic the moment they send another message from their phone.`;
 
 export const isRemoteHookAgent = (raw: string): raw is RemoteHookAgent =>
   (REMOTE_HOOK_AGENTS as readonly string[]).includes(raw);
@@ -105,7 +105,7 @@ export const runRemoteHook = (
   // `cwd` keys every state file, so without it there is nothing to look up.
   if (!cwd) return null;
 
-  // Mute outranks everything (Rule 12) — stay silent and leave both the marker
+  // Mute outranks everything (the mute rule) — stay silent and leave both the marker
   // and the state untouched (the next inject overwrites the marker anyway).
   if (isMuted(cwd)) return null;
 
@@ -149,7 +149,7 @@ export const runRemoteHook = (
  *   is in flight (queued behind a long turn, or a digest the two sides compute
  *   differently). Reading that as "the user is back" would drop them out of
  *   REMOTE while they are still holding the phone, with no answerable push
- *   left — the quiet failure Rule 4 calls worse than light spam.
+ *   left — the quiet failure the core calls worse than light spam.
  *
  * A stale marker is deleted on sight and reads as `keyboard`; junk in the file
  * can never match anything, so it says nothing about who typed and reads the

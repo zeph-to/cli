@@ -34,8 +34,12 @@ const commandsOf = (config: unknown): string[] =>
 
 describe('templates.ts: completion hooks survive the quiet default', () => {
     it('every agent that installs hooks is covered here', () => {
-        // Five today (Cursor, Windsurf, Gemini, Codex, Copilot). The assertion
-        // is a floor, not a pin — a new agent must not shrink the table.
+        // Five today (Cursor, Windsurf, Gemini, Codex, Copilot) — every agent
+        // whose completion hook ships as a `*_HOOKS` config. Pi and OpenCode are
+        // hook-driven too but ship theirs as a dropped-in source file
+        // (PI_EXTENSION / OPENCODE_PLUGIN), which this table deliberately does
+        // not collect. The assertion is a floor, not a pin — a new agent must
+        // not shrink the table.
         expect(HOOK_CONFIGS.length).toBeGreaterThanOrEqual(5);
     });
 
