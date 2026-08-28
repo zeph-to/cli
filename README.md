@@ -141,12 +141,13 @@ an answerable `zeph_ask`).
 | Claude Code | `UserPromptSubmit` → plugin's `zeph-remote.sh` | Zeph plugin |
 | Gemini CLI | `BeforeAgent` → `zeph remote-hook gemini` | `zeph setup` |
 | Codex CLI | `UserPromptSubmit` → `zeph remote-hook codex` | `zeph setup` |
+| Pi | `before_agent_start` → `zeph remote-hook pi` (via extension) | `zeph setup` |
 | Cursor CLI | — none yet | — |
 
 Detection is exact-match: a terminal keystroke racing a phone message
 can never false-flag. Muted projects are never flagged.
 
-Agents without that hook (Cursor, Windsurf, Copilot, Cline, Aider) have one
+Agents without that hook (Cursor, Windsurf, Copilot, Cline, Aider, OpenCode) have one
 other way in: a `zeph_ask` answer that is not a Done-like button. Their rule
 files therefore keep the after-real-work `zeph_ask` — the "Entering REMOTE
 without a prompt hook" preamble in `src/templates.ts` — so the phone always
@@ -218,6 +219,8 @@ block here.
    zeph cursor    # cursor-agent → tmux session "zeph-<project>"
    zeph gemini    # gemini       → tmux session "zeph-<project>"
    zeph hermes    # hermes       → tmux session "zeph-<project>"
+   zeph pi        # pi           → tmux session "zeph-<project>"
+   zeph opencode  # opencode     → tmux session "zeph-<project>"
    ```
 
    `zeph cursor` runs **`cursor-agent`**, Cursor's terminal agent — a
@@ -712,6 +715,8 @@ try {
 | Copilot CLI | Session end hook + rules |
 | Cline | Rules file (`~/.cline/rules/zeph.md`) |
 | Aider | Conventions file + `read:` directive in `~/.aider.conf.yml` |
+| Pi | Extension (settle hook + remote detection) + rules — no MCP (pi has none; rules map zeph tools to the CLI) |
+| OpenCode | MCP server + idle-notify plugin + rules |
 
 For remote-control via `zeph listener` the per-agent setup is the same
 across CC/Codex/Gemini — the wrapper just spawns them in a named tmux

@@ -38,6 +38,8 @@ const AGENT_RULE_PRESENT: Record<string, () => boolean> = {
     copilot: () => existsSync(join(HOME, '.copilot', 'instructions', 'zeph.instructions.md')),
     cline: () => existsSync(join(HOME, '.cline', 'rules', 'zeph.md')),
     aider: () => existsSync(join(HOME, '.zeph', 'aider-conventions.md')),
+    pi: () => hasManagedBlock(join(HOME, '.pi', 'agent', 'AGENTS.md')),
+    opencode: () => hasManagedBlock(join(HOME, '.config', 'opencode', 'AGENTS.md')),
 };
 
 export const handleVerify = async (args: Record<string, string | boolean>): Promise<number> => {

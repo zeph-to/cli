@@ -252,3 +252,43 @@ describe('rmCodexHook — command-substring ownership (codex handlers have no na
         expect(JSON.parse(readFileSync(hooks, 'utf-8')).hooks).toHaveProperty('Stop');
     });
 });
+
+describe('rmOpencodeMcpEntry — opencode.json top-level mcp key', () => {
+    it('removes only mcp.zeph, keeps sibling entries and other top-level keys', async () => {
+        const file = write('.config/opencode/opencode.json', JSON.stringify({
+            theme: 'dark',
+            mcp: {
+                zeph: { type: 'local', command: ['npx', '-y', '@zeph-to/mcp-server'], enabled: true },
+                'codebase-memory-mcp': { type: 'local', command: ['/usr/local/bin/cbmem'] },
+            },
+        }));
+        const { rmOpencodeMcpEntry } = await import('./uninstall.js');
+        expect(rmOpencodeMcpEntry(file, false)).toBeTruthy();
+        const data = JSON.parse(readFileSync(file, 'utf-8'));
+        expect(data.mcp).not.toHaveProperty('zeph');
+        expect(data.mcp).toHaveProperty('codebase-memory-mcp');
+        expect(data.theme).toBe('dark');
+    });
+
+    it('null when no zeph entry (idempotent re-run)', async () => {
+        const original = JSON.stringify({ mcp: { other: { type: 'local', command: ['x'] } } });
+        const file = write('.config/opencode/opencode.json', original);
+        const { rmOpencodeMcpEntry } = await import('./uninstall.js');
+        expect(rmOpencodeMcpEntry(file, false)).toBeNull();
+        expect(readFileSync(file, 'utf-8')).toBe(original);
+    });
+
+    it('null when the file is absent', async () => {
+        const { rmOpencodeMcpEntry } = await import('./uninstall.js');
+        expect(rmOpencodeMcpEntry(join(TMP, 'nope.json'), false)).toBeNull();
+    });
+
+    it('dry-run reports but changes nothing', async () => {
+        const file = write('.config/opencode/opencode.json', JSON.stringify({
+            mcp: { zeph: { type: 'local', command: ['x'] } },
+        }));
+        const { rmOpencodeMcpEntry } = await import('./uninstall.js');
+        expect(rmOpencodeMcpEntry(file, true)).toBeTruthy();
+        expect(JSON.parse(readFileSync(file, 'utf-8')).mcp).toHaveProperty('zeph');
+    });
+});

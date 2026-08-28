@@ -18,6 +18,8 @@ import {
   COPILOT_HOOKS, COPILOT_RULE,
   CLINE_RULE,
   AIDER_RULE,
+  PI_RULE, PI_EXTENSION,
+  OPENCODE_RULE, OPENCODE_PLUGIN,
   isZephHookGroup,
   upsertManagedBlock,
 } from './templates.js';
@@ -143,6 +145,30 @@ const injectMcpJson = (filePath: string): void => {
     command: 'npx',
     args: ['-y', '@zeph-to/mcp-server'],
     env: { ZEPH_API_KEY: '${ZEPH_API_KEY}' },
+  };
+  mkdirSync(dirname(filePath), { recursive: true });
+  writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n');
+};
+
+/**
+ * opencode.json uses its own MCP schema — top-level `mcp` key (not
+ * `mcpServers`), `command` as ARRAY (binary + args), `type: "local"`.
+ * Deliberately not a generalization of injectMcpJson: single consumer,
+ * every field differs. No `environment` — opencode is a terminal app that
+ * inherits shell env, and the MCP server falls back to ~/.zeph/config.json
+ * anyway (an unexpanded "${ZEPH_API_KEY}" literal would shadow that
+ * fallback with junk). Exported for tests (sibling-preservation semantics).
+ */
+export const injectOpencodeMcp = (filePath: string): void => {
+  let data: Record<string, unknown> = {};
+  try {
+    data = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+  } catch { /* new file */ }
+  if (!isPlainObject(data.mcp)) data.mcp = {};
+  (data.mcp as Record<string, unknown>).zeph = {
+    type: 'local',
+    command: ['npx', '-y', '@zeph-to/mcp-server'],
+    enabled: true,
   };
   mkdirSync(dirname(filePath), { recursive: true });
   writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n');
@@ -297,6 +323,46 @@ const installAider = (): void => {
   }
 };
 
+const installPi = (): void => {
+  try {
+    // Drop-in auto-load; full-file overwrite is the idempotency model
+    // (the header comment is the ownership marker). No MCP — pi has none;
+    // PI_RULE maps the zeph_* tools to the CLI instead.
+    writeFile(join(HOME, '.pi', 'agent', 'extensions', 'zeph.ts'), PI_EXTENSION);
+    ok('Extension added (settle notify + remote detection)');
+  } catch {
+    fail('Extension install failed. Manual: save the zeph extension to ~/.pi/agent/extensions/zeph.ts');
+  }
+  try {
+    // Pi loads ~/.pi/agent/AGENTS.md as global context.
+    writeManagedRule(join(HOME, '.pi', 'agent', 'AGENTS.md'), PI_RULE);
+    ok('Rules added to AGENTS.md');
+  } catch {
+    fail('Rule install failed. Manual: add zeph rules to ~/.pi/agent/AGENTS.md');
+  }
+};
+
+const installOpencode = (): void => {
+  try {
+    injectOpencodeMcp(join(HOME, '.config', 'opencode', 'opencode.json'));
+    ok('MCP server added');
+  } catch {
+    fail('MCP injection failed. Manual: add zeph to ~/.config/opencode/opencode.json');
+  }
+  try {
+    writeFile(join(HOME, '.config', 'opencode', 'plugins', 'zeph.ts'), OPENCODE_PLUGIN);
+    ok('Idle-notify plugin added');
+  } catch {
+    fail('Plugin install failed. Manual: save the zeph plugin to ~/.config/opencode/plugins/zeph.ts');
+  }
+  try {
+    writeManagedRule(join(HOME, '.config', 'opencode', 'AGENTS.md'), OPENCODE_RULE);
+    ok('Rules added to AGENTS.md');
+  } catch {
+    fail('Rule install failed. Manual: add zeph rules to ~/.config/opencode/AGENTS.md');
+  }
+};
+
 const AGENT_INSTALLERS: Record<string, () => void> = {
   claude: installClaude,
   cursor: installCursor,
@@ -306,6 +372,8 @@ const AGENT_INSTALLERS: Record<string, () => void> = {
   copilot: installCopilot,
   cline: installCline,
   aider: installAider,
+  pi: installPi,
+  opencode: installOpencode,
 };
 
 // One-line summary of what each agent's installer does — shown in the
@@ -319,6 +387,8 @@ const AGENT_PLAN_LABELS: Record<string, string> = {
   copilot: 'Copilot CLI — hooks + rules',
   cline: 'Cline — rules',
   aider: 'Aider — conventions',
+  pi: 'Pi — extension + rules',
+  opencode: 'OpenCode — MCP + plugin + rules',
 };
 
 // ── Agent selection ──────────────────────────────────────────────

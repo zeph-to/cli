@@ -33,4 +33,6 @@ export const detectAgents = (): Agent[] => [
     { name: 'Copilot CLI', id: 'copilot', detected: existsSync(join(HOME, '.copilot')) },
     { name: 'Cline', id: 'cline', detected: existsSync(join(HOME, '.cline')) },
     { name: 'Aider', id: 'aider', detected: hasCommand('aider') },
+    { name: 'Pi', id: 'pi', detected: hasCommand('pi') || existsSync(join(HOME, '.pi')) },
+    { name: 'OpenCode', id: 'opencode', detected: hasCommand('opencode') || existsSync(join(HOME, '.config', 'opencode')) },
 ];

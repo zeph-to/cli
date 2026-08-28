@@ -243,6 +243,87 @@ describe('templates.ts: command graceful fallback works at runtime', () => {
     });
 });
 
+describe('templates.ts: pi extension + opencode plugin artifacts', () => {
+    // These are TS source files, not *_HOOKS JSON configs, so the auto-collected
+    // quiet-default guard in templates.test.ts never sees them. The same
+    // invariant (NOTIFY_CMD with the pushmode default) is pinned here instead.
+    it('PI_EXTENSION carries the notify command with the quiet-default escape', async () => {
+        const { PI_EXTENSION } = await import('./templates.js');
+        const { PUSHMODE_DEFAULT_FLAG } = await import('./gate.js');
+        expect(PI_EXTENSION).toContain('command -v zeph');
+        expect(PI_EXTENSION).toContain(`--${PUSHMODE_DEFAULT_FLAG} normal`);
+    });
+
+    it('PI_EXTENSION wires both events: settle notify + remote detection', async () => {
+        const { PI_EXTENSION } = await import('./templates.js');
+        expect(PI_EXTENSION).toContain('agent_settled');
+        expect(PI_EXTENSION).toContain('before_agent_start');
+        expect(PI_EXTENSION).toContain('remote-hook pi');
+    });
+
+    it('OPENCODE_PLUGIN filters the generic event hook for session.idle', async () => {
+        const { OPENCODE_PLUGIN } = await import('./templates.js');
+        const { PUSHMODE_DEFAULT_FLAG } = await import('./gate.js');
+        // The installed plugin API has no per-event keys — only the generic
+        // `event` hook. A "session.idle" KEY would silently never fire.
+        expect(OPENCODE_PLUGIN).toContain('"session.idle"');
+        expect(OPENCODE_PLUGIN).not.toContain('"session.idle":');
+        expect(OPENCODE_PLUGIN).toContain('command -v zeph');
+        expect(OPENCODE_PLUGIN).toContain(`--${PUSHMODE_DEFAULT_FLAG} normal`);
+    });
+
+    it('PI_RULE maps zeph tools to the CLI and skips the no-hook REMOTE preamble', async () => {
+        const { PI_RULE } = await import('./templates.js');
+        expect(PI_RULE).toContain('zeph ask --title');
+        // pi HAS a prompt hook (the extension) — the no-hook entry preamble
+        // would wrongly re-impose end-with-ask in NORMAL.
+        expect(PI_RULE).not.toContain('Entering REMOTE without a prompt hook');
+    });
+
+    it('OPENCODE_RULE keeps the no-hook REMOTE entry preamble (no prompt hook in v1)', async () => {
+        const { OPENCODE_RULE } = await import('./templates.js');
+        expect(OPENCODE_RULE).toContain('Entering REMOTE without a prompt hook');
+    });
+});
+
+describe('injectOpencodeMcp — opencode.json mcp schema', () => {
+    it('writes mcp.zeph in opencode shape (array command, type local, enabled)', async () => {
+        const file = join(TMP, '.config', 'opencode', 'opencode.json');
+        const { injectOpencodeMcp } = await import('./installer.js');
+        injectOpencodeMcp(file);
+        const out = JSON.parse(readFileSync(file, 'utf-8'));
+        expect(out.mcp.zeph).toEqual({
+            type: 'local',
+            command: ['npx', '-y', '@zeph-to/mcp-server'],
+            enabled: true,
+        });
+    });
+
+    it('preserves sibling mcp entries and top-level keys', async () => {
+        const file = join(TMP, '.config', 'opencode', 'opencode.json');
+        mkdirSync(join(TMP, '.config', 'opencode'), { recursive: true });
+        writeFileSync(file, JSON.stringify({
+            theme: 'dark',
+            mcp: { 'codebase-memory-mcp': { type: 'local', command: ['/usr/local/bin/cbmem'] } },
+        }));
+        const { injectOpencodeMcp } = await import('./installer.js');
+        injectOpencodeMcp(file);
+        const out = JSON.parse(readFileSync(file, 'utf-8'));
+        expect(out.theme).toBe('dark');
+        expect(out.mcp['codebase-memory-mcp'].command).toEqual(['/usr/local/bin/cbmem']);
+        expect(out.mcp).toHaveProperty('zeph');
+    });
+
+    it('re-run is idempotent', async () => {
+        const file = join(TMP, '.config', 'opencode', 'opencode.json');
+        const { injectOpencodeMcp } = await import('./installer.js');
+        injectOpencodeMcp(file);
+        injectOpencodeMcp(file);
+        const out = JSON.parse(readFileSync(file, 'utf-8'));
+        expect(Object.keys(out.mcp)).toEqual(['zeph']);
+    });
+});
+
 // Sanity touchpoint — make sure the import surface compiles
 describe('public API surface', () => {
     it('exports ZephHook + error classes', async () => {

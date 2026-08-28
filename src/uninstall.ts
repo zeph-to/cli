@@ -44,6 +44,25 @@ const rmMcpEntry = (filePath: string, dry: boolean): string | null => {
     return `${verb(dry)} zeph from ${filePath}`;
 };
 
+/** Remove just the `zeph` entry from opencode.json's top-level `mcp` key
+ *  (opencode's own schema — not `mcpServers`). Exported for tests. */
+export const rmOpencodeMcpEntry = (filePath: string, dry: boolean): string | null => {
+    if (!existsSync(filePath)) return null;
+    let data: Record<string, unknown>;
+    try {
+        data = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+    } catch {
+        return null;
+    }
+    const servers = data.mcp as Record<string, unknown> | undefined;
+    if (!servers || !('zeph' in servers)) return null;
+    if (!dry) {
+        delete servers.zeph;
+        writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n');
+    }
+    return `${verb(dry)} zeph from ${filePath}`;
+};
+
 /** Strip the <!-- ZEPH:START/END --> block from a shared rule file. */
 const stripManagedRule = (filePath: string, dry: boolean): string | null => {
     if (!existsSync(filePath)) return null;
@@ -203,6 +222,15 @@ const AGENT_UNINSTALLERS: Record<string, (dry: boolean) => void> = {
     aider: (dry) => runSteps([
         () => rmFile(join(HOME, '.zeph', 'aider-conventions.md'), dry),
         () => rmAiderReadDirective(join(HOME, '.aider.conf.yml'), dry),
+    ]),
+    pi: (dry) => runSteps([
+        () => rmFile(join(HOME, '.pi', 'agent', 'extensions', 'zeph.ts'), dry),
+        () => stripManagedRule(join(HOME, '.pi', 'agent', 'AGENTS.md'), dry),
+    ]),
+    opencode: (dry) => runSteps([
+        () => rmOpencodeMcpEntry(join(HOME, '.config', 'opencode', 'opencode.json'), dry),
+        () => rmFile(join(HOME, '.config', 'opencode', 'plugins', 'zeph.ts'), dry),
+        () => stripManagedRule(join(HOME, '.config', 'opencode', 'AGENTS.md'), dry),
     ]),
 };
 

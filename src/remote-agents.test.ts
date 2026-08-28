@@ -87,6 +87,8 @@ describe('remote-agents.ts: lookups', () => {
         expect(findAgentBySubcommand('codex')?.kind).toBe('codex');
         expect(findAgentBySubcommand('gemini')?.kind).toBe('gemini');
         expect(findAgentBySubcommand('hermes')?.kind).toBe('hermes');
+        expect(findAgentBySubcommand('pi')?.kind).toBe('pi');
+        expect(findAgentBySubcommand('opencode')?.kind).toBe('opencode');
     });
 
     it('cursor launches the terminal TUI, never the IDE launcher', () => {
@@ -102,6 +104,8 @@ describe('remote-agents.ts: lookups', () => {
         // opening the editor, and adopting it would address a dead session.
         expect(matchAgentByPaneCommand('cursor')).toBeUndefined();
         expect(matchAgentByPaneCommand('hermes')?.kind).toBe('hermes');
+        expect(matchAgentByPaneCommand('pi')?.kind).toBe('pi');
+        expect(matchAgentByPaneCommand('opencode')?.kind).toBe('opencode');
         expect(matchAgentByPaneCommand('bash')).toBeUndefined();
         expect(matchAgentByPaneCommand('node')).toBeUndefined();
         expect(matchAgentByPaneCommand('')).toBeUndefined();
