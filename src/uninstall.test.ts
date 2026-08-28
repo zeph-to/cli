@@ -252,3 +252,23 @@ describe('rmCodexHook — command-substring ownership (codex handlers have no na
         expect(JSON.parse(readFileSync(hooks, 'utf-8')).hooks).toHaveProperty('Stop');
     });
 });
+
+describe('rmMcpEntry with a custom container key (opencode.json)', () => {
+    // Shared-body semantics (absent file, bad JSON, dry-run, idempotency) are
+    // covered through handleUninstall above; the new fact is the `mcp` routing.
+    it('removes only mcp.zeph, keeps sibling entries and other top-level keys', async () => {
+        const file = write('.config/opencode/opencode.json', JSON.stringify({
+            theme: 'dark',
+            mcp: {
+                zeph: { type: 'local', command: ['npx', '-y', '@zeph-to/mcp-server'], enabled: true },
+                'codebase-memory-mcp': { type: 'local', command: ['/usr/local/bin/cbmem'] },
+            },
+        }));
+        const { rmMcpEntry } = await import('./uninstall.js');
+        expect(rmMcpEntry(file, false, 'mcp')).toBeTruthy();
+        const data = JSON.parse(readFileSync(file, 'utf-8'));
+        expect(data.mcp).not.toHaveProperty('zeph');
+        expect(data.mcp).toHaveProperty('codebase-memory-mcp');
+        expect(data.theme).toBe('dark');
+    });
+});

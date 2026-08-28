@@ -13,6 +13,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { PUSHMODE_DEFAULT_FLAG } from './gate.js';
+import { REMOTE_HOOK_AGENTS } from './remote-hook.js';
 import * as templates from './templates.js';
 
 // Derived from the module, not hand-listed: a sixth agent added to
@@ -47,6 +48,48 @@ describe('templates.ts: completion hooks survive the quiet default', () => {
             for (const command of notifyCommands) {
                 expect(command).toContain(`--${PUSHMODE_DEFAULT_FLAG} normal`);
             }
+        });
+    }
+});
+
+// Drop-in TS source artifacts (pi extension, opencode plugin) embed the same
+// NOTIFY_CMD but are not JSON — same quiet-default guard, at the string level.
+// Derived from the module like HOOK_CONFIGS: a new drop-in joins by itself.
+const ARTIFACT_SOURCES = Object.entries(templates)
+    .filter(([name]) => /_(EXTENSION|PLUGIN)$/.test(name)) as [string, string][];
+
+describe('templates.ts: drop-in artifacts survive the quiet default', () => {
+    it('every drop-in artifact is covered here', () => {
+        // Two today (pi extension, opencode plugin) — a floor, not a pin.
+        expect(ARTIFACT_SOURCES.length).toBeGreaterThanOrEqual(2);
+    });
+
+    for (const [name, source] of ARTIFACT_SOURCES) {
+        it(`${name} embeds the gated notify with a push-mode default`, () => {
+            expect(source).toContain('command -v zeph');
+            expect(source).toContain(`--${PUSHMODE_DEFAULT_FLAG} normal`);
+        });
+    }
+});
+
+// "No-hook REMOTE entry preamble ⟺ agent lacks a prompt hook" spans two files
+// (rules here, registry in remote-hook.ts) — this is the only thing tying them.
+// An agent that gains a prompt hook but keeps the preamble would end every
+// NORMAL turn with zeph_ask, duplicating what its hook already does.
+describe('templates.ts: rules agree with the remote-hook registry', () => {
+    const RULES = Object.entries(templates).filter(([name]) => name.endsWith('_RULE')) as [string, string][];
+    const NO_HOOK_MARKER = 'Entering REMOTE without a prompt hook';
+
+    it('collects every rule', () => {
+        expect(RULES.length).toBeGreaterThanOrEqual(9);
+    });
+
+    for (const [name, rule] of RULES) {
+        const id = name.replace(/_RULE$/, '').toLowerCase();
+        const hasPromptHook = (REMOTE_HOOK_AGENTS as readonly string[]).includes(id);
+        it(`${name} ${hasPromptHook ? 'omits' : 'carries'} the no-hook REMOTE entry preamble`, () => {
+            if (hasPromptHook) expect(rule).not.toContain(NO_HOOK_MARKER);
+            else expect(rule).toContain(NO_HOOK_MARKER);
         });
     }
 });

@@ -1,7 +1,8 @@
 /**
  * `zeph remote-hook <agent>` — prompt-submit hook handler for agents whose
- * hooks the cli installs directly: Gemini CLI (BeforeAgent) and Codex CLI
- * (UserPromptSubmit). TS twin of the Claude Code plugin's
+ * hooks the cli installs directly: Gemini CLI (BeforeAgent), Codex CLI
+ * (UserPromptSubmit), and Pi (before_agent_start, consumed by the zeph
+ * extension itself). TS twin of the Claude Code plugin's
  * hooks/zeph-remote.sh (ADR-0002).
  *
  * The listener records every phone→pane text injection as a one-shot
@@ -41,7 +42,7 @@ import {
 
 /** Agents whose prompt-submit hooks this command serves. Claude Code is
  *  NOT here — its hook ships with the plugin (hooks/zeph-remote.sh). */
-export const REMOTE_HOOK_AGENTS = ['gemini', 'codex'] as const;
+export const REMOTE_HOOK_AGENTS = ['gemini', 'codex', 'pi'] as const;
 export type RemoteHookAgent = (typeof REMOTE_HOOK_AGENTS)[number];
 
 /** Per-agent hookEventName echoed back in hookSpecificOutput — each CLI
@@ -49,6 +50,7 @@ export type RemoteHookAgent = (typeof REMOTE_HOOK_AGENTS)[number];
 const HOOK_EVENT_NAME: Record<RemoteHookAgent, string> = {
   gemini: 'BeforeAgent',
   codex: 'UserPromptSubmit',
+  pi: 'before_agent_start',
 };
 
 /**

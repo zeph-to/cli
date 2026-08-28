@@ -625,6 +625,18 @@ const REMOTE_AGENT_TABLE = [
         // `<timestamp>_<hash>` string, and nothing on the wire consumes it yet.
         resolveSessionName: detectHermesSessionName,
     },
+    {
+        kind: 'pi',
+        displayName: 'Pi',
+        binary: 'pi',
+        subcommands: ['pi'],
+    },
+    {
+        kind: 'opencode',
+        displayName: 'OpenCode',
+        binary: 'opencode',
+        subcommands: ['opencode'],
+    },
 ] as const satisfies readonly RemoteAgent[];
 
 /** Closed union of remote-controllable agent kinds, derived from the table above. */
