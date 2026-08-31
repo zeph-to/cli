@@ -3065,6 +3065,61 @@ export const recordInventory = (sessions: ReadonlyArray<{ name: string }> | null
 let inventoryOffload: InventoryOffload | null = null;
 
 /**
+ * Mirror each session's provider name onto the tmux session itself, as the
+ * user option `@zeph_agent_name`.
+ *
+ * Why: the phone shows what the agent calls this session (`zeph-to-d0`) while
+ * the user's own status bar shows the tmux name (`zeph-zeph-to-3`), and the
+ * two never agree. The phone's render precedence is already decided
+ * (`alias ?? "<providerSessionName> · <Agent>" ?? computed label`, see the
+ * `agentSessionAliases` comment in zeph `libs/shared/src/types/device.ts`);
+ * this puts the same middle tier where a tmux config can read it:
+ *
+ *     #{?@zeph_agent_name,#{@zeph_agent_name},#S}
+ *
+ * A tmux option rather than a `#()` in the status line on purpose. The status
+ * line re-renders per attached client on every status-interval, so a shell
+ * there would walk a process tree several times a second across every session;
+ * an option is written only when the name actually changes and costs the
+ * renderer nothing.
+ *
+ * The tmux name is NOT renamed and must not be: it is the addressing key the
+ * phone injects against, it has to exist before the agent it names does, and
+ * the agent's own name rotates on resume. Display and address stay separate —
+ * this only makes the display agree with the phone.
+ *
+ * Keyed by name AND `createdAt`, mirroring the alias anchor in zeph
+ * `apps/server/src/lib/agent-session-alias.ts`: a tmux name is a slot, so the
+ * cache must not let a new occupant inherit the previous one's write. tmux
+ * drops session options with the session, so this is the belt to that braces —
+ * what it actually prevents is the *skip*, where an unchanged key would leave
+ * the new session with no write at all.
+ */
+const publishedTmuxNames = new Map<string, string>();
+
+export const syncTmuxAgentNames = (sessions: ReadonlyArray<AgentSession>): void => {
+    const liveKeys = new Set<string>();
+    for (const s of sessions) {
+        const key = `${s.name}\u241f${s.createdAt ?? ''}`;
+        liveKeys.add(key);
+        const value = s.providerSessionName ?? '';
+        if (publishedTmuxNames.get(key) === value) continue;
+        // No name to show → unset, so the format falls through to `#S` and no
+        // stale value is left on a session whose agent stopped reporting one.
+        const args = value
+            ? ['set-option', '-t', s.name, '@zeph_agent_name', value]
+            : ['set-option', '-u', '-t', s.name, '@zeph_agent_name'];
+        const r = spawnSync('tmux', tmuxArgs(args), { stdio: ['ignore', 'ignore', 'ignore'] });
+        // Only remember a write that landed; a failed one must be retried next
+        // sweep rather than cached as done.
+        if (r.status === 0) publishedTmuxNames.set(key, value);
+    }
+    for (const key of [...publishedTmuxNames.keys()]) {
+        if (!liveKeys.has(key)) publishedTmuxNames.delete(key);
+    }
+};
+
+/**
  * Is this session in the inventory? Answered from the last sweep when it can
  * be: a full sweep is two tmux spawns per session on this thread, and it used
  * to run again on every stream start and screen request (12% of daemon wall
@@ -3610,6 +3665,9 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
         };
         const publishSessions = ({ sessions, rejected }: CollectResult): void => {
             recordInventory(sessions);
+            // Let the user's own status bar say what the phone says. Change-gated
+            // internally, so an unchanged sweep spawns nothing.
+            syncTmuxAgentNames(sessions);
             // Watch hits are one-shot events — they go out on every poll,
             // independent of the sessions-report gate below.
             // (§S5 v2): probe watched panes and report hits; the server
