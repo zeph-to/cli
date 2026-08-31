@@ -92,10 +92,11 @@ Commands:
                   (run inside a zeph cc session; --clear resets it)
   test            Send a test notification to verify setup
 ${usageAgentLines()}
-                  (auto-suffixed -2/-3/… when another zeph cc is already
-                   attached to the default name; any args after the
-                   subcommand are forwarded verbatim, e.g.
-                   'zeph cc --resume')
+                  (reattaches a detached session of that project when
+                   there is one, newest suffix first; auto-suffixes
+                   -2/-3/… only when every existing one has a client
+                   attached. Any args after the subcommand are forwarded
+                   verbatim, e.g. 'zeph cc --resume')
   listener        Resident daemon — receives 'agent.command' pushes from
                   the phone picker and injects them into the matching
                   tmux session.

@@ -47,36 +47,68 @@ export const detectProjectName = (): string => {
 /** `zeph-<project>` — the canonical tmux session base name. */
 export const tmuxSessionName = (project: string): string => `zeph-${project}`;
 
+/**
+ * Every live tmux session as `name → attached`, in one spawn.
+ *
+ * `tmux list-sessions` exits non-zero when no server is running; that is the
+ * ordinary "first `zeph cc` after a reboot" case, not an error, and it means
+ * an empty family.
+ *
+ * The format puts the 0/1 flag first so the name — which carries whatever the
+ * project directory was called, spaces included — is everything after the
+ * first space and needs no quoting.
+ */
+const liveSessions = (): Map<string, boolean> => {
+    const r = spawnSync('tmux', ['list-sessions', '-F', '#{session_attached} #{session_name}'], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const out = new Map<string, boolean>();
+    if (r.status !== 0) return out;
+    for (const line of (r.stdout ?? '').split('\n')) {
+        const sep = line.indexOf(' ');
+        if (sep < 0) continue;
+        out.set(line.slice(sep + 1), line.slice(0, sep) === '1');
+    }
+    return out;
+};
+
 const MAX_SUFFIX_ATTEMPTS = 20;
+
+/** `<base>`, `<base>-2`, `<base>-3`, … — the session family for one project. */
+const familyNames = (base: string): string[] =>
+    Array.from({ length: MAX_SUFFIX_ATTEMPTS }, (_, i) => (i === 0 ? base : `${base}-${i + 1}`));
 
 /**
  * Pick a tmux session name that won't steal focus from another live
  * `zeph cc`. Strategy:
- *   - If `<base>` doesn't exist → use it (create new).
- *   - If `<base>` exists but is detached → use it (reattach).
- *   - If `<base>` exists *and* has a client attached → try `<base>-2`,
- *     `<base>-3`, … so the new `zeph cc` gets an independent session
- *     instead of joining the existing one.
- * Falls back to `<base>` after 20 attempts (shouldn't realistically hit).
+ *   - Reuse the **highest-numbered detached** session in the family.
+ *   - Otherwise take the lowest name that doesn't exist yet (create new),
+ *     so an all-attached family gets an independent `<base>-N`.
  *
- * Detection uses `tmux has-session` and `tmux list-clients`; both are
- * dependency-free against the user's running tmux server.
+ * Highest-detached rather than lowest is what keeps the family reachable.
+ * The old scan walked the family in order and returned the first session that
+ * was missing *or* detached, which meant a detached `<base>` ended the scan
+ * every time: `<base>-2` could not be reached by any later `zeph cc`, not even
+ * after `<base>` was used and exited (a missing `<base>` is taken fresh). A
+ * session nobody can reach still holds a live agent — a Claude Code CLI plus
+ * its MCP fleet, 250-550MB measured — so stranding one leaks memory the user
+ * can neither see nor reclaim. Draining from the tail makes every suffix
+ * reachable again: the tail goes first, and `<base>` is picked on the run
+ * after that. Reuse also wins over a gap in the numbering, for the same
+ * reason — a free `<base>-2` must not hide a detached `<base>-3`.
+ *
+ * Reclaiming is deliberately all this does. Killing a detached session would
+ * take a live agent with it, and nothing here can tell "the user is done with
+ * this" from "the user closed the terminal and will come back".
  */
 export const findAvailableSession = (base: string): string => {
-    for (let i = 0; i < MAX_SUFFIX_ATTEMPTS; i++) {
-        const name = i === 0 ? base : `${base}-${i + 1}`;
-        const has = spawnSync('tmux', ['has-session', '-t', name], {
-            stdio: ['ignore', 'ignore', 'ignore'],
-        });
-        if (has.status !== 0) return name; // doesn't exist — fresh session
-        const clients = spawnSync('tmux', ['list-clients', '-t', name, '-F', '#{client_tty}'], {
-            encoding: 'utf-8',
-            stdio: ['ignore', 'pipe', 'ignore'],
-        });
-        const attached = (clients.stdout ?? '').trim().length > 0;
-        if (!attached) return name; // exists but detached — reattach
+    const live = liveSessions();
+    const family = familyNames(base);
+    for (let i = family.length - 1; i >= 0; i--) {
+        if (live.get(family[i]) === false) return family[i];
     }
-    return base;
+    return family.find((name) => !live.has(name)) ?? base;
 };
 
 interface SpawnTarget {
@@ -97,10 +129,10 @@ const targetForAgent = (agent: string, extra: string[]): SpawnTarget => {
         return { cmd: agent, args: extra };
     }
     const base = tmuxSessionName(detectProjectName());
-    // Auto-suffix when the default name is taken by another attached
-    // session — lets the user keep `zeph cc` workflow simple and still
-    // get independent sessions when opening multiple terminals in the
-    // same project.
+    // Reattach a detached session of this project when there is one,
+    // else auto-suffix — lets the user keep `zeph cc` workflow simple and
+    // still get independent sessions when opening multiple terminals in
+    // the same project.
     const session = findAvailableSession(base);
     // `tmux new -A`: attach if the named session exists, else create it.
     // tmux joins trailing argv into a single shell-command, so flags like
