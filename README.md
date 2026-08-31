@@ -265,10 +265,18 @@ block here.
    same folder, run `zeph cc` again, and the wrapper auto-suffixes:
    first session is `zeph-encl`, the next attached one becomes
    `zeph-encl-2`, then `zeph-encl-3`, etc. The phone picker shows them
-   as `encl · Claude`, `encl · Claude #2`, `encl · Claude #3`. If
-   `zeph-encl` already exists but is **detached** (no one attached),
-   the wrapper reattaches to it instead of spawning a new one — close
-   the terminal, come back later, pick up where you left off.
+   as `encl · Claude`, `encl · Claude #2`, `encl · Claude #3`.
+
+   **Reattaching wins over spawning.** If any session of that project is
+   **detached** (no one attached), the wrapper reattaches instead of
+   spawning a new one — close the terminal, come back later, pick up
+   where you left off. When several are detached it takes the
+   highest-numbered one first, then works down on later runs, so no
+   session can end up out of reach. That matters because a session you
+   cannot reach still holds a live agent: an agent CLI plus its MCP
+   servers is a few hundred MB you can neither see nor reclaim. A
+   detached session is never killed for you — nothing here can tell
+   "done with this" from "closed the laptop".
 
    If you're already inside a tmux session (`$TMUX` set) the wrapper
    skips the outer tmux and runs the agent in the current pane — the
@@ -514,7 +522,7 @@ zeph notify --title "Hello" --json
 | `dismiss <id>` | Dismiss a push (or `--all`) |
 | `rename <name>` | Set the current agent session's display name in the app — run inside a `zeph cc` session (`--clear` resets). Auto-detects the tmux session + this machine's listener device id, so the alias lands on the right device |
 | `test` | Verify connection and API key |
-| `cc` · `codex` · `gemini` | Run the agent in a `zeph-<project>` tmux session (auto-suffixed `-2`, `-3`, … on attached collisions). Auto-spawns the background listener on first invocation so the phone picker just works. Trailing args pass through to the agent (`zeph cc --resume "..."`) |
+| `cc` · `codex` · `gemini` | Run the agent in a `zeph-<project>` tmux session — reattaches a detached session of that project (newest suffix first) when there is one, else auto-suffixes `-2`, `-3`, …. Auto-spawns the background listener on first invocation so the phone picker just works. Trailing args pass through to the agent (`zeph cc --resume "..."`) |
 | `listener` | (Usually unnecessary — `zeph cc` autospawns it.) Resident daemon: subscribes via WebSocket, reports tmux session inventory every 5 s, injects `agent.command` pushes into the matching session. Run in the foreground for SDK development; otherwise let `zeph cc` manage it |
 
 ### Notify Options
