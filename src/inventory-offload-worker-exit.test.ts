@@ -14,9 +14,11 @@
  * poll, which is why this showed up as an intermittent line in the log rather
  * than a dead feature.
  */
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
 import { join } from 'path';
 import { describe, expect, it, vi } from 'vitest';
-import { startInventoryOffload } from './inventory-offload.js';
+import { MAX_CONSECUTIVE_TIMEOUTS, startInventoryOffload } from './inventory-offload.js';
 
 const FIXTURES = join(__dirname, 'fixtures', 'inventory-worker');
 const IN_THREAD = { sessions: [{ name: 'zeph-in-thread' }], rejected: [] };
@@ -69,5 +71,74 @@ describe('inventory offload — a timed-out worker is not a failed worker', () =
         offload.close();
         await new Promise((r) => setTimeout(r, 200));
         expect(log).not.toHaveBeenCalled();
+    });
+});
+
+/**
+ * The escape hatch the exit-judgment fix exposed.
+ *
+ * A sweep that overruns the timeout is terminated and the next one starts a
+ * fresh worker from nothing, so on a host where a cold sweep cannot finish
+ * inside the timeout the offload makes no progress at all and the daemon stops
+ * reporting entirely. Before the exit judgment was fixed this escaped by
+ * accident — the terminated worker's exit was misread as a failure, which
+ * degraded to in-thread. Losing that accident must not cost the daemon its
+ * reports, so the degrade is now deliberate and takes consecutive timeouts.
+ */
+describe('inventory offload — repeated timeouts degrade on purpose', () => {
+    it('keeps trying workers below the threshold', async () => {
+        const log = vi.fn();
+        const offload = startInventoryOffload(inThread, log, join(FIXTURES, 'hangs.cjs'), TIMEOUT);
+        try {
+            for (let i = 1; i < MAX_CONSECUTIVE_TIMEOUTS; i++) {
+                await expect(offload.collect()).rejects.toThrow(/exceeded/);
+            }
+            expect(degraded(log)).toBe(false);
+        } finally {
+            offload.close();
+        }
+    });
+
+    it('degrades in-thread once sweeps time out MAX times in a row', async () => {
+        const log = vi.fn();
+        const offload = startInventoryOffload(inThread, log, join(FIXTURES, 'hangs.cjs'), TIMEOUT);
+        try {
+            for (let i = 0; i < MAX_CONSECUTIVE_TIMEOUTS; i++) {
+                await expect(offload.collect()).rejects.toThrow(/exceeded/);
+            }
+            // The daemon reports again from here, slowly, instead of not at all.
+            expect(await offload.collect()).toBe(IN_THREAD);
+            expect(degraded(log)).toBe(true);
+            expect(log.mock.calls.some((c) => /timed out/.test(String(c[0])))).toBe(true);
+        } finally {
+            offload.close();
+        }
+    });
+
+    // Load-bearing form of "the streak resets": two timeouts, then a sweep that
+    // answers, then another timeout. That is three timeouts in total but only
+    // one since the last answer, so the offload must NOT have given up. A
+    // per-worker counter cannot express this -- each timeout terminates the
+    // worker -- hence the marker file.
+    it('forgets earlier timeouts once a sweep succeeds', async () => {
+        const log = vi.fn();
+        const dir = mkdtempSync(join(tmpdir(), 'zeph-offload-'));
+        const marker = join(dir, 'answer');
+        process.env.ZEPH_TEST_MARKER = marker;
+        const offload = startInventoryOffload(inThread, log, join(FIXTURES, 'marker.cjs'), TIMEOUT);
+        try {
+            for (let i = 0; i < MAX_CONSECUTIVE_TIMEOUTS - 1; i++) {
+                await expect(offload.collect()).rejects.toThrow(/exceeded/);
+            }
+            writeFileSync(marker, '');
+            expect((await offload.collect()).sessions.map((s) => s.name)).toEqual(['zeph-from-worker']);
+            rmSync(marker);
+            await expect(offload.collect()).rejects.toThrow(/exceeded/);
+            expect(degraded(log)).toBe(false);
+        } finally {
+            offload.close();
+            delete process.env.ZEPH_TEST_MARKER;
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 });

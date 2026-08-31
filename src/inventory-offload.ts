@@ -50,6 +50,19 @@ export interface InventoryOffload {
 export const COLLECT_TIMEOUT_MS = 20_000;
 
 /**
+ * Consecutive timed-out sweeps before the offload gives up on workers.
+ *
+ * A sweep that overruns is terminated, and the next one starts a fresh worker
+ * from nothing — so on a host where a cold sweep cannot finish inside the
+ * timeout, retrying forever means the daemon never reports at all. Reporting
+ * slowly beats not reporting, and in-thread is exactly "slowly". Three in a row
+ * rather than one, so a single slow moment (a load spike, a machine waking) does
+ * not cost the offload for the rest of the daemon's life; the streak resets on
+ * any answered sweep.
+ */
+export const MAX_CONSECUTIVE_TIMEOUTS = 3;
+
+/**
  * A live worker and the sweep ids it still owes an answer for.
  *
  * The pairing is the point: `pending` is keyed by id across every worker this
@@ -81,6 +94,8 @@ export const startInventoryOffload = (
     /** Set when the worker is given up on — sweeps run in-thread from then on. */
     let inThreadOnly = false;
     let nextId = 0;
+    /** Timed-out sweeps since the last answered one. */
+    let consecutiveTimeouts = 0;
     const pending = new Map<number, Pending>();
 
     const settleAll = (outcome: (p: Pending) => void): void => {
@@ -118,6 +133,7 @@ export const startInventoryOffload = (
             pending.delete(msg.id);
             clearTimeout(p.timer);
             everReplied = true;
+            consecutiveTimeouts = 0;
             if (msg.error !== undefined) p.reject(new Error(msg.error));
             else p.resolve(msg.result as CollectResult);
         });
@@ -157,6 +173,11 @@ export const startInventoryOffload = (
                 // Settled here, so the terminate below is a death we caused and
                 // this worker's exit must not be reported as a failure.
                 live.owed.delete(id);
+                consecutiveTimeouts += 1;
+                if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS && !inThreadOnly) {
+                    inThreadOnly = true;
+                    log(`! inventory sweep timed out ${consecutiveTimeouts}× in a row — running the inventory in-thread from now on`);
+                }
                 reject(new Error(`inventory sweep exceeded ${timeoutMs / 1000}s`));
                 // A stuck worker is not coming back; the next call spawns a fresh one.
                 if (worker === live) worker = null;
