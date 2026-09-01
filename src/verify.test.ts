@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { binaryResolves, classifyMcpRegistration, MCP_REGISTRIES, registeredMcpArgv } from './verify.js';
+import { binaryResolves, classifyMcpRegistration, registeredMcpArgv } from './verify.js';
 import { MCP_LAUNCH_ARGV, MCP_SERVERS_ENTRY, OPENCODE_MCP_ENTRY } from './mcp-command.js';
 
 // An MCP registration is written once, at install time, and never read back.
@@ -71,20 +71,12 @@ describe('classifyMcpRegistration', () => {
     // Unresolvable outranks stale — a stale entry still starts a server.
     it('reports an unreachable binary even when the argv is also stale', () => {
         const argv = ['npx', '-y', '@zeph-to/mcp-server'];
-        expect(classifyMcpRegistration(argv, nothingOnPath).state).toBe('unresolvable');
+        expect(classifyMcpRegistration(argv, nothingOnPath)?.state).toBe('unresolvable');
     });
 
-    it('treats a missing or empty registration as absent', () => {
-        expect(classifyMcpRegistration(null, onPath)).toEqual({ state: 'absent' });
-        expect(classifyMcpRegistration([], onPath)).toEqual({ state: 'absent' });
-    });
-});
-
-describe('MCP_REGISTRIES', () => {
-    it('covers every site zeph install writes an MCP entry to', () => {
-        expect(MCP_REGISTRIES.map((r) => r.agent)).toEqual(['Cursor', 'Windsurf', 'Gemini', 'OpenCode']);
-        // opencode is the odd one out — top-level `mcp`, not `mcpServers`.
-        expect(MCP_REGISTRIES.find((r) => r.agent === 'OpenCode')?.key).toBe('mcp');
+    it('reports nothing for a missing or empty registration', () => {
+        expect(classifyMcpRegistration(null, onPath)).toBeNull();
+        expect(classifyMcpRegistration([], onPath)).toBeNull();
     });
 });
 

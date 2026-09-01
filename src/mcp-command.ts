@@ -1,14 +1,13 @@
 /**
- * How every agent launches the Zeph MCP server — one source, four schemas.
+ * How every agent launches the Zeph MCP server — one source, three schemas.
  *
  * Registrations used to say `npx -y @zeph-to/mcp-server`, which left an
  * `npm exec` launcher resident beside the server for the life of the session.
  * `zeph mcp` (see mcp.ts) runs the server in the CLI's own process instead.
  *
- * Cursor, Windsurf, Gemini, OpenCode and the Claude Code plugin each want that
- * launch in a different shape, and the shapes drifted apart when each site
- * spelled the command out itself. Everything below is derived from
- * MCP_LAUNCH_ARGV.
+ * Cursor/Windsurf, Gemini and OpenCode each want that launch in a different
+ * shape, and the shapes drifted apart when each site spelled the command out
+ * itself. Everything below is derived from MCP_LAUNCH_ARGV.
  */
 
 /** What the agents run. `zeph` resolves out of the same global bin dir as `npx`. */
@@ -17,10 +16,13 @@ export const MCP_LAUNCH_ARGV = ['zeph', 'mcp'] as const;
 const [MCP_BIN, ...MCP_SUBCOMMAND] = MCP_LAUNCH_ARGV;
 
 /**
- * `mcpServers.zeph` — Cursor, Windsurf, and plugin/.mcp.json.
- * The env block is deliberate: Cursor and Windsurf spawn the MCP server from a
- * graphical context that may not inherit shell env, so the key is passed
- * through explicitly rather than left to inheritance.
+ * `mcpServers.zeph` — what the installer writes for Cursor and Windsurf.
+ * The env block is deliberate: both spawn the MCP server from a graphical
+ * context that may not inherit shell env, so the key is passed through
+ * explicitly rather than left to inheritance.
+ *
+ * `zeph-to/plugin`'s `.mcp.json` holds the same shape but is a HAND-KEPT COPY —
+ * it lives in another repo and cannot import this. Change one, change both.
  */
 export const MCP_SERVERS_ENTRY = {
     command: MCP_BIN,

@@ -55,14 +55,15 @@ export const handleCheckUpdate = async (args: Record<string, string | boolean>):
     // Both installed versions are knowable: the CLI's from its own
     // package.json, and mcp-server's because `zeph mcp` runs it in-process,
     // which makes it a dependency rather than an npx download of unknown age.
-    const results: Array<{ pkg: string; current: string | null; latest: string | null; outdated: boolean }> = [];
+    // Two unrelated registry round-trips — awaiting them one after the other
+    // doubled the command's wall time for nothing.
+    const latestVersions = await Promise.all(PACKAGES.map(fetchLatest));
 
-    for (const pkg of PACKAGES) {
-        const latest = await fetchLatest(pkg);
+    const results = PACKAGES.map((pkg, i) => {
+        const latest = latestVersions[i];
         const current = pkg === '@zeph-to/cli' ? VERSION : installedMcpServerVersion();
-        const outdated = !!(latest && current && isNewer(latest, current));
-        results.push({ pkg, current, latest, outdated });
-    }
+        return { pkg, current, latest, outdated: !!(latest && current && isNewer(latest, current)) };
+    });
 
     if (isJson) {
         console.log(JSON.stringify({ results }, null, 2));

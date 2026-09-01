@@ -9,9 +9,10 @@ import {
 
 const asArgv = [...MCP_LAUNCH_ARGV];
 
-/** Shell-split a `gemini mcp add …` line and drop the `--` separator. */
-const argvAfterServerName = (command: string): string[] =>
-    command.split(' ').slice(command.split(' ').indexOf('zeph', 3) + 1).filter((t) => t !== '--');
+/** The launch argv sits at the tail of both `gemini mcp add …` forms, once the
+ *  `--` separator is dropped. */
+const launchTail = (command: string): string[] =>
+    command.split(' ').filter((token) => token !== '--').slice(-asArgv.length);
 
 describe('MCP_LAUNCH_ARGV', () => {
     it('launches the CLI subcommand, not an npx launcher', () => {
@@ -41,8 +42,8 @@ describe('derived registration shapes', () => {
     });
 
     it('both gemini forms reconstruct the launch argv after the server name', () => {
-        expect(argvAfterServerName(GEMINI_MCP_ADD)).toEqual(asArgv);
-        expect(argvAfterServerName(GEMINI_MCP_ADD_LEGACY)).toEqual(asArgv);
+        expect(launchTail(GEMINI_MCP_ADD)).toEqual(asArgv);
+        expect(launchTail(GEMINI_MCP_ADD_LEGACY)).toEqual(asArgv);
     });
 
     it('pins user scope on the modern gemini form, project scope being its default', () => {

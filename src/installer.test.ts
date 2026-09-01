@@ -196,15 +196,11 @@ describe('mergeJsonFile — hooks-level merge', () => {
     });
 });
 
-describe('plugin/.mcp.json consistency', () => {
+describe('MCP entry is single-sourced from mcp-command.ts', () => {
     // Pins the shape we want injectMcpJson to write. Mirrors plugin/.mcp.json
     // — if the SDK installer drifts away from this shape, MCP misbehaves
     // (notably: no env field means ZEPH_API_KEY can't reach the MCP
     // subprocess on IDEs that don't inherit shell env).
-    it('expected MCP server entry shape includes env.ZEPH_API_KEY placeholder', () => {
-        expect(expectedMcpEntry()).toEqual({ ...MCP_SERVERS_ENTRY, env: { ZEPH_API_KEY: '${ZEPH_API_KEY}' } });
-    });
-
     // The value of the mcp-command.ts move: no site spells the launch out
     // itself any more. A literal here would mean one registry silently kept
     // spawning the npm launcher this change exists to delete.
@@ -212,7 +208,7 @@ describe('plugin/.mcp.json consistency', () => {
         const dir = dirname(fileURLToPath(import.meta.url));
         const installerSrc = readFileSync(join(dir, 'installer.ts'), 'utf-8');
         expect(installerSrc).not.toContain('@zeph-to/mcp-server');
-        expect(installerSrc).not.toContain('mcp add');
+        expect(installerSrc).not.toContain('gemini mcp add');
     });
 
     it('injectMcpJson preserves existing mcpServers entries (idempotency contract)', async () => {

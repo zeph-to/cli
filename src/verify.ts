@@ -2,7 +2,7 @@ import { accessSync, constants, existsSync, readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { execFileSync } from 'child_process';
-import { detectAgents, hasCommand } from './agents.js';
+import { detectAgents } from './agents.js';
 import { loadConfig, resolvedEnv, resolveHookId, VERSION } from './config.js';
 import { serviceHealthChecks, serviceStatus, type ServiceHealthRow } from './listener-service.js';
 import { ZephHook } from './zeph-hook.js';
@@ -44,11 +44,18 @@ const AGENT_RULE_PRESENT: Record<string, () => boolean> = {
     opencode: () => hasManagedBlock(join(HOME, '.config', 'opencode', 'AGENTS.md')),
 };
 
-/** Where each agent records the MCP launch `zeph install` writes, and under which container key. */
-export const MCP_REGISTRIES: ReadonlyArray<{ agent: string; path: string; key: string }> = [
+/**
+ * Where each agent records the MCP launch, and under which container key.
+ * `agent` matches the label `detectAgents` uses so one report never names the
+ * same agent two ways. Cursor/Windsurf/OpenCode are files the installer writes
+ * itself; the Gemini row is READ-ONLY — `zeph install` shells out to
+ * `gemini mcp add`, so this path is the gemini CLI's own storage layout,
+ * confirmed by reading the file it produced, not something Zeph chose.
+ */
+const MCP_REGISTRIES: ReadonlyArray<{ agent: string; path: string; key: string }> = [
     { agent: 'Cursor', path: join(HOME, '.cursor', 'mcp.json'), key: 'mcpServers' },
     { agent: 'Windsurf', path: join(HOME, '.codeium', 'windsurf', 'mcp_config.json'), key: 'mcpServers' },
-    { agent: 'Gemini', path: join(HOME, '.gemini', 'settings.json'), key: 'mcpServers' },
+    { agent: 'Gemini CLI', path: join(HOME, '.gemini', 'settings.json'), key: 'mcpServers' },
     { agent: 'OpenCode', path: join(HOME, '.config', 'opencode', 'opencode.json'), key: 'mcp' },
 ];
 
@@ -82,16 +89,9 @@ export const registeredMcpArgv = (filePath: string, key: string): string[] | nul
  * in the file would reach the shell). Nothing here touches a shell.
  */
 export const binaryResolves = (bin: string): boolean => {
-    if (bin.includes('/')) {
-        try {
-            accessSync(bin, constants.X_OK);
-            return true;
-        } catch {
-            return false;
-        }
-    }
     try {
-        execFileSync('which', [bin], { stdio: 'pipe' });
+        if (bin.includes('/')) accessSync(bin, constants.X_OK);
+        else execFileSync('which', [bin], { stdio: 'pipe' });
         return true;
     } catch {
         return false;
@@ -106,30 +106,30 @@ export const binaryResolves = (bin: string): boolean => {
  * read once at install time and never checked again.
  */
 export type McpRegistration =
-    | { readonly state: 'absent' }
     | { readonly state: 'current' }
     | { readonly state: 'stale'; readonly argv: string[] }
     | { readonly state: 'unresolvable'; readonly argv: string[] };
 
+/** null = this agent has no zeph registration at all, so there is nothing to report. */
 export const classifyMcpRegistration = (
     argv: string[] | null,
     isOnPath: (bin: string) => boolean,
-): McpRegistration => {
-    if (!argv || argv.length === 0) return { state: 'absent' };
+): McpRegistration | null => {
+    if (!argv || argv.length === 0) return null;
     if (!isOnPath(argv[0])) return { state: 'unresolvable', argv };
     const isCanonical = argv.length === MCP_LAUNCH_ARGV.length
         && argv.every((token, i) => token === MCP_LAUNCH_ARGV[i]);
     return isCanonical ? { state: 'current' } : { state: 'stale', argv };
 };
 
-/** The registries that actually hold a zeph entry, classified. Absent ones drop
- *  out here so the report has no row for an agent that was never installed. */
+/** The registries that actually hold a zeph entry, classified. Agents that were
+ *  never installed drop out here so the report has no row for them. */
 const activeMcpRegistrations = (
     isOnPath: (bin: string) => boolean,
-): Array<{ agent: string; result: Exclude<McpRegistration, { state: 'absent' }> }> =>
+): Array<{ agent: string; result: McpRegistration }> =>
     MCP_REGISTRIES.flatMap((registry) => {
         const result = classifyMcpRegistration(registeredMcpArgv(registry.path, registry.key), isOnPath);
-        return result.state === 'absent' ? [] : [{ agent: registry.agent, result }];
+        return result ? [{ agent: registry.agent, result }] : [];
     });
 
 export const handleVerify = async (args: Record<string, string | boolean>): Promise<number> => {
@@ -157,16 +157,30 @@ export const handleVerify = async (args: Record<string, string | boolean>): Prom
         hookId ? 'pass' : 'warn');
 
     // ── Runtime ──────────────────────────────────────────────────
+    // One resolution per binary: `zeph` alone was being looked up five times
+    // (twice here, once per registry below), and each lookup is a spawn.
+    const resolved = new Map<string, boolean>();
+    const resolves = (bin: string): boolean => {
+        const cached = resolved.get(bin);
+        if (cached !== undefined) return cached;
+        const found = binaryResolves(bin);
+        resolved.set(bin, found);
+        return found;
+    };
+
     console.log('\n  Runtime:');
-    record(hasCommand('node') ? 'node available' : 'node not found', hasCommand('node') ? 'pass' : 'fail');
-    record(hasCommand('npx') ? 'npx available (hook fallback when zeph is off PATH)' : 'npx not found',
-        hasCommand('npx') ? 'pass' : 'warn');
+    const hasNode = resolves('node');
+    const hasNpx = resolves('npx');
+    const hasZeph = resolves('zeph');
+    record(hasNode ? 'node available' : 'node not found', hasNode ? 'pass' : 'fail');
+    record(hasNpx ? 'npx available (hook fallback when zeph is off PATH)' : 'npx not found',
+        hasNpx ? 'pass' : 'warn');
     // Not a warning any more: `zeph mcp` IS the MCP server, so a zeph that
     // isn't on PATH means no MCP tools at all, not just a slower first call.
-    record(hasCommand('zeph')
+    record(hasZeph
         ? 'zeph CLI on PATH (runs the MCP server and the hooks)'
         : 'zeph CLI not on PATH — MCP tools will not start. Reinstall: npm i -g @zeph-to/cli',
-        hasCommand('zeph') ? 'pass' : 'fail');
+        hasZeph ? 'pass' : 'fail');
 
     // ── Login-time service ───────────────────────────────────────
     // Optional, so a missing one is a warning. A broken one is not: every way
@@ -178,7 +192,7 @@ export const handleVerify = async (args: Record<string, string | boolean>): Prom
     }
 
     // ── MCP registrations ────────────────────────────────────────
-    const registrations = activeMcpRegistrations(binaryResolves);
+    const registrations = activeMcpRegistrations(resolves);
     if (registrations.length > 0) {
         console.log('\n  MCP registrations:');
         for (const { agent, result } of registrations) {
