@@ -179,9 +179,14 @@ way. `zeph install` does not wire Hermes either — add the MCP server to
 ```yaml
 mcp_servers:
   zeph:
-    command: "npx"
-    args: ["-y", "@zeph-to/mcp-server"]
+    command: "zeph"
+    args: ["mcp"]
 ```
+
+`zeph mcp` runs the MCP server inside the CLI process. The older
+`command: "npx"` / `args: ["-y", "@zeph-to/mcp-server"]` form still works,
+but leaves an `npm exec` launcher resident beside the server for as long as
+the session lives — `zeph verify` flags a config still on it.
 
 Add the entry; do not replace the file. `mcp_servers` is shared with
 every other server you have configured, and nothing under `~/.hermes` is
@@ -523,7 +528,7 @@ zeph notify --title "Hello" --json
 | `rename <name>` | Set the current agent session's display name in the app — run inside a `zeph cc` session (`--clear` resets). Auto-detects the tmux session + this machine's listener device id, so the alias lands on the right device |
 | `test` | Verify connection and API key |
 | `cc` · `codex` · `gemini` | Run the agent in a `zeph-<project>` tmux session — reattaches a detached session of that project (newest suffix first) when there is one, else auto-suffixes `-2`, `-3`, …. Auto-spawns the background listener on first invocation so the phone picker just works. Trailing args pass through to the agent (`zeph cc --resume "..."`) |
-| `mcp` | Run the MCP server on stdio, in this process. What agent MCP configs launch — `zeph install` registers it and you never type it. Replaces the old `npx -y @zeph-to/mcp-server` registration, which left an `npm exec` launcher resident alongside the server for the life of the session |
+| `mcp` | Run the MCP server on stdio, in this process. What agent MCP configs launch — `zeph install` registers it and you never type it. Replaces the old `npx -y @zeph-to/mcp-server` registration, which left an `npm exec` launcher resident alongside the server for the life of the session. `@zeph-to/mcp-server` ships as a dependency now, so it updates with the CLI rather than being re-fetched by `npx` on every launch — `zeph check-update` reports the version you actually have |
 | `listener` | (Usually unnecessary — `zeph cc` autospawns it.) Resident daemon: subscribes via WebSocket, reports tmux session inventory every 5 s, injects `agent.command` pushes into the matching session. Run in the foreground for SDK development; otherwise let `zeph cc` manage it |
 
 ### Notify Options

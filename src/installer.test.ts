@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { MCP_SERVERS_ENTRY, OPENCODE_MCP_ENTRY } from './mcp-command.js';
 
 // Tests for the agent installers. The injectMcpJson regression catalysed
 // the CLI hotfix branch — without the env field, Cursor/Windsurf MCP
@@ -34,11 +35,11 @@ afterEach(() => {
 // behaviour is observable through the templates output. Instead of
 // invoking the whole `handleInstall` flow (which runs prompts), we
 // re-implement the same shape the source uses, then assert the output
-// JSON matches. If the source ever drifts, the assertion fails — a
-// reminder to keep the SDK and plugin/.mcp.json in sync.
+// JSON matches. The entry itself comes from mcp-command.ts — the one place
+// that decides how agents launch the server — so a drift there shows up in
+// every registry test rather than being re-pinned per file.
 const expectedMcpEntry = (apiKey: string = '${ZEPH_API_KEY}') => ({
-    command: 'npx',
-    args: ['-y', '@zeph-to/mcp-server'],
+    ...MCP_SERVERS_ENTRY,
     env: { ZEPH_API_KEY: apiKey },
 });
 
@@ -201,12 +202,17 @@ describe('plugin/.mcp.json consistency', () => {
     // (notably: no env field means ZEPH_API_KEY can't reach the MCP
     // subprocess on IDEs that don't inherit shell env).
     it('expected MCP server entry shape includes env.ZEPH_API_KEY placeholder', () => {
-        const entry = expectedMcpEntry();
-        expect(entry).toEqual({
-            command: 'npx',
-            args: ['-y', '@zeph-to/mcp-server'],
-            env: { ZEPH_API_KEY: '${ZEPH_API_KEY}' },
-        });
+        expect(expectedMcpEntry()).toEqual({ ...MCP_SERVERS_ENTRY, env: { ZEPH_API_KEY: '${ZEPH_API_KEY}' } });
+    });
+
+    // The value of the mcp-command.ts move: no site spells the launch out
+    // itself any more. A literal here would mean one registry silently kept
+    // spawning the npm launcher this change exists to delete.
+    it('installer.ts holds no launch string of its own', () => {
+        const dir = dirname(fileURLToPath(import.meta.url));
+        const installerSrc = readFileSync(join(dir, 'installer.ts'), 'utf-8');
+        expect(installerSrc).not.toContain('@zeph-to/mcp-server');
+        expect(installerSrc).not.toContain('mcp add');
     });
 
     it('injectMcpJson preserves existing mcpServers entries (idempotency contract)', async () => {
@@ -280,14 +286,13 @@ describe('templates.ts: pi extension + opencode plugin artifacts', () => {
 describe('injectMcpEntry — opencode.json mcp schema', () => {
     it('writes mcp.zeph in opencode shape (array command, type local, enabled)', async () => {
         const file = join(TMP, '.config', 'opencode', 'opencode.json');
-        const { injectMcpEntry, OPENCODE_MCP_ENTRY } = await import('./installer.js');
+        const { injectMcpEntry } = await import('./installer.js');
         injectMcpEntry(file, 'mcp', OPENCODE_MCP_ENTRY);
         const out = JSON.parse(readFileSync(file, 'utf-8'));
-        expect(out.mcp.zeph).toEqual({
-            type: 'local',
-            command: ['npx', '-y', '@zeph-to/mcp-server'],
-            enabled: true,
-        });
+        expect(out.mcp.zeph).toEqual(OPENCODE_MCP_ENTRY);
+        // opencode's schema is the array-command one — the shape, not just the
+        // values, is what the other registries do NOT share.
+        expect(Array.isArray(out.mcp.zeph.command)).toBe(true);
     });
 
     it('preserves sibling mcp entries and top-level keys', async () => {
@@ -297,7 +302,7 @@ describe('injectMcpEntry — opencode.json mcp schema', () => {
             theme: 'dark',
             mcp: { 'codebase-memory-mcp': { type: 'local', command: ['/usr/local/bin/cbmem'] } },
         }));
-        const { injectMcpEntry, OPENCODE_MCP_ENTRY } = await import('./installer.js');
+        const { injectMcpEntry } = await import('./installer.js');
         injectMcpEntry(file, 'mcp', OPENCODE_MCP_ENTRY);
         const out = JSON.parse(readFileSync(file, 'utf-8'));
         expect(out.theme).toBe('dark');
@@ -307,7 +312,7 @@ describe('injectMcpEntry — opencode.json mcp schema', () => {
 
     it('re-run is idempotent', async () => {
         const file = join(TMP, '.config', 'opencode', 'opencode.json');
-        const { injectMcpEntry, OPENCODE_MCP_ENTRY } = await import('./installer.js');
+        const { injectMcpEntry } = await import('./installer.js');
         injectMcpEntry(file, 'mcp', OPENCODE_MCP_ENTRY);
         injectMcpEntry(file, 'mcp', OPENCODE_MCP_ENTRY);
         const out = JSON.parse(readFileSync(file, 'utf-8'));
