@@ -8,6 +8,9 @@ import { loadConfig, resolvedEnv, saveConfig, CONFIG_FILE, VERSION } from './con
 import type { ZephConfig } from './config.js';
 import { runLoginFlow, resolveWebUrl, resolveTimeoutSec } from './login.js';
 import { detectAgents } from './agents.js';
+import {
+  GEMINI_MCP_ADD, GEMINI_MCP_ADD_LEGACY, MCP_SERVERS_ENTRY, OPENCODE_MCP_ENTRY,
+} from './mcp-command.js';
 import { installService, serviceSupported } from './listener-service.js';
 import type { Agent } from './agents.js';
 import {
@@ -131,29 +134,6 @@ const addAiderReadDirective = (confPath: string, conventionsPath: string): void 
 
 // ── Per-Agent Installers ─────────────────────────────────────────
 
-// Pass through env explicitly so the MCP server doesn't have to rely on
-// process-env inheritance (which behaves differently per IDE — Cursor and
-// Windsurf spawn the MCP from a graphical context that may not inherit
-// shell env). Mirrors plugin/.mcp.json.
-const MCP_SERVERS_ENTRY = {
-  command: 'npx',
-  args: ['-y', '@zeph-to/mcp-server'],
-  env: { ZEPH_API_KEY: '${ZEPH_API_KEY}' },
-};
-
-/**
- * opencode.json's own MCP schema — top-level `mcp` key (not `mcpServers`),
- * `command` as ARRAY (binary + args), `type: "local"`. No `environment` —
- * opencode is a terminal app that inherits shell env, and the MCP server
- * falls back to ~/.zeph/config.json anyway (an unexpanded "${ZEPH_API_KEY}"
- * literal would shadow that fallback with junk). Exported for tests (shape pin).
- */
-export const OPENCODE_MCP_ENTRY = {
-  type: 'local',
-  command: ['npx', '-y', '@zeph-to/mcp-server'],
-  enabled: true,
-};
-
 /** Add the zeph entry under `key` in an MCP registry JSON file, preserving
  *  everything else in it. Exported for tests (merge semantics). */
 export const injectMcpEntry = (filePath: string, key: string, entry: Record<string, unknown>): void => {
@@ -224,18 +204,16 @@ const installWindsurf = (): void => {
 
 const installGemini = (): void => {
   try {
-    // gemini ≥0.26 syntax: `mcp add [-s scope] <name> <command> [args…]` —
-    // the default scope is "project" (cwd-local .gemini/), so pin user
-    // scope for a machine-wide install. Older gemini CLIs only accept the
-    // legacy `mcp add zeph -- npx …` form; fall back for those.
-    execSync('gemini mcp add -s user zeph npx -- -y @zeph-to/mcp-server', { stdio: 'pipe' });
+    // Both forms are built in mcp-command.ts; older gemini CLIs only accept
+    // the legacy one, so try the modern form first and fall back.
+    execSync(GEMINI_MCP_ADD, { stdio: 'pipe' });
     ok('MCP server added');
   } catch {
     try {
-      execSync('gemini mcp add zeph -- npx -y @zeph-to/mcp-server', { stdio: 'pipe' });
+      execSync(GEMINI_MCP_ADD_LEGACY, { stdio: 'pipe' });
       ok('MCP server added (legacy gemini CLI)');
     } catch {
-      fail('MCP add failed. Manual: gemini mcp add -s user zeph npx -- -y @zeph-to/mcp-server');
+      fail(`MCP add failed. Manual: ${GEMINI_MCP_ADD}`);
     }
   }
   try {

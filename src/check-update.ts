@@ -1,3 +1,4 @@
+import { readFileSync } from 'fs';
 import { VERSION } from './config.js';
 
 // Compares installed versions against the npm registry. Pure read-only —
@@ -31,21 +32,38 @@ export const isNewer = (latest: string, current: string): boolean => {
     return false;
 };
 
+/**
+ * The mcp-server version this CLI will actually run. It ships as a dependency
+ * (see mcp.ts), so it is pinned at install time — no longer "whatever npx
+ * fetched last". Returns null on a broken install rather than throwing; the
+ * report degrades to "latest is vX" the way it always did for this package.
+ */
+export const installedMcpServerVersion = (): string | null => {
+    try {
+        const pkg = JSON.parse(
+            readFileSync(require.resolve('@zeph-to/mcp-server/package.json'), 'utf-8'),
+        ) as { version?: string };
+        return pkg.version ?? null;
+    } catch {
+        return null;
+    }
+};
+
 export const handleCheckUpdate = async (args: Record<string, string | boolean>): Promise<number> => {
     const isJson = args.json === true;
 
-    // The CLI's own installed version is known from package.json.
-    // mcp-server's installed version isn't reliably knowable from here
-    // (it's a separate package, often run via npx), so we only report its
-    // latest — the user compares against whatever they have.
-    const results: Array<{ pkg: string; current: string | null; latest: string | null; outdated: boolean }> = [];
+    // Both installed versions are knowable: the CLI's from its own
+    // package.json, and mcp-server's because `zeph mcp` runs it in-process,
+    // which makes it a dependency rather than an npx download of unknown age.
+    // Two unrelated registry round-trips — awaiting them one after the other
+    // doubled the command's wall time for nothing.
+    const latestVersions = await Promise.all(PACKAGES.map(fetchLatest));
 
-    for (const pkg of PACKAGES) {
-        const latest = await fetchLatest(pkg);
-        const current = pkg === '@zeph-to/cli' ? VERSION : null;
-        const outdated = !!(latest && current && isNewer(latest, current));
-        results.push({ pkg, current, latest, outdated });
-    }
+    const results = PACKAGES.map((pkg, i) => {
+        const latest = latestVersions[i];
+        const current = pkg === '@zeph-to/cli' ? VERSION : installedMcpServerVersion();
+        return { pkg, current, latest, outdated: !!(latest && current && isNewer(latest, current)) };
+    });
 
     if (isJson) {
         console.log(JSON.stringify({ results }, null, 2));

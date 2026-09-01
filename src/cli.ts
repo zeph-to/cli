@@ -10,6 +10,7 @@ import { handleVerify } from './verify.js';
 import { handleCheckUpdate } from './check-update.js';
 import { handleAsk } from './ask.js';
 import { handleAgentSession } from './wrapper.js';
+import { handleMcp } from './mcp.js';
 import { handleListener, computeListenerDeviceId } from './listener.js';
 import { detectProjectDir, loadConfig, resolvedEnv, VERSION } from './config.js';
 import {
@@ -97,6 +98,9 @@ ${usageAgentLines()}
                    -2/-3/… only when every existing one has a client
                    attached. Any args after the subcommand are forwarded
                    verbatim, e.g. 'zeph cc --resume')
+  mcp             Run the MCP server on stdio. This is what agent MCP
+                  configs launch — 'zeph install' registers it, you
+                  never type it
   listener        Resident daemon — receives 'agent.command' pushes from
                   the phone picker and injects them into the matching
                   tmux session.
@@ -511,6 +515,8 @@ const main = async (): Promise<number> => {
       return handleRename(args);
     case 'test':
       return handleTest(args);
+    case 'mcp':
+      return handleMcp();
     case 'listener':
       return handleListener(args);
     case 'remote-hook':

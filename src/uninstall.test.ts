@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { MCP_SERVERS_ENTRY, OPENCODE_MCP_ENTRY } from './mcp-command.js';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -44,7 +45,7 @@ const seedCursorAndWindsurf = () => {
     const cursorMcp = write('.cursor/mcp.json', JSON.stringify({
         mcpServers: {
             other: { command: 'node' },
-            zeph: { command: 'npx', args: ['-y', '@zeph-to/mcp-server'] },
+            zeph: MCP_SERVERS_ENTRY,
         },
     }, null, 2));
     const cursorRule = write('.cursor/rules/zeph.mdc', 'zeph rule content');
@@ -253,6 +254,26 @@ describe('rmCodexHook — command-substring ownership (codex handlers have no na
     });
 });
 
+describe('rmMcpEntry is keyed on the entry name, not the command', () => {
+    // Everyone who installed before `zeph mcp` existed has an npx-shaped entry
+    // sitting in their config. Uninstall matches on the `zeph` key, so the
+    // command shape is irrelevant — this pins that, because a command-matching
+    // implementation would strand those entries forever.
+    it('removes a legacy npx-shaped registration', async () => {
+        const file = write('.cursor/mcp.json', JSON.stringify({
+            mcpServers: {
+                zeph: { command: 'npx', args: ['-y', '@zeph-to/mcp-server'] },
+                other: { command: 'node' },
+            },
+        }));
+        const { rmMcpEntry } = await import('./uninstall.js');
+        expect(rmMcpEntry(file, false)).toBeTruthy();
+        const data = JSON.parse(readFileSync(file, 'utf-8'));
+        expect(data.mcpServers).not.toHaveProperty('zeph');
+        expect(data.mcpServers).toHaveProperty('other');
+    });
+});
+
 describe('rmMcpEntry with a custom container key (opencode.json)', () => {
     // Shared-body semantics (absent file, bad JSON, dry-run, idempotency) are
     // covered through handleUninstall above; the new fact is the `mcp` routing.
@@ -260,7 +281,7 @@ describe('rmMcpEntry with a custom container key (opencode.json)', () => {
         const file = write('.config/opencode/opencode.json', JSON.stringify({
             theme: 'dark',
             mcp: {
-                zeph: { type: 'local', command: ['npx', '-y', '@zeph-to/mcp-server'], enabled: true },
+                zeph: OPENCODE_MCP_ENTRY,
                 'codebase-memory-mcp': { type: 'local', command: ['/usr/local/bin/cbmem'] },
             },
         }));
