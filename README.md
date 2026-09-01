@@ -523,6 +523,7 @@ zeph notify --title "Hello" --json
 | `rename <name>` | Set the current agent session's display name in the app — run inside a `zeph cc` session (`--clear` resets). Auto-detects the tmux session + this machine's listener device id, so the alias lands on the right device |
 | `test` | Verify connection and API key |
 | `cc` · `codex` · `gemini` | Run the agent in a `zeph-<project>` tmux session — reattaches a detached session of that project (newest suffix first) when there is one, else auto-suffixes `-2`, `-3`, …. Auto-spawns the background listener on first invocation so the phone picker just works. Trailing args pass through to the agent (`zeph cc --resume "..."`) |
+| `mcp` | Run the MCP server on stdio, in this process. What agent MCP configs launch — `zeph install` registers it and you never type it. Replaces the old `npx -y @zeph-to/mcp-server` registration, which left an `npm exec` launcher resident alongside the server for the life of the session |
 | `listener` | (Usually unnecessary — `zeph cc` autospawns it.) Resident daemon: subscribes via WebSocket, reports tmux session inventory every 5 s, injects `agent.command` pushes into the matching session. Run in the foreground for SDK development; otherwise let `zeph cc` manage it |
 
 ### Notify Options

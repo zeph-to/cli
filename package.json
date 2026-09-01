@@ -72,6 +72,7 @@
   },
   "dependencies": {
     "@inquirer/prompts": "^8.4.3",
+    "@zeph-to/mcp-server": "^2.3.0",
     "ws": "^8.21.0"
   }
 }
