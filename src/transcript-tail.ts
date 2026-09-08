@@ -285,7 +285,36 @@ const promptTextOf = (entry: Record<string, unknown>): string | null => {
     const message = entry.message;
     if (!message || typeof message !== 'object') return null;
     const content = (message as Record<string, unknown>).content;
-    return typeof content === 'string' && content.trim() ? content : null;
+    if (typeof content === 'string') return nonEmpty(stripAttachmentMarkers(content));
+    // An array is usually the harness answering the model, but the same shape
+    // carries what a person typed when they attached something — the prompt
+    // arrives as text blocks beside the attachment. Take those; a message with
+    // no text block at all is a pure tool_result carrier and not a prompt.
+    if (!Array.isArray(content)) return null;
+    const text = content
+        .filter((b): b is Record<string, unknown> => !!b && typeof b === 'object' && b.type === 'text')
+        .map((b) => (typeof b.text === 'string' ? b.text : ''))
+        .join('\n')
+        .trim();
+    return text ? nonEmpty(stripAttachmentMarkers(text)) : null;
+};
+
+/**
+ * Drop the `[Image: source: /abs/path]` markers Claude Code substitutes for an
+ * attached image.
+ *
+ * They are a local filesystem path and nothing else: useless on the phone, which
+ * cannot open it, and a directory listing of this machine if it goes anywhere
+ * else. The attachment itself is not on this wire — showing that one exists is a
+ * separate feature, not a reason to ship the path.
+ */
+const stripAttachmentMarkers = (text: string): string =>
+    text.replace(/\[Image:[^\]]*\]/g, '').replace(/\n{3,}/g, '\n\n');
+
+/** Trimmed, or null when nothing survived — a message that was only an attachment. */
+const nonEmpty = (text: string): string | null => {
+    const trimmed = text.trim();
+    return trimmed ? trimmed : null;
 };
 
 /**
@@ -347,7 +376,16 @@ export const projectTranscriptEntries = (
                 events.push({ kind: 'tool_result', id: block.tool_use_id, ok: block.is_error !== true });
                 continue;
             }
-            if (block.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+            // Prose, only from the model. A user entry reaching here has already
+            // been offered to `promptTextOf`; treating its text blocks as
+            // assistant output is how an attachment marker ends up rendered as
+            // the agent's own words.
+            if (
+                entry.type === 'assistant' &&
+                block.type === 'text' &&
+                typeof block.text === 'string' &&
+                block.text.trim()
+            ) {
                 events.push({ kind: 'text', text: clamp(block.text) });
             }
             // `thinking` falls through on purpose — the timeline shows what the

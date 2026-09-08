@@ -251,6 +251,55 @@ describe('projectTranscriptEntries', () => {
         }
     });
 
+    it('reads a prompt that arrived as text blocks beside an attachment', () => {
+        const events = projectTranscriptEntries([
+            line({
+                type: 'user',
+                message: {
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: '[Image: source: /Users/tak/.claude/image-cache/abc/6.png]' },
+                        { type: 'text', text: 'this UI looks wrong' },
+                    ],
+                },
+            }),
+        ]);
+
+        expect(events).toEqual([{ kind: 'prompt', text: 'this UI looks wrong' }]);
+    });
+
+    it('never renders a user message as the assistant\'s own words', () => {
+        const events = projectTranscriptEntries([
+            line({
+                type: 'user',
+                message: { role: 'user', content: [{ type: 'text', text: 'typed by a person' }] },
+            }),
+        ]);
+
+        expect(events.every((e) => e.kind !== 'text')).toBe(true);
+    });
+
+    it('drops the local path of an attached image — the phone cannot open it and should not see it', () => {
+        const marker = '/Users/tak/.claude/image-cache/f85e/6.png';
+        const events = projectTranscriptEntries([
+            line({ type: 'user', message: { role: 'user', content: `[Image: source: ${marker}]\nlook at this` } }),
+        ]);
+
+        expect(JSON.stringify(events)).not.toContain(marker);
+        expect(events).toEqual([{ kind: 'prompt', text: 'look at this' }]);
+    });
+
+    it('is not fooled into a prompt by an attachment-only message', () => {
+        const events = projectTranscriptEntries([
+            line({
+                type: 'user',
+                message: { role: 'user', content: [{ type: 'text', text: '[Image: source: /tmp/a.png]' }] },
+            }),
+        ]);
+
+        expect(events).toEqual([]);
+    });
+
     it('treats a real user prompt as a prompt but a tool_result carrier as not one', () => {
         const events = projectTranscriptEntries([userLine('do the thing'), toolResultLine('t5')]);
 
