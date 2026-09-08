@@ -51,6 +51,26 @@ export const TURN_POLL_INTERVAL_MS = 500;
 export const TURN_LEASE_MS = 60_000;
 
 /**
+ * How often a live watch re-asks which transcript its session is writing.
+ *
+ * `/clear` and a compaction start a new session file under a new name; the old
+ * one simply stops growing, so a watcher pinned to the path it resolved at
+ * `start` goes quiet forever and looks exactly like an idle agent. Nothing in
+ * the file itself can signal this — the answer lives in the session registry —
+ * so it is asked for on a cadence rather than discovered.
+ *
+ * This is not a cheap question, and the number is chosen against its real cost:
+ * `resolveTranscript` runs `readPaneInfo`, an uncached blocking
+ * `spawnSync('tmux', …)` (`listener.ts`), and the pid-record memo behind it
+ * expires every 4s (`remote-agents.ts` SNAPSHOT_TTL_MS), so a recheck is one
+ * tmux spawn plus a real directory read — not a memo hit. At 10s per watcher and
+ * at most three watchers that stays under what the session report already spends
+ * on its own (`SESSION_REPORT_INTERVAL_MS` = 5s, one sweep for the whole
+ * machine), while keeping how long a cleared session stays dark to one interval.
+ */
+export const TRANSCRIPT_RECHECK_MS = 10_000;
+
+/**
  * Consecutive seal failures before the watch gives up and says so.
  *
  * Dropping a batch that will not seal is right; dropping every batch forever is
@@ -122,6 +142,8 @@ interface Watcher {
     seq: number;
     epoch: number;
     sealFailures: number;
+    /** When the transcript path was last re-resolved. */
+    checkedAt: number;
     send: SendTurnFrame;
     /** The first read backfills, so it keeps only the turn still in flight. */
     backfilling: boolean;
@@ -199,6 +221,17 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
 
     const readAndEmit = async (watcher: Watcher): Promise<void> => {
         const { sessionName } = watcher;
+
+        // Follow the session if it started writing somewhere else. Keeping the
+        // old path would be a watch that never reports again and never says why.
+        if (now() - watcher.checkedAt >= TRANSCRIPT_RECHECK_MS) {
+            watcher.checkedAt = now();
+            const current = deps.resolveTranscript(sessionName);
+            if (current && current !== watcher.transcriptPath) {
+                deps.log(`⧉ turn-watch ${sessionName}: transcript rotated — following the new session file`);
+                reseed(watcher, current, watcher.subscriberPublicKey, watcher.send);
+            }
+        }
         const read = readTranscriptDelta(watcher.transcriptPath, watcher.tail);
         // `null` is the idle case and the common one: nothing was appended, so
         // nothing was read, parsed, or allocated.
@@ -340,6 +373,7 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
             seq: 0,
             epoch: 0,
             sealFailures: 0,
+            checkedAt: 0,
             send,
             backfilling: true,
             events: 0,
@@ -386,6 +420,7 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
         // everything below its old high-water mark.
         watcher.epoch += 1;
         watcher.seq = 0;
+        watcher.checkedAt = now();
         deps.log(`⧉ turn-watch ${watcher.sessionName} started (${subscriberPublicKey ? 'sealed' : 'plaintext'})`);
     };
 

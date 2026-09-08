@@ -3,7 +3,14 @@ import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { createTurnWatchers, MAX_TURN_SEAL_FAILURES, MAX_TURN_WATCHERS, TURN_LEASE_MS, type TurnWatchDeps } from './turn-watch.js';
+import {
+    createTurnWatchers,
+    MAX_TURN_SEAL_FAILURES,
+    MAX_TURN_WATCHERS,
+    TRANSCRIPT_RECHECK_MS,
+    TURN_LEASE_MS,
+    type TurnWatchDeps,
+} from './turn-watch.js';
 
 const DEVICE = 'dev_listener_abc123';
 
@@ -392,5 +399,48 @@ describe('turn watch regressions', () => {
         expect(sent.at(-1)).toMatchObject({ subtype: 'agent.turn.watch.error', error: 'e2ee_unavailable' });
         expect(watchers.size()).toBe(0);
         expect(deltas()).toHaveLength(0);
+    });
+});
+
+describe('turn watch follows the session', () => {
+    it('moves to the new transcript when the session starts writing elsewhere', async () => {
+        // `/clear` writes a file under a new name; the old one just stops growing,
+        // so a watcher pinned to it goes quiet and looks like an idle agent.
+        let target = 'before-clear';
+        const watchers = createTurnWatchers(makeDeps({ resolveTranscript: () => transcriptFor(target) }));
+        writeFileSync(transcriptFor('before-clear'), userPrompt('old session'));
+        writeFileSync(transcriptFor('after-clear'), userPrompt('new session') + toolUse('t9', 'Read', { file_path: '/after.ts' }));
+
+        watchers.handle(start('s1'), send);
+        await watchers.tick('s1');
+        const before = deltas().length;
+
+        target = 'after-clear';
+        clock += TRANSCRIPT_RECHECK_MS;
+        await watchers.tick('s1');
+
+        expect(deltas().length).toBeGreaterThan(before);
+        expect(JSON.stringify(deltas().at(-1)!.events)).toContain('/after.ts');
+        expect(logs.some((l) => l.includes('transcript rotated'))).toBe(true);
+    });
+
+    it('does not re-resolve on every tick — the session registry is not free', async () => {
+        let calls = 0;
+        const watchers = createTurnWatchers(
+            makeDeps({
+                resolveTranscript: (session) => {
+                    calls += 1;
+                    return transcriptFor(session);
+                },
+            }),
+        );
+        writeFileSync(transcriptFor('s1'), userPrompt('go'));
+        watchers.handle(start('s1'), send);
+        await watchers.tick('s1');
+        const afterStart = calls;
+
+        for (let i = 0; i < 5; i++) await watchers.tick('s1');
+
+        expect(calls).toBe(afterStart);
     });
 });

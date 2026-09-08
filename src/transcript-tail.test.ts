@@ -168,6 +168,21 @@ describe('readTranscriptDelta', () => {
         for (const l of collected) expect(() => JSON.parse(l)).not.toThrow();
     });
 
+    it('restarts when the path holds a different file, even one longer than the old read position', () => {
+        writeFileSync(file, userLine('old') + textLine('older'));
+        const first = readTranscriptDelta(file, initialTailState())!;
+
+        // A replacement longer than the old offset — size alone reads this as an
+        // ordinary append, and the offset then points into the middle of a record
+        // that was never written.
+        rmSync(file);
+        writeFileSync(file, userLine('fresh one') + textLine('fresh two') + textLine('fresh three'));
+        const second = readTranscriptDelta(file, first.state)!;
+
+        expect(second.lines).toHaveLength(3);
+        expect(second.lines[0]).toContain('fresh one');
+    });
+
     it('reports a missing file as null rather than throwing', () => {
         expect(readTranscriptDelta(join(dir, 'gone.jsonl'), initialTailState())).toBeNull();
     });

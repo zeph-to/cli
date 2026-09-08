@@ -52,6 +52,8 @@ export interface TailState {
     readonly offset: number;
     readonly size: number;
     readonly mtimeMs: number;
+    /** Which file this offset belongs to. A new inode is a new file at the same path. */
+    readonly ino: number;
     /** Bytes after the last newline seen — an incomplete line, held for the next tick. */
     readonly carry: string;
     /** Inside an oversized line: discard bytes until the next newline. */
@@ -107,21 +109,32 @@ export const readTranscriptDelta = (path: string, prev: TailState | null): TailR
         return null;
     }
 
-    const { size, mtimeMs } = stat;
+    const { size, mtimeMs, ino } = stat;
 
     // Caught up AND untouched. `offset >= size` matters on its own: a tick that
     // stopped at MAX_TAIL_BYTES_PER_TICK leaves bytes behind on a file that has
-    // not changed since, and skipping there would strand them until the next append.
-    if (prev && prev.offset >= size && size === prev.size && mtimeMs === prev.mtimeMs) return null;
+    // not changed since, and skipping there would strand them until the next
+    // append. `ino` matters here too, not only below: a replacement that matched
+    // the old size and mtime would otherwise skip out before the rotation check
+    // downstream ever ran.
+    if (prev && prev.offset >= size && size === prev.size && mtimeMs === prev.mtimeMs && ino === prev.ino) {
+        return null;
+    }
 
-    // A file that shrank was replaced or truncated in place. Note this does NOT
-    // cover a `/clear`, which writes a *different* file: the old one simply stops
-    // growing, and nothing here notices. Re-resolving the session id belongs to
-    // the caller and is not implemented yet.
+    // A new inode at the same path is a different file, and a file that shrank
+    // below the offset was truncated in place. Size alone misses the first case:
+    // a replacement that happens to be longer than the old read position reads as
+    // an ordinary append, and the offset then points into the middle of a record
+    // that was never there.
+    //
+    // Neither covers a `/clear`, which writes a file under a *different* name —
+    // the old one simply stops growing. Following that means re-resolving the
+    // session id, which is the caller's job (`turn-watch` re-resolves on a
+    // cadence) because only it knows which session this path was for.
     //
     // Either way — first attach or rotation — everything remembered about the old
     // contents is meaningless, so the read restarts from a window off the end.
-    const restart = !prev || size < prev.offset;
+    const restart = !prev || size < prev.offset || ino !== prev.ino;
 
     const start = restart ? Math.max(0, size - TRANSCRIPT_BACKFILL_BYTES) : prev.offset;
     // A window that starts mid-line yields a fragment of a record that began
@@ -134,7 +147,7 @@ export const readTranscriptDelta = (path: string, prev: TailState | null): TailR
     if (want <= 0) {
         return {
             lines: [],
-            state: { offset: start, size, mtimeMs, carry, resyncing },
+            state: { offset: start, size, mtimeMs, ino, carry, resyncing },
             bytesRead: 0,
             droppedLines: 0,
         };
@@ -203,7 +216,7 @@ export const readTranscriptDelta = (path: string, prev: TailState | null): TailR
 
     return {
         lines,
-        state: { offset: start + usable, size, mtimeMs, carry: pending, resyncing },
+        state: { offset: start + usable, size, mtimeMs, ino, carry: pending, resyncing },
         bytesRead: usable,
         droppedLines,
     };
