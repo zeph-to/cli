@@ -38,8 +38,23 @@ export const MAX_TAIL_BYTES_PER_TICK = 256 * 1024;
  */
 export const MAX_TRANSCRIPT_LINE_CHARS = 1024 * 1024;
 
-/** Ceiling on any single string that reaches the wire. */
+/**
+ * Ceiling on a tool's label — its name, and the short string saying what it
+ * acted on. A path or a one-line description; anything longer is a runaway
+ * input, not a label.
+ */
 export const MAX_EVENT_FIELD_CHARS = 512;
+
+/**
+ * Ceiling on prose — what the agent wrote, and what the person asked.
+ *
+ * Deliberately far above the label cap: 512 characters is a filename, and
+ * applying it here cut every reply off mid-sentence. 5000 is what the
+ * completion push already carries for the same text (`zeph-stop.sh`), so the
+ * live lane and the push that replaces it agree on how much of a reply is
+ * worth sending.
+ */
+export const MAX_EVENT_TEXT_CHARS = 5000;
 
 /**
  * Where the reader is in one file.
@@ -253,8 +268,8 @@ export type TurnEvent =
  */
 const TARGET_KEYS = ['description', 'file_path', 'path', 'pattern', 'query', 'url', 'skill'] as const;
 
-const clamp = (value: string): string =>
-    value.length > MAX_EVENT_FIELD_CHARS ? value.slice(0, MAX_EVENT_FIELD_CHARS) : value;
+const clamp = (value: string, max = MAX_EVENT_FIELD_CHARS): string =>
+    value.length > max ? value.slice(0, max) : value;
 
 const targetOf = (input: unknown): string | undefined => {
     if (!input || typeof input !== 'object') return undefined;
@@ -403,7 +418,7 @@ export const projectTranscriptEntries = (
 
         const prompt = promptTextOf(entry);
         if (prompt !== null) {
-            events.push({ kind: 'prompt', text: clamp(prompt) });
+            events.push({ kind: 'prompt', text: clamp(prompt, MAX_EVENT_TEXT_CHARS) });
             continue;
         }
 
@@ -427,7 +442,7 @@ export const projectTranscriptEntries = (
                 typeof block.text === 'string' &&
                 block.text.trim()
             ) {
-                events.push({ kind: 'text', text: clamp(block.text) });
+                events.push({ kind: 'text', text: clamp(block.text, MAX_EVENT_TEXT_CHARS) });
             }
             // `thinking` falls through on purpose — the timeline shows what the
             // agent did, not what it considered.

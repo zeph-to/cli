@@ -11,6 +11,7 @@ import {
     MAX_TAIL_BYTES_PER_TICK,
     TRANSCRIPT_BACKFILL_BYTES,
     MAX_EVENT_FIELD_CHARS,
+    MAX_EVENT_TEXT_CHARS,
 } from './transcript-tail.js';
 
 let dir: string;
@@ -238,17 +239,26 @@ describe('projectTranscriptEntries', () => {
         expect(JSON.stringify(events)).not.toContain(secret);
     });
 
-    it('truncates long fields to MAX_EVENT_FIELD_CHARS', () => {
+    it('truncates a tool label to MAX_EVENT_FIELD_CHARS', () => {
         const events = projectTranscriptEntries([
             toolUseLine('t4', 'Read', { file_path: '/'.repeat(MAX_EVENT_FIELD_CHARS + 500) }),
-            textLine('z'.repeat(MAX_EVENT_FIELD_CHARS + 500)),
         ]);
 
-        for (const e of events) {
-            for (const value of Object.values(e)) {
-                if (typeof value === 'string') expect(value.length).toBeLessThanOrEqual(MAX_EVENT_FIELD_CHARS);
-            }
-        }
+        expect((events[0] as { target: string }).target.length).toBe(MAX_EVENT_FIELD_CHARS);
+    });
+
+    it('does not cut a reply off at the label cap — prose gets the prose ceiling', () => {
+        const reply = 'z'.repeat(MAX_EVENT_FIELD_CHARS * 4);
+        const events = projectTranscriptEntries([textLine(reply)]);
+
+        expect((events[0] as { text: string }).text).toHaveLength(reply.length);
+        expect(reply.length).toBeLessThanOrEqual(MAX_EVENT_TEXT_CHARS);
+    });
+
+    it('still bounds prose at MAX_EVENT_TEXT_CHARS', () => {
+        const events = projectTranscriptEntries([textLine('z'.repeat(MAX_EVENT_TEXT_CHARS + 100))]);
+
+        expect((events[0] as { text: string }).text).toHaveLength(MAX_EVENT_TEXT_CHARS);
     });
 
     it('reads a prompt that arrived as text blocks beside an attachment', () => {
