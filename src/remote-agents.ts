@@ -59,6 +59,17 @@ export interface RemoteAgent {
      * name at all, so there is nothing to read and the computed label stands.
      */
     resolveSessionName?: (paneCwd: string, panePid?: number) => string | null;
+    /**
+     * Resolve the file this agent is writing its session transcript to, for the
+     * live chat timeline (`turn-watch`).
+     *
+     * Same shape and the same EXTENSION POINT rule as the two above: a row
+     * carries this only once that agent's transcript format is confirmed, and a
+     * pane whose agent omits it answers `no_transcript` rather than guessing.
+     * That is the seam a second agent hangs off — the reader that parses the
+     * file is the other half, and lives beside this one.
+     */
+    resolveTranscript?: (paneCwd: string, panePid?: number) => string | null;
 }
 
 /**
@@ -640,6 +651,7 @@ const REMOTE_AGENT_TABLE = [
             ?? detectClaudeSessionId(paneCwd),
         resolveSessionName: (paneCwd, panePid) =>
             panePid !== undefined ? detectClaudeSessionNameByPid(panePid, paneCwd) : null,
+        resolveTranscript: (paneCwd, panePid) => claudeTranscriptPath(paneCwd, panePid),
     },
     {
         kind: 'codex',

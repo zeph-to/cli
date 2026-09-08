@@ -337,9 +337,7 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
                 send({ subtype: 'agent.turn.watch.error', sessionName: req.sessionName, error: 'no_transcript' });
                 return true;
             }
-            reseed(existing, transcriptPath, req.subscriberPublicKey, send);
-            send({ subtype: 'agent.turn.watch.ok', sessionName: req.sessionName });
-            void startTicking(existing, req.subscriberPublicKey);
+            beginWatch(existing, transcriptPath, req.subscriberPublicKey, send);
             return true;
         }
         if (req.subtype === 'agent.turn.watch.renew') {
@@ -379,11 +377,28 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
             events: 0,
             startedAt: now(),
         };
-        reseed(watcher, transcriptPath, req.subscriberPublicKey, send);
         watchers.set(req.sessionName, watcher);
-        send({ subtype: 'agent.turn.watch.ok', sessionName: req.sessionName });
-        void startTicking(watcher, req.subscriberPublicKey);
+        beginWatch(watcher, transcriptPath, req.subscriberPublicKey, send);
         return true;
+    };
+
+    /**
+     * Everything a `start` means, in one place.
+     *
+     * Both branches of `handle` — a watcher that already exists and one just
+     * built — end here, because a start means the same thing either way: point
+     * at the transcript, tell the viewer, begin reading. Two copies of that
+     * sequence is how the next step added to it ends up in only one of them.
+     */
+    const beginWatch = (
+        watcher: Watcher,
+        transcriptPath: string,
+        subscriberPublicKey: string | undefined,
+        send: SendTurnFrame,
+    ): void => {
+        reseed(watcher, transcriptPath, subscriberPublicKey, send);
+        send({ subtype: 'agent.turn.watch.ok', sessionName: watcher.sessionName });
+        void sealThenRead(watcher, subscriberPublicKey);
     };
 
     /**
@@ -425,14 +440,18 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
     };
 
     /**
-     * Read once immediately, so the viewer sees the in-flight turn on open rather
-     * than one poll interval later.
+     * Settle the encryption question, then read once.
      *
-     * When a seal was asked for, the keypair is loaded first and a failure is
-     * fatal to the watch: refusing up front is the honest answer, where letting
-     * the first batches die one by one looks like an idle session.
+     * Mostly this is the handshake: a viewer that asked for a seal gets the
+     * keypair loaded before any batch is built, and a failure ends the watch
+     * rather than letting the first batches die one at a time — three silent
+     * drops read as an idle session, which is the one thing this surface must
+     * never look like when it is broken.
+     *
+     * The read that follows is immediate so the in-flight turn is on screen when
+     * the chat opens, not one poll interval later.
      */
-    const startTicking = async (watcher: Watcher, subscriberPublicKey: string | undefined): Promise<void> => {
+    const sealThenRead = async (watcher: Watcher, subscriberPublicKey: string | undefined): Promise<void> => {
         if (subscriberPublicKey) {
             try {
                 await deps.initCrypto();

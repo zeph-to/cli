@@ -48,7 +48,7 @@ import {
     rememberSessions,
     sessionDirectoryExists,
 } from './session-registry.js';
-import { claudeTranscriptPath, matchAgentByPaneCommand, REMOTE_AGENTS, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
+import { matchAgentByPaneCommand, REMOTE_AGENTS, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 import {
     installService,
     restartService,
@@ -2063,7 +2063,16 @@ const turnWatchers = createTurnWatchers({
     deviceId: () => computeListenerDeviceId(),
     resolveTranscript: (sessionName) => {
         const info = readPaneInfo(sessionName);
-        return claudeTranscriptPath(info.currentPath, info.panePid ?? undefined);
+        if (!info.currentPath) return null;
+        // Ask the agent actually running in the pane, through the same detector
+        // the session sweep uses — start_command first, because the foreground
+        // process is usually the interpreter, and quote-stripped, because a
+        // leading `"` once made this exact check miss every wrapped session.
+        // A Codex or Gemini pane carries no resolver yet and answers null, which
+        // the watcher reports as `no_transcript` — the EXTENSION POINT rule the
+        // session-id and session-name resolvers already follow.
+        const agent = detectRemoteAgent(info);
+        return agent?.resolveTranscript?.(info.currentPath, info.panePid ?? undefined) ?? null;
     },
     sessionExists: (sessionName) => sessionExists(sessionName),
     initCrypto: async () => { await initDeviceCrypto(); },
