@@ -48,7 +48,7 @@ import {
     rememberSessions,
     sessionDirectoryExists,
 } from './session-registry.js';
-import { matchAgentByPaneCommand, REMOTE_AGENTS, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
+import { claudeTranscriptPath, matchAgentByPaneCommand, REMOTE_AGENTS, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 import {
     installService,
     restartService,
@@ -62,6 +62,7 @@ import { advanceState, evaluateState, findPatternMatch, type AgentState, type Ev
 import { startInventoryOffload, type InventoryOffload } from './inventory-offload.js';
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
 import { decryptEphemeral, encryptEphemeral, getDevicePublicKey, initDeviceCrypto, type EncryptedEphemeralPayload } from './crypto.js';
+import { createTurnWatchers, type TurnWatchControl } from './turn-watch.js';
 import { createInputSequencer, type InputSequencer, type SequencedInput } from './input-sequencer.js';
 import { startKeepAwake } from './keep-awake.js';
 
@@ -2051,6 +2052,25 @@ const leaseFor = (renewing: boolean): number => (renewing ? STREAM_LEASE_MS : ST
 
 const activeStreams = new Map<string, ActiveStream>();
 
+/**
+ * The live agent-chat timeline (`turn-watch.ts`), kept beside `activeStreams`
+ * rather than inside it: both are per-session and both end on socket close, but
+ * their lifetimes are driven by different things — a tmux pane for one, a
+ * viewer's lease over a growing file for the other — and merging them would tie
+ * a terminal mirror's death to a chat tab's.
+ */
+const turnWatchers = createTurnWatchers({
+    deviceId: () => computeListenerDeviceId(),
+    resolveTranscript: (sessionName) => {
+        const info = readPaneInfo(sessionName);
+        return claudeTranscriptPath(info.currentPath, info.panePid ?? undefined);
+    },
+    sessionExists: (sessionName) => sessionExists(sessionName),
+    initCrypto: async () => { await initDeviceCrypto(); },
+    seal: (plaintext, subscriberPublicKey) => encryptEphemeral(plaintext, subscriberPublicKey),
+    log: (message) => log(message),
+});
+
 /** Inbound key ordering, one per (streamed session, sender device) — see the
  *  `agent.command.input` section below. Lives here so stopStream can drop them
  *  with the lease they belong to. Keyed `<session>#<deviceId>`, or the bare
@@ -3810,6 +3830,10 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                 if (
                     !handleCommandInput(m.data as AgentCommandInput, sendEphemeral) &&
                     !handleStreamControl(m.data as StreamControl, sendEphemeral) &&
+                    // The chat timeline's own control messages. Same envelope,
+                    // same addressing rule, different source — a transcript file
+                    // rather than the pane.
+                    !turnWatchers.handle(m.data as TurnWatchControl, sendEphemeral) &&
                     // A page of scrollback answers through `send` rather than by
                     // return value: on an encrypted stream it finishes after the
                     // seal, exactly like the frames it is history for.
@@ -3853,6 +3877,11 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
 
         sock.on('close', (code, reasonBuf) => {
             stopAllStreams();
+            // `send` is a closure over THIS socket, so a watcher that outlived it
+            // would tick forever into a dead connection. Viewers re-arm with a
+            // fresh watch.start after reconnecting, exactly as they re-lease a
+            // terminal stream.
+            turnWatchers.stopAll('socket closed');
             cleanup();
             resolve({ closeCode: code, reason: reasonBuf?.toString('utf-8') ?? '', connected: opened });
         });
