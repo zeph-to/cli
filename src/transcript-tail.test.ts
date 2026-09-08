@@ -193,12 +193,21 @@ describe('projectTranscriptEntries', () => {
         expect(events).toEqual([{ kind: 'tool_result', id: 't9', ok: false }]);
     });
 
-    it('prefers a Bash description over the raw command as the target', () => {
+    it('labels a Bash call with its description', () => {
         const events = projectTranscriptEntries([
             toolUseLine('t2', 'Bash', { command: 'rm -rf /tmp/x', description: 'Remove scratch dir' }),
         ]);
 
         expect(events[0]).toMatchObject({ name: 'Bash', target: 'Remove scratch dir' });
+    });
+
+    it('never puts a command line on the wire, even when there is no description to use instead', () => {
+        const events = projectTranscriptEntries([
+            toolUseLine('t3', 'Bash', { command: 'curl -H "Authorization: Bearer sk-secret" https://api.example.com' }),
+        ]);
+
+        expect(events).toEqual([{ kind: 'tool', id: 't3', name: 'Bash' }]);
+        expect(JSON.stringify(events)).not.toContain('sk-secret');
     });
 
     it('never carries tool_result bodies or tool inputs onto the wire', () => {

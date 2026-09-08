@@ -225,10 +225,20 @@ export type TurnEvent =
 
 /**
  * Which input field reads as "what this call is about". Ordered, first match
- * wins: `description` beats `command` because it is the sentence a human wrote
- * about the command, which is exactly what a collapsed timeline row wants.
+ * wins: `description` leads because it is the sentence a human wrote about the
+ * call, which is exactly what a collapsed timeline row wants.
+ *
+ * `command` is deliberately absent. It would only ever be reached for a Bash
+ * call with no `description`, and measured over the 60 most recent transcripts
+ * that is 0 of 2985 calls — while a command line is the single field here most
+ * likely to carry a secret (an `Authorization` header, a token in a URL, a
+ * profile name). Zero measured value against the worst downside on the list.
+ *
+ * This list is Claude Code's vocabulary. Another agent names its inputs
+ * differently, so a second agent means a second projector, not a longer list —
+ * see the note on `projectTranscriptEntries`.
  */
-const TARGET_KEYS = ['description', 'file_path', 'path', 'pattern', 'query', 'url', 'skill', 'command'] as const;
+const TARGET_KEYS = ['description', 'file_path', 'path', 'pattern', 'query', 'url', 'skill'] as const;
 
 const clamp = (value: string): string =>
     value.length > MAX_EVENT_FIELD_CHARS ? value.slice(0, MAX_EVENT_FIELD_CHARS) : value;
@@ -276,6 +286,17 @@ const promptTextOf = (entry: Record<string, unknown>): string | null => {
  * `sinceLastPrompt` is for the backfill window: finished turns already exist in
  * the chat as their completion pushes, so replaying them would double every
  * message. Only the turn still in flight is new information.
+ *
+ * The prompt a person typed IS carried, unlike anything a tool read or wrote.
+ * It is their own words, it is the same class of content the completion push
+ * already sends, and without it the timeline is a list of tool names with no
+ * record of what was asked.
+ *
+ * Everything here — the block shapes, the entry types, `TARGET_KEYS` — is Claude
+ * Code's transcript format. Supporting another agent (pi, Codex) means a
+ * projector of its own alongside this one, reached the way `REMOTE_AGENTS`
+ * already reaches per-agent session resolvers; `turn-watch` takes the reader as
+ * a dependency and needs no change for it.
  */
 export const projectTranscriptEntries = (
     lines: readonly string[],
