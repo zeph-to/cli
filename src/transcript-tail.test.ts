@@ -261,6 +261,18 @@ describe('projectTranscriptEntries', () => {
         expect((events[0] as { text: string }).text).toHaveLength(MAX_EVENT_TEXT_CHARS);
     });
 
+    it('carries the entry timestamp, so a viewer can place the turn in time', () => {
+        const events = projectTranscriptEntries([
+            line({
+                type: 'assistant',
+                timestamp: '2026-09-08T07:30:00.000Z',
+                message: { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: {} }] },
+            }),
+        ]);
+
+        expect(events[0]).toMatchObject({ at: '2026-09-08T07:30:00.000Z' });
+    });
+
     it('reads a prompt that arrived as text blocks beside an attachment', () => {
         const events = projectTranscriptEntries([
             line({

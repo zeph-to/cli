@@ -245,11 +245,18 @@ export const readTranscriptDelta = (path: string, prev: TailState | null): TailR
  * routinely in a previous tick's batch — merging by `id` is the viewer's job,
  * and it is the only side that holds the whole turn.
  */
-export type TurnEvent =
+/**
+ * `at` is the transcript entry's own timestamp, carried so the viewer can place
+ * a live turn among the pushes in time order instead of parking the whole live
+ * block below them — where a message sent while reading lands above the turn it
+ * answers.
+ */
+export type TurnEvent = { at?: string } & (
     | { kind: 'tool'; id: string; name: string; target?: string }
     | { kind: 'tool_result'; id: string; ok: boolean }
     | { kind: 'text'; text: string }
-    | { kind: 'prompt'; text: string };
+    | { kind: 'prompt'; text: string }
+);
 
 /**
  * Which input field reads as "what this call is about". Ordered, first match
@@ -416,20 +423,22 @@ export const projectTranscriptEntries = (
         // it, which the parent transcript already shows as one row.
         if (entry.isSidechain) continue;
 
+        const at = typeof entry.timestamp === 'string' ? entry.timestamp : undefined;
+
         const prompt = promptTextOf(entry);
         if (prompt !== null) {
-            events.push({ kind: 'prompt', text: clamp(prompt, MAX_EVENT_TEXT_CHARS) });
+            events.push({ kind: 'prompt', text: clamp(prompt, MAX_EVENT_TEXT_CHARS), ...(at ? { at } : {}) });
             continue;
         }
 
         for (const block of contentBlocks(entry)) {
             if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
                 const target = targetOf(block.input);
-                events.push({ kind: 'tool', id: block.id, name: clamp(block.name), ...(target ? { target } : {}) });
+                events.push({ kind: 'tool', id: block.id, name: clamp(block.name), ...(target ? { target } : {}), ...(at ? { at } : {}) });
                 continue;
             }
             if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
-                events.push({ kind: 'tool_result', id: block.tool_use_id, ok: block.is_error !== true });
+                events.push({ kind: 'tool_result', id: block.tool_use_id, ok: block.is_error !== true, ...(at ? { at } : {}) });
                 continue;
             }
             // Prose, only from the model. A user entry reaching here has already
@@ -442,7 +451,7 @@ export const projectTranscriptEntries = (
                 typeof block.text === 'string' &&
                 block.text.trim()
             ) {
-                events.push({ kind: 'text', text: clamp(block.text, MAX_EVENT_TEXT_CHARS) });
+                events.push({ kind: 'text', text: clamp(block.text, MAX_EVENT_TEXT_CHARS), ...(at ? { at } : {}) });
             }
             // `thinking` falls through on purpose — the timeline shows what the
             // agent did, not what it considered.
