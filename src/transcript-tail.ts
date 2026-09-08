@@ -280,8 +280,43 @@ const contentBlocks = (entry: Record<string, unknown>): Record<string, unknown>[
  * model, and counting it as a prompt would cut every turn into fragments —
  * the same distinction `plugin/hooks/zeph-stop.sh` draws to scope a turn.
  */
+/**
+ * Harness plumbing that Claude Code writes into the conversation as if a person
+ * had said it: background-task notifications, injected reminders, the caveat
+ * wrapper around a slash command's own output.
+ *
+ * Dropping these is not cosmetic. A `<task-notification>` rendered as a prompt
+ * bubble puts internal ids, tool-use ids and whatever a tool reported on a
+ * phone screen, attributed to the user — and there is no bound on what a future
+ * notification carries.
+ */
+const SYNTHETIC_BLOCKS = /<(task-notification|system-reminder|local-command-caveat|local-command-stdout|command-message|command-name|command-args)>[\s\S]*?<\/\1>/g;
+
+/** `<command-name>/simplify</command-name>` — the one wrapper worth keeping, as what it names. */
+const COMMAND_NAME = /<command-name>([^<]*)<\/command-name>/;
+
+/**
+ * Whether this entry is a person speaking.
+ *
+ * `origin.kind` is the honest answer where Claude Code writes it: `human` for
+ * both a typed message and a slash command, something else for everything the
+ * harness injects. Absent — an older version — it falls through to the tag
+ * check below, so a build that does not stamp provenance still cannot leak a
+ * notification it happens to phrase as a user turn.
+ */
+const isHumanTurn = (entry: Record<string, unknown>): boolean => {
+    if (entry.promptSource === 'system') return false;
+    const origin = entry.origin;
+    if (origin && typeof origin === 'object') {
+        const kind = (origin as Record<string, unknown>).kind;
+        if (typeof kind === 'string') return kind === 'human';
+    }
+    return true;
+};
+
 const promptTextOf = (entry: Record<string, unknown>): string | null => {
     if (entry.type !== 'user' || entry.isMeta) return null;
+    if (!isHumanTurn(entry)) return null;
     const message = entry.message;
     if (!message || typeof message !== 'object') return null;
     const content = (message as Record<string, unknown>).content;
@@ -308,8 +343,14 @@ const promptTextOf = (entry: Record<string, unknown>): string | null => {
  * else. The attachment itself is not on this wire — showing that one exists is a
  * separate feature, not a reason to ship the path.
  */
-const stripAttachmentMarkers = (text: string): string =>
-    text.replace(/\[Image:[^\]]*\]/g, '').replace(/\n{3,}/g, '\n\n');
+const stripAttachmentMarkers = (text: string): string => {
+    const command = text.match(COMMAND_NAME)?.[1]?.trim();
+    const body = text.replace(SYNTHETIC_BLOCKS, '');
+    // A slash command is a person's turn, and its name is the whole of what they
+    // said — the wrapper around it is not.
+    const withCommand = command ? `${command}\n${body}` : body;
+    return withCommand.replace(/\[Image:[^\]]*\]/g, '').replace(/\n{3,}/g, '\n\n');
+};
 
 /** Trimmed, or null when nothing survived — a message that was only an attachment. */
 const nonEmpty = (text: string): string | null => {

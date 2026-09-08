@@ -300,6 +300,61 @@ describe('projectTranscriptEntries', () => {
         expect(events).toEqual([]);
     });
 
+    it('never shows harness plumbing as something a person said', () => {
+        const notification = line({
+            type: 'user',
+            promptSource: 'system',
+            origin: { kind: 'task-notification' },
+            message: {
+                role: 'user',
+                content: '<task-notification>\n<task-id>abc123</task-id>\n<result>internal</result>\n</task-notification>',
+            },
+        });
+
+        const events = projectTranscriptEntries([notification]);
+
+        expect(events).toEqual([]);
+    });
+
+    it('drops an injected reminder even from a build that stamps no provenance', () => {
+        const events = projectTranscriptEntries([
+            line({
+                type: 'user',
+                message: { role: 'user', content: '<system-reminder>do the thing</system-reminder>' },
+            }),
+        ]);
+
+        expect(events).toEqual([]);
+    });
+
+    it('keeps a slash command as the person\'s turn, named by the command', () => {
+        const events = projectTranscriptEntries([
+            line({
+                type: 'user',
+                origin: { kind: 'human' },
+                message: {
+                    role: 'user',
+                    content: '<command-message>simplify</command-message>\n<command-name>/simplify</command-name>',
+                },
+            }),
+        ]);
+
+        expect(events).toEqual([{ kind: 'prompt', text: '/simplify' }]);
+    });
+
+    it('keeps what a person typed', () => {
+        const events = projectTranscriptEntries([
+            line({
+                type: 'user',
+                promptSource: 'typed',
+                origin: { kind: 'human' },
+                message: { role: 'user', content: 'ship it' },
+            }),
+        ]);
+
+        expect(events).toEqual([{ kind: 'prompt', text: 'ship it' }]);
+    });
+
     it('treats a real user prompt as a prompt but a tool_result carrier as not one', () => {
         const events = projectTranscriptEntries([userLine('do the thing'), toolResultLine('t5')]);
 
