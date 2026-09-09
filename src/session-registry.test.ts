@@ -5,23 +5,12 @@
  * refuses to store, is a security property, not bookkeeping.
  */
 
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, statSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { chmodSync, mkdirSync, statSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
-import { describe, expect, it, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it } from 'vitest';
+import { withTmpStateDir } from './test-state-dir.js';
 
-let TMP: string;
-const originalState = process.env.XDG_STATE_HOME;
-
-beforeEach(() => {
-    TMP = mkdtempSync(join(tmpdir(), 'zeph-registry-'));
-    process.env.XDG_STATE_HOME = TMP;
-});
-afterEach(() => {
-    rmSync(TMP, { recursive: true, force: true });
-    if (originalState === undefined) delete process.env.XDG_STATE_HOME;
-    else process.env.XDG_STATE_HOME = originalState;
-});
+withTmpStateDir('zeph-registry-');
 
 const {
     appendTurnRing,

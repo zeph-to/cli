@@ -82,6 +82,16 @@ const removeQuietly = (path: string): void => {
     }
 };
 
+/**
+ * How far under the cap a trim cuts.
+ *
+ * Trimming exactly to the cap would leave the file one event below it, so the
+ * next append crosses again and rewrites the whole thing — a full read, split
+ * and rename per event for the rest of the session. Cutting deeper buys roughly
+ * a quarter of the ring's worth of appends between rewrites.
+ */
+const TRIM_TARGET_BYTES = Math.floor(MAX_TURN_RING_BYTES * 0.75);
+
 /** Keep the newest lines that fit under `MAX_TURN_RING_BYTES`. False when the cap still stands broken. */
 const trimToCap = (path: string): boolean => {
     let raw: string;
@@ -94,10 +104,10 @@ const trimToCap = (path: string): boolean => {
     const lines = raw.split('\n').filter((line) => line.length > 0);
     let bytes = 0;
     let start = lines.length;
-    // Walk back from the newest, taking lines until the next one would not fit.
+    // Newest first, until the next line would not fit.
     while (start > 0) {
         const size = Buffer.byteLength(lines[start - 1]!, 'utf-8') + 1;
-        if (bytes + size > MAX_TURN_RING_BYTES) break;
+        if (bytes + size > TRIM_TARGET_BYTES) break;
         bytes += size;
         start--;
     }

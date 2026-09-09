@@ -399,15 +399,8 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
         // that has been superseded stops here instead of interleaving its pages
         // with the newer one's.
         const epoch = watcher.epoch;
-        // A refused page is not the end of the history. `emit` already counts
-        // seal failures and ends the watch at MAX_TURN_SEAL_FAILURES — which the
-        // viewer is told about — so abandoning the remaining pages here would
-        // turn one transient failure into scrollback that is silently short,
-        // indistinguishable from a session that simply did little.
-        const keepGoing = async (page: TurnEvent[]): Promise<boolean> => {
-            await emit(watcher, page);
-            return watchers.get(watcher.sessionName) === watcher && watcher.epoch === epoch;
-        };
+        const superseded = (): boolean =>
+            watchers.get(watcher.sessionName) !== watcher || watcher.epoch !== epoch;
         let page: TurnEvent[] = [];
         let bytes = 0;
         for (const event of recent) {
@@ -418,14 +411,20 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
             // budget is what keeps a *batch* well inside the transport, not a
             // promise about every single event.
             if (page.length && bytes + size > MAX_TURN_FRAME_BYTES) {
-                if (!(await keepGoing(page))) return;
+                // A refused page is not the end of the history: `emit` already
+                // counts seal failures and ends the watch at
+                // MAX_TURN_SEAL_FAILURES — which the viewer is told about — so
+                // stopping here on one transient failure would leave scrollback
+                // silently short, indistinguishable from a quiet session.
+                await emit(watcher, page);
+                if (superseded()) return;
                 page = [];
                 bytes = 0;
             }
             page.push(event);
             bytes += size;
         }
-        if (page.length) await keepGoing(page);
+        if (page.length) await emit(watcher, page);
     };
 
     /**
