@@ -8,7 +8,7 @@
  * so the session cannot be started again afterwards.
  */
 
-import { mkdirSync, mkdtempSync, rmSync } from 'fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
@@ -48,6 +48,7 @@ mkdirSync(PROJECT_DIR, { recursive: true });
 
 const { handleSessionForgetRequest, computeListenerDeviceId } = await import('./listener.js');
 const { rememberSessions, knownSessions, isKnownSession } = await import('./session-registry.js');
+const { appendTurnRing, readTurnRing, turnRingDir } = await import('./turn-ring.js');
 
 describe('agent.session.forget.request — deleting a session this machine ran', () => {
     const device = computeListenerDeviceId();
@@ -103,6 +104,35 @@ describe('agent.session.forget.request — deleting a session this machine ran',
     });
 
     describe('what it will forget', () => {
+        it('takes the chat scrollback with the record', () => {
+            remember();
+            appendTurnRing('zeph-api', [{ kind: 'text', text: 'a week of prompts' }]);
+
+            const { reply } = ask();
+
+            expect(reply).toMatchObject({ forgotten: true });
+            expect(reply).not.toHaveProperty('scrollbackKept');
+            expect(readTurnRing('zeph-api')).toEqual([]);
+        });
+
+        it('says the scrollback stayed when its file will not delete, instead of a flat forgotten', () => {
+            remember();
+            appendTurnRing('zeph-api', [{ kind: 'text', text: 'a week of prompts' }]);
+            chmodSync(turnRingDir(), 0o500);
+
+            try {
+                const { reply } = ask();
+
+                // The session is unstartable either way, but its prompts and
+                // tool targets are still on this machine — answering a plain
+                // "forgotten" would be the one wrong answer here.
+                expect(reply).toMatchObject({ forgotten: true, scrollbackKept: true });
+            } finally {
+                chmodSync(turnRingDir(), 0o700);
+            }
+            expect(isKnownSession('zeph-api')).toBe(false);
+        });
+
         it('drops the session from its own record and says so', () => {
             remember();
 

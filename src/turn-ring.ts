@@ -82,14 +82,14 @@ const removeQuietly = (path: string): void => {
     }
 };
 
-/** Keep the newest lines that fit under `MAX_TURN_RING_BYTES`. */
-const trimToCap = (path: string): void => {
+/** Keep the newest lines that fit under `MAX_TURN_RING_BYTES`. False when the cap still stands broken. */
+const trimToCap = (path: string): boolean => {
     let raw: string;
     try {
-        if (statSync(path).size <= MAX_TURN_RING_BYTES) return;
+        if (statSync(path).size <= MAX_TURN_RING_BYTES) return true;
         raw = readFileSync(path, 'utf-8');
     } catch {
-        return;
+        return false;
     }
     const lines = raw.split('\n').filter((line) => line.length > 0);
     let bytes = 0;
@@ -118,8 +118,12 @@ const trimToCap = (path: string): void => {
     try {
         writeFileSync(tmp, kept, { mode: 0o600, flag: 'wx' });
         renameSync(tmp, path);
+        return true;
     } catch {
         removeQuietly(tmp);
+        // The append landed but the cap did not. Saying the write succeeded
+        // would let the file grow past its bound with nothing ever noticing.
+        return false;
     }
 };
 
@@ -128,8 +132,8 @@ const trimToCap = (path: string): void => {
  * — the ring's whole meaning is "what the viewer already received", and a replay
  * is that array sent again.
  */
-export const appendTurnRing = (sessionName: string, events: readonly TurnEvent[]): void => {
-    if (!events.length) return;
+export const appendTurnRing = (sessionName: string, events: readonly TurnEvent[]): boolean => {
+    if (!events.length) return true;
     let path: string;
     try {
         // Inside the guard: the name arrives off the wire, and a non-string one
@@ -147,9 +151,11 @@ export const appendTurnRing = (sessionName: string, events: readonly TurnEvent[]
         chmodSync(turnRingDir(), 0o700);
         chmodSync(path, 0o600);
     } catch {
-        return;
+        // The caller says so once per session rather than per tick: a full disk
+        // costs the scrollback, and silence about it costs the diagnosis.
+        return false;
     }
-    trimToCap(path);
+    return trimToCap(path);
 };
 
 /**
@@ -228,4 +234,49 @@ export const sweepTurnRings = (now: number = Date.now()): void => {
     if (live.length <= MAX_TURN_RING_FILES) return;
     live.sort((a, b) => a.mtimeMs - b.mtimeMs);
     for (const stale of live.slice(0, live.length - MAX_TURN_RING_FILES)) removeQuietly(stale.path);
+};
+
+/**
+ * Forget one session's scrollback outright — the machine was told to forget the
+ * session. False when the file is still there, which the caller has to say out
+ * loud: answering "forgotten" while a week of prompts and tool targets sits on
+ * disk is the one wrong answer here.
+ */
+export const removeTurnRing = (sessionName: string): boolean => {
+    let path: string;
+    try {
+        path = turnRingPath(sessionName);
+    } catch {
+        return true; // a name that cannot even be hashed has no ring
+    }
+    try {
+        unlinkSync(path);
+        return true;
+    } catch (err) {
+        // Already gone is the outcome the caller asked for. Checking existence
+        // first and then unlinking would call a file that vanished in between a
+        // failure, and answer "your scrollback is still there" about nothing.
+        return (err as NodeJS.ErrnoException)?.code === 'ENOENT';
+    }
+};
+
+/**
+ * The three operations a watcher needs, as one injectable surface.
+ *
+ * The watcher takes this rather than importing the module so its tests can hold
+ * the ring in memory — what the disk does is settled here, and re-proving it
+ * through a socket-and-transcript harness would only make those tests slower and
+ * no more truthful.
+ */
+export interface TurnRing {
+    read: (sessionName: string) => TurnEvent[];
+    /** False when nothing was written — a full disk, a directory that is not ours. */
+    append: (sessionName: string, events: readonly TurnEvent[]) => boolean;
+    sweep: () => void;
+}
+
+export const diskTurnRing: TurnRing = {
+    read: (sessionName) => readTurnRing(sessionName),
+    append: (sessionName, events) => appendTurnRing(sessionName, events),
+    sweep: () => sweepTurnRings(),
 };

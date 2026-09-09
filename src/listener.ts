@@ -63,6 +63,7 @@ import { startInventoryOffload, type InventoryOffload } from './inventory-offloa
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
 import { decryptEphemeral, encryptEphemeral, getDevicePublicKey, initDeviceCrypto, type EncryptedEphemeralPayload } from './crypto.js';
 import { createTurnWatchers, type TurnWatchControl } from './turn-watch.js';
+import { diskTurnRing } from './turn-ring.js';
 import { createInputSequencer, type InputSequencer, type SequencedInput } from './input-sequencer.js';
 import { startKeepAwake } from './keep-awake.js';
 
@@ -1437,6 +1438,13 @@ export interface SessionForgetResult {
     requestId: string;
     sessionName: string;
     forgotten?: true;
+    /**
+     * Set when the record went but the chat scrollback file would not delete.
+     * The session is no longer resumable either way; this says the prompts and
+     * tool targets it collected are still on the machine, which a flat
+     * `forgotten: true` would have claimed otherwise.
+     */
+    scrollbackKept?: true;
     error?: string;
     at: string;
 }
@@ -1481,9 +1489,17 @@ export const handleSessionForgetRequest = (
     if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return reply({ error: 'rate_limited' });
 
     if (sessionExists(sessionName)) return reply({ error: 'still_running' });
-    if (!forgetSession(sessionName)) {
+    const outcome = forgetSession(sessionName);
+    if (outcome === 'unknown') {
         log(`✗ forget ${sessionName}: never seen on this machine`);
         return reply({ error: 'unknown_session' });
+    }
+    if (outcome === 'scrollback_kept') {
+        // The registry entry is gone, so the session is no longer resumable —
+        // but its chat scrollback would not delete, and answering a flat
+        // "forgotten" would overstate what actually happened.
+        log(`🗑 forget ${sessionName}: dropped from the record, but its chat scrollback would not delete`);
+        return reply({ forgotten: true, scrollbackKept: true });
     }
 
     log(`🗑 forget ${sessionName}: dropped from this machine's record`);
@@ -2077,6 +2093,7 @@ const turnWatchers = createTurnWatchers({
     sessionExists: (sessionName) => sessionExists(sessionName),
     initCrypto: async () => { await initDeviceCrypto(); },
     seal: (plaintext, subscriberPublicKey) => encryptEphemeral(plaintext, subscriberPublicKey),
+    ring: diskTurnRing,
     log: (message) => log(message),
 });
 

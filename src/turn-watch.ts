@@ -24,6 +24,7 @@ import {
     type TailState,
     type TurnEvent,
 } from './transcript-tail.js';
+import type { TurnRing } from './turn-ring.js';
 
 /**
  * Watchers this daemon will run at once — the same ceiling, for the same reason,
@@ -80,6 +81,24 @@ export const TRANSCRIPT_RECHECK_MS = 10_000;
  */
 export const MAX_TURN_SEAL_FAILURES = 3;
 
+/**
+ * Ceiling on one replay, in events.
+ *
+ * The viewer keeps a bounded window of live turns, and a replay that filled it
+ * on its own would push the turn actually in flight out of the very screen the
+ * replay exists to fill. Below the web cap on purpose, so the live tail still
+ * has room after a full replay.
+ */
+export const MAX_REPLAY_EVENTS = 400;
+
+/**
+ * Plaintext bytes per frame. Ephemeral frames ride API Gateway's 32KB WebSocket
+ * limit, and sealing base64-expands what goes in it — so this is deliberately
+ * below `SCREEN_PEEK_MAX_BYTES` (24KB, `listener.ts`), which bounds frames that
+ * are never sealed.
+ */
+export const MAX_TURN_FRAME_BYTES = 12 * 1024;
+
 /** Wire shape of one batch of timeline events. */
 export type TurnDeltaFrame = {
     subtype: 'agent.turn.delta';
@@ -129,6 +148,8 @@ export interface TurnWatchDeps {
     /** Seal a batch for the subscriber. Rejecting drops the batch; it never falls back to plaintext. */
     seal: (plaintext: string, subscriberPublicKey: string) => Promise<unknown>;
     log: (message: string) => void;
+    /** Where a watch's events are kept so a later watch can replay them. */
+    ring: TurnRing;
     now?: () => number;
 }
 
@@ -147,6 +168,8 @@ interface Watcher {
     send: SendTurnFrame;
     /** The first read backfills, so it keeps only the turn still in flight. */
     backfilling: boolean;
+    /** Whether this watch has already said its ring cannot be written. */
+    ringWriteFailed?: boolean;
     events: number;
     startedAt: number;
 }
@@ -157,6 +180,31 @@ const isWatchSubtype = (subtype: unknown): subtype is WatchSubtype =>
     subtype === 'agent.turn.watch.start' ||
     subtype === 'agent.turn.watch.stop' ||
     subtype === 'agent.turn.watch.renew';
+
+/**
+ * The part of a backfill the ring has not already sent.
+ *
+ * A restart re-reads the same region of the transcript the ring was filled
+ * from, so without this the first frames after every re-open would repeat the
+ * turn the replay just drew. An event with no `at` is kept: a transcript entry
+ * with no timestamp gives the cut nothing to compare, and showing a turn twice
+ * is recoverable where dropping one is not.
+ *
+ * The line is read off the ring at cut time rather than tracked as the watcher
+ * sends, so it says exactly what has been recorded — a live batch the seal
+ * refused was never appended and so never moves it. (A replayed page is the
+ * other case: it came out of the ring, so it counts whether or not this viewer
+ * received it, and the next re-open replays it again.) Reading it here also
+ * removes a race, since `beginWatch` starts the replay without awaiting it and
+ * a cached line could still be unset when the first poll lands.
+ */
+const afterRingTail = (events: TurnEvent[], held: readonly TurnEvent[]): TurnEvent[] => {
+    let tail: string | undefined;
+    for (const event of held) {
+        if (event.at && (!tail || event.at > tail)) tail = event.at;
+    }
+    return tail ? events.filter((event) => !event.at || event.at > tail) : events;
+};
 
 /**
  * A registry of transcript watchers plus the control handler that drives it.
@@ -241,9 +289,14 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
                 deps.log(`⧉ turn-watch ${sessionName}: dropped ${read.droppedLines} oversized line(s)`);
             }
             if (read.lines.length) {
-                const events = projectTranscriptEntries(read.lines, { sinceLastPrompt: watcher.backfilling });
+                const projected = projectTranscriptEntries(read.lines, { sinceLastPrompt: watcher.backfilling });
+                const backfilling = watcher.backfilling;
                 watcher.backfilling = false;
-                if (events.length) await emit(watcher, events);
+                // Cut before the send, not after: the ring records what went out,
+                // so recording the uncut batch would make the next replay resend
+                // what this one just skipped.
+                const events = backfilling ? afterRingTail(projected, deps.ring.read(sessionName)) : projected;
+                if (events.length && (await emit(watcher, events))) recordSent(watcher, events);
             }
         }
     };
@@ -257,7 +310,7 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
         watcher.timer.unref?.();
     };
 
-    const emit = async (watcher: Watcher, events: TurnEvent[]): Promise<void> => {
+    const emit = async (watcher: Watcher, events: TurnEvent[]): Promise<boolean> => {
         const frame: TurnDeltaFrame = {
             subtype: 'agent.turn.delta',
             sessionName: watcher.sessionName,
@@ -286,7 +339,7 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
                     });
                     stop(watcher.sessionName, 'seal failed');
                 }
-                return;
+                return false;
             }
         } else {
             frame.events = events;
@@ -294,6 +347,85 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
 
         watcher.events += events.length;
         watcher.send(frame as unknown as Record<string, unknown>);
+        return true;
+    };
+
+    /**
+     * Everything a batch that actually went out changes.
+     *
+     * The ring's whole meaning is "what this viewer has already been handed", so
+     * it is written here and nowhere else — a batch the seal refused never
+     * reached anyone and must not come back as scrollback.
+     */
+    const recordSent = (watcher: Watcher, events: TurnEvent[]): void => {
+        let wrote = false;
+        try {
+            wrote = deps.ring.append(watcher.sessionName, events);
+        } catch {
+            // The ring is injected, so a caller's implementation can throw where
+            // this one returns false. Either way the live send has already
+            // happened and must not be undone by the record of it.
+        }
+        // Once per watch, not per tick: a full disk stays full, and a line every
+        // 500ms would bury the log it is trying to explain.
+        if (!wrote && !watcher.ringWriteFailed) {
+            watcher.ringWriteFailed = true;
+            // Deliberately not "the scrollback will be short": the same false
+            // covers a trim that could not run, where the file is over its cap
+            // rather than under-filled. One line that is true of both.
+            deps.log(`⧉ turn-watch ${watcher.sessionName}: ring write failed — scrollback for this session is unreliable`);
+        }
+    };
+
+    /**
+     * Send what the ring holds, oldest first, before the transcript is read.
+     *
+     * This is the reason the ring exists: the backfill replays only since the
+     * last prompt, on the assumption that finished turns are already in the chat
+     * as their completion pushes — which under the `quiet` dial they are not.
+     *
+     * Paged, because one frame is bounded by the transport and a week of turns
+     * is not. Through `emit`, because that is where a subscriber's seal is
+     * applied; not through `recordSent`, because these events are already in the
+     * ring and re-appending them would double it on every re-open.
+     */
+    const replayRing = async (watcher: Watcher): Promise<void> => {
+        const held = deps.ring.read(watcher.sessionName);
+        if (!held.length) return;
+        const recent = held.length > MAX_REPLAY_EVENTS ? held.slice(held.length - MAX_REPLAY_EVENTS) : held;
+        // A second `start` on this same watcher re-seeds it and begins its own
+        // replay, and the object identity check below cannot see that — it is
+        // the same object. The epoch is what a re-seed changes, so a replay
+        // that has been superseded stops here instead of interleaving its pages
+        // with the newer one's.
+        const epoch = watcher.epoch;
+        // A refused page is not the end of the history. `emit` already counts
+        // seal failures and ends the watch at MAX_TURN_SEAL_FAILURES — which the
+        // viewer is told about — so abandoning the remaining pages here would
+        // turn one transient failure into scrollback that is silently short,
+        // indistinguishable from a session that simply did little.
+        const keepGoing = async (page: TurnEvent[]): Promise<boolean> => {
+            await emit(watcher, page);
+            return watchers.get(watcher.sessionName) === watcher && watcher.epoch === epoch;
+        };
+        let page: TurnEvent[] = [];
+        let bytes = 0;
+        for (const event of recent) {
+            const size = Buffer.byteLength(JSON.stringify(event), 'utf-8') + 1;
+            // `page.length &&` — one event bigger than the whole budget still
+            // goes, alone. Prose is clamped at MAX_EVENT_TEXT_CHARS characters,
+            // not bytes, so a Korean paragraph can reach ~15KB plaintext; the
+            // budget is what keeps a *batch* well inside the transport, not a
+            // promise about every single event.
+            if (page.length && bytes + size > MAX_TURN_FRAME_BYTES) {
+                if (!(await keepGoing(page))) return;
+                page = [];
+                bytes = 0;
+            }
+            page.push(event);
+            bytes += size;
+        }
+        if (page.length) await keepGoing(page);
     };
 
     /**
@@ -378,6 +510,9 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
             startedAt: now(),
         };
         watchers.set(req.sessionName, watcher);
+        // Once per new watch, not per tick: the sweep is a directory read, and a
+        // machine that has run agents for months is the only one it matters for.
+        deps.ring.sweep();
         beginWatch(watcher, transcriptPath, req.subscriberPublicKey, send);
         return true;
     };
@@ -435,6 +570,7 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
         // everything below its old high-water mark.
         watcher.epoch += 1;
         watcher.seq = 0;
+        watcher.ringWriteFailed = false;
         watcher.checkedAt = now();
         deps.log(`⧉ turn-watch ${watcher.sessionName} started (${subscriberPublicKey ? 'sealed' : 'plaintext'})`);
     };
@@ -469,6 +605,10 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
             }
             if (watchers.get(watcher.sessionName) !== watcher) return;
         }
+        // Before the read, so the chat draws its history and then its live turn
+        // in the order they happened.
+        await replayRing(watcher);
+        if (watchers.get(watcher.sessionName) !== watcher) return;
         await tick(watcher.sessionName);
     };
 

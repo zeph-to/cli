@@ -38,6 +38,7 @@ afterEach(() => {
 const {
     appendTurnRing,
     readTurnRing,
+    removeTurnRing,
     sweepTurnRings,
     turnRingPath,
     turnRingDir,
@@ -152,6 +153,37 @@ describe('turn ring — damaged and expired files', () => {
         // append lands on top of pre-expiry content and the TTL means nothing.
         appendTurnRing('zeph-app', [text('fresh')]);
         expect(readTurnRing('zeph-app')).toEqual([text('fresh')]);
+    });
+});
+
+describe('turn ring — reporting what it could not do', () => {
+    it('says the write failed instead of reporting a scrollback it never kept', () => {
+        // Something else already owns that name. Silence here is what makes a
+        // short scrollback undiagnosable: the live lane keeps working and
+        // nothing anywhere says why the history stopped growing.
+        mkdirSync(turnRingPath('zeph-app'), { recursive: true });
+
+        expect(appendTurnRing('zeph-app', [text('nowhere to go')])).toBe(false);
+    });
+
+    it('reports success only when the events are actually readable again', () => {
+        expect(appendTurnRing('zeph-app', [text('kept')])).toBe(true);
+        expect(readTurnRing('zeph-app')).toEqual([text('kept')]);
+    });
+
+    it('reports a ring it could not delete, rather than claiming the session was forgotten', () => {
+        appendTurnRing('zeph-app', [text('still here')]);
+        chmodSync(turnRingDir(), 0o500);
+
+        try {
+            expect(removeTurnRing('zeph-app')).toBe(false);
+        } finally {
+            chmodSync(turnRingDir(), 0o700);
+        }
+        expect(removeTurnRing('zeph-app')).toBe(true);
+        // Removing a ring that was never there is not a failure — nothing is
+        // what the caller asked for.
+        expect(removeTurnRing('never-watched')).toBe(true);
     });
 });
 

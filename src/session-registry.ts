@@ -15,6 +15,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
+import { removeTurnRing } from './turn-ring.js';
 import { stateDir } from './gate.js';
 
 export interface KnownSession {
@@ -138,12 +139,24 @@ export const rememberSessions = (
  * running, so nothing re-adds an entry for a session that has ended. Running
  * that name again is what brings it back, which is also the only way back.
  */
-export const forgetSession = (name: string): boolean => {
+export type ForgetOutcome =
+    /** This machine never had a record under that name. */
+    | 'unknown'
+    /** Registry entry and chat scrollback both gone. */
+    | 'forgotten'
+    /** Registry entry gone, but the scrollback file would not delete. */
+    | 'scrollback_kept';
+
+export const forgetSession = (name: string): ForgetOutcome => {
     const entries = readAll();
     const kept = entries.filter((e) => e.name !== name);
-    if (kept.length === entries.length) return false;
+    if (kept.length === entries.length) return 'unknown';
     writeAll(kept);
-    return true;
+    // The chat's scrollback for that session goes with it. Forgetting a session
+    // everywhere except the one file that holds a week of its prompts and tool
+    // targets is not forgetting it — and a failure to delete that file has to
+    // reach the person who asked, not stay in a swallowed catch.
+    return removeTurnRing(name) ? 'forgotten' : 'scrollback_kept';
 };
 
 /** Whether the registry knows this name — the resume whitelist check. */
