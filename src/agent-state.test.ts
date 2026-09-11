@@ -276,4 +276,12 @@ describe('candidate pi rules — screens not captured', () => {
     it('a status line drawn in braille that is not a spinner frame stays idle', () => {
         expect(pi(['───', '↑531k ↓139k $0.316 5.0%/1.0M (auto)', '⠠⠄ caveman level: FULL'])).toBe('idle');
     });
+
+    it('the spinner counts bare at line start, as a custom editor draws it', () => {
+        expect(pi([' ⠦ Working', '▎', ' dou-app on  main [░░░] 7.0%/1.0M'])).toBe('working');
+    });
+
+    it('a braille glyph mid-line in leftover output is not the spinner', () => {
+        expect(pi(['  build: 12 files ⠙ cached', '───', '↑3.8k ↓33 0.4%/1.0M (auto)'])).toBe('idle');
+    });
 });

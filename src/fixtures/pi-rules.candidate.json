@@ -1,6 +1,6 @@
 {
   "$comment": "Candidate pi detection rules, verified against real panes by harness-bench.test.ts before they are published. These are DATA for the OTA manifest (zeph/apps/server/src/agent-rules/manifest.json), not bundled rules — agent-rules.default.ts stays empty for pi so a listener that cannot reach the endpoint keeps reporting `unknown` rather than guessing. Authored from panes captured for this repo (pi v0.85.1) and from pi's own dialog hint strings (dist/modes/interactive/components/extension-selector.js, extension-input.js); no rule content is carried over from any other project.",
-  "$coverage": "`blocked` was captured on a picker drawn through ctx.ui.custom by an ask_user_question extension (hint `↑↓ navigate • Enter select • Esc cancel`). pi core's own extension dialogs end their hint with `escape/ctrl+c cancel` under the default keybindings — matched by the same pattern but read from the vendor file, not captured. A user who rebinds tui.select.cancel changes that text and falls back to `working` or `idle`. `working` is pi's default Loader frames inside the editor's top border; an extension that swaps the indicator frames reports `idle` while working. `idle` keys on the footer's context-usage figure (`5.0%/1.0M`, or `?/1.0M` right after a compaction — footer.js), which renders from the first frame, before any token count exists. The footer truncates its stats line with `...` when it is wider than the pane (footer.js:155-158) and the context figure is its last item, so a pane too narrow for the stats reports `unknown` rather than `idle`.",
+  "$coverage": "`blocked` was captured on a picker drawn through ctx.ui.custom by an ask_user_question extension (hint `↑↓ navigate • Enter select • Esc cancel`). pi core's own extension dialogs end their hint with `escape/ctrl+c cancel` under the default keybindings — matched by the same pattern but read from the vendor file, not captured. A user who rebinds tui.select.cancel changes that text and falls back to `working` or `idle`. `working` is pi's default Loader frames at the start of a line, bare or inside the editor's top border — anchored so a braille glyph mid-line in tool output does not count; an extension that swaps the indicator frames reports `idle` while working. `idle` keys on the footer's context-usage figure (`5.0%/1.0M`, or `?/1.0M` right after a compaction — footer.js), which renders from the first frame, before any token count exists. The footer truncates its stats line with `...` when it is wider than the pane (footer.js:155-158) and the context figure is its last item, so a pane too narrow for the stats reports `unknown` rather than `idle`.",
   "rules": [
     {
       "id": "pi-blocked-dialog",
@@ -15,7 +15,7 @@
       "id": "pi-working-spinner",
       "state": "working",
       "priority": 800,
-      "regex": ["[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] +[a-z]"]
+      "regex": ["^\\s*(?:─+\\s*)?[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] +[a-z]"]
     },
     {
       "id": "pi-idle-context-footer",
