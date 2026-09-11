@@ -79,6 +79,17 @@ const TURN_FACT_FLAGS =
 const remoteHookCmd = (agent: 'gemini' | 'codex' | 'pi'): string =>
   `$(command -v zeph || echo "npx -y @zeph-to/cli") remote-hook ${agent} 2>/dev/null || true`;
 
+// Waiting-on-you push — the pi twin of the plugin's zeph-ask.sh: same `high`
+// priority, so it gets through the quiet dial, and plain `notify` (no --auto)
+// so only a mute stops it. Title and body arrive as env vars, never spliced
+// into the string: the body can carry the model's own bash command.
+const promptNotifyCmd =
+  '$(command -v zeph || echo "npx -y @zeph-to/cli") notify'
+  + ' --title "$ZEPH_PROMPT_TITLE" --body "$ZEPH_PROMPT_BODY" --priority high 2>/dev/null || true';
+
+/** Grace before the pi extension turns an unanswered prompt into a push. Exported for the tests. */
+export const PI_PROMPT_GRACE_MS = 10_000;
+
 // ── Shared behavioral core ───────────────────────────────────────
 //
 // GENERATED from plugin/docs/CORE_RULES.md — see src/zeph-core.generated.ts
@@ -213,7 +224,7 @@ export const AIDER_RULE = buildRule({
   core: ZEPH_CORE_RULE_ONLY,
 });
 
-/** Pi — managed block in ~/.pi/agent/AGENTS.md. Extension = Stop-equivalent + prompt hook (PI_EXTENSION). */
+/** Pi — managed block in ~/.pi/agent/AGENTS.md. Extension = Stop-equivalent + prompt hook + waiting-on-you push (PI_EXTENSION). */
 export const PI_RULE = buildRule({
   notify: HOOK_DRIVEN_NOTIFY,
   toolAccess: PI_TOOL_ACCESS,
@@ -350,15 +361,54 @@ const sh = (cmd: string, cwd: string, stdin?: string): Promise<string> =>
 // an unknown tool errs toward pushing rather than toward silence.
 const READ_ONLY = new Set(["read", "grep", "find", "ls"]);
 
+// How long a blocking prompt may stay open before it becomes a push. An answer
+// inside the window means the user is at the terminal, and a guard extension
+// can raise several prompts a turn — pushing each one at once would be noise.
+const PROMPT_GRACE_MS = ${PI_PROMPT_GRACE_MS};
+
 export default function (pi: ExtensionAPI) {
   // Turn facts for the push gate. One agent per process, so plain counters
   // suffice — no session keying.
   let tools = 0;
   let nonReadonly = 0;
+  // The tool call in flight. tool_execution_start fires before pi runs the
+  // tool_call handlers, so a guard's prompt always finds its own call here.
+  let running: { toolName: string; args: any } | undefined;
+  let promptTimer: ReturnType<typeof setTimeout> | undefined;
 
+  pi.on("tool_execution_start", (event) => {
+    running = event;
+  });
   pi.on("tool_execution_end", (event) => {
+    running = undefined;
     tools += 1;
     if (!READ_ONLY.has(event.toolName)) nonReadonly += 1;
+  });
+  // Waiting-on-you: pi fires ui_prompt_start for every blocking extension
+  // dialog (select/confirm/input/editor/custom — bash guards, ask-user tools).
+  // A custom dialog carries no title, so name the call that raised it instead.
+  pi.on("ui_prompt_start", (event, ctx) => {
+    clearTimeout(promptTimer);
+    const command = running?.toolName === "bash" ? running.args?.command : undefined;
+    const body = event.title
+      ?? (typeof command === "string" ? "$ " + command : undefined)
+      ?? (running ? running.toolName + " is waiting for your answer" : "Waiting for your input");
+    const env = {
+      ...process.env,
+      ZEPH_PROMPT_TITLE: "pi asks: " + (ctx.cwd.split("/").pop() || ctx.cwd),
+      ZEPH_PROMPT_BODY: body.length > 200 ? body.slice(0, 199) + "…" : body,
+    };
+    promptTimer = setTimeout(() => {
+      promptTimer = undefined;
+      const child = spawn("sh", ["-c", ${JSON.stringify(promptNotifyCmd)}], { cwd: ctx.cwd, env, stdio: "ignore", detached: true });
+      child.on("error", () => {});
+      child.unref();
+    }, PROMPT_GRACE_MS);
+    promptTimer.unref?.();
+  });
+  pi.on("ui_prompt_end", () => {
+    clearTimeout(promptTimer);
+    promptTimer = undefined;
   });
   // Stop-equivalent: agent_settled fires once per user turn, after retries/compaction.
   // Fire-and-forget: never block pi's turn-end on the notify network call.

@@ -12,7 +12,7 @@
  * file exists to prevent.
  */
 import { transformSync } from 'esbuild';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NONREADONLY_COUNT_FLAG, PUSHMODE_DEFAULT_FLAG, TOOL_COUNT_FLAG } from './gate.js';
 import { REMOTE_HOOK_AGENTS } from './remote-hook.js';
 import * as templates from './templates.js';
@@ -276,6 +276,78 @@ describe('templates.ts: the OpenCode plugin bills tool calls to the right sessio
 
         expect(p.commands).toHaveLength(1);
         expect(p.commands[0]).toContain(`--${TOOL_COUNT_FLAG} 2`);
+    });
+});
+
+// Waiting-on-you push. pi 0.85.1 wraps every blocking extension dialog in
+// ui_prompt_start / ui_prompt_end (dist/core/extensions/runner.js
+// withUIPrompt) and emits tool_execution_start before the tool_call handlers
+// that raise a guard's dialog (pi-agent-core dist/agent-loop.js). The timing
+// and the env handoff are behavior, so drive the compiled artifact.
+describe('templates.ts: the pi extension pushes a prompt left unanswered', () => {
+    type Handler = (event: unknown, ctx: unknown) => unknown;
+
+    const loadExtension = () => {
+        const js = transformSync(templates.PI_EXTENSION, { loader: 'ts', format: 'cjs' }).code;
+        const spawned: { command: string; env: Record<string, string | undefined> }[] = [];
+        const mod = { exports: {} as Record<string, unknown> };
+        new Function('exports', 'module', 'require', js)(mod.exports, mod, () => ({
+            spawn: (_sh: string, argv: string[], opts: { env?: Record<string, string> }) => {
+                spawned.push({ command: argv[1], env: opts.env ?? {} });
+                return { on: () => {}, unref: () => {} };
+            },
+        }));
+        const handlers: Record<string, Handler> = {};
+        (mod.exports.default as (pi: unknown) => void)({
+            on: (name: string, handler: Handler) => (handlers[name] = handler),
+        });
+        const ctx = { cwd: '/work/dou-app' };
+        return {
+            spawned,
+            emit: (name: string, event: Record<string, unknown> = {}) => handlers[name]({ type: name, ...event }, ctx),
+        };
+    };
+
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it('pushes the guarded bash command at high priority once the grace passes', () => {
+        const pi = loadExtension();
+        pi.emit('tool_execution_start', { toolName: 'bash', args: { command: 'git status | head' } });
+        pi.emit('ui_prompt_start', { kind: 'custom' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS - 1);
+        expect(pi.spawned).toEqual([]);
+
+        vi.advanceTimersByTime(1);
+        expect(pi.spawned).toHaveLength(1);
+        expect(pi.spawned[0].command).toContain('notify');
+        expect(pi.spawned[0].command).toContain('--priority high');
+        // The command reaches the shell as an env var, not as command text.
+        expect(pi.spawned[0].command).not.toContain('git status');
+        expect(pi.spawned[0].env.ZEPH_PROMPT_TITLE).toBe('pi asks: dou-app');
+        expect(pi.spawned[0].env.ZEPH_PROMPT_BODY).toBe('$ git status | head');
+    });
+
+    it('stays silent when the prompt is answered inside the grace', () => {
+        const pi = loadExtension();
+        pi.emit('ui_prompt_start', { kind: 'confirm', title: 'Delete branch?' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS - 1);
+        pi.emit('ui_prompt_end', { kind: 'confirm', title: 'Delete branch?' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
+        expect(pi.spawned).toEqual([]);
+    });
+
+    it('prefers the dialog title, and falls back once the tool call ends', () => {
+        const pi = loadExtension();
+        pi.emit('tool_execution_start', { toolName: 'bash', args: { command: 'rm -rf dist' } });
+        pi.emit('ui_prompt_start', { kind: 'select', title: 'Pick a target' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
+        pi.emit('ui_prompt_end', { kind: 'select' });
+        pi.emit('tool_execution_end', { toolName: 'bash' });
+        pi.emit('ui_prompt_start', { kind: 'custom' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
+
+        expect(pi.spawned.map((s) => s.env.ZEPH_PROMPT_BODY)).toEqual(['Pick a target', 'Waiting for your input']);
     });
 });
 
