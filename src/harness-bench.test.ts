@@ -10,7 +10,7 @@
  * (the boundary in agent-rules.default.ts:5-7 and SPEC-AGENT-AWARENESS.md:7).
  *
  * The bench reports a matrix of harness × state. A blank cell is NOT a failure:
- * codex and gemini ship with empty rule sets on purpose ("Honest ignorance
+ * codex, gemini and pi ship with empty rule sets on purpose ("Honest ignorance
  * beats guessed state" — agent-rules.default.ts:20-21), because rules arrive as
  * OTA data rather than in a release (§S7). What the bench asserts is that the
  * engine's answer matches what the bundle claims to know:
