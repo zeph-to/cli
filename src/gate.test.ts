@@ -24,6 +24,7 @@ interface Vector {
         alreadyAsked: boolean;
         marker: string;
         pushMode: string;
+        away?: boolean;
     };
     expect: { push: boolean; priority: 'high' | 'normal' };
 }
@@ -45,6 +46,7 @@ describe('gate.ts: decidePush parity with plugin/hooks/gate.sh', () => {
                 alreadyAsked: v.input.alreadyAsked,
                 marker: normalizeMarker(v.input.marker),
                 pushMode: normalizePushMode(v.input.pushMode),
+                away: v.input.away ?? false,
             });
             expect(verdict).toEqual(v.expect);
         });
@@ -71,10 +73,10 @@ describe('gate.ts: normalizers', () => {
     });
 
     // Why --pushmode-default exists: a hook that supplies no turn facts also
-    // supplies no marker, and quiet only lets a `high` marker through. So for
-    // those agents quiet is not a lower volume, it is permanent silence.
-    it('GATE_DEFAULTS can never push in quiet mode', () => {
-        expect(decidePush({ ...GATE_DEFAULTS, marker: 'none', pushMode: 'quiet' }))
+    // supplies no marker, and quiet only lets a `high` marker (or an away
+    // user) through. So for those agents quiet is silence while they're present.
+    it('GATE_DEFAULTS can never push in quiet mode while the user is present', () => {
+        expect(decidePush({ ...GATE_DEFAULTS, marker: 'none', pushMode: 'quiet', away: false }))
             .toEqual({ push: false, priority: 'normal' });
     });
 });

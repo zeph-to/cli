@@ -62,6 +62,8 @@ import { advanceState, evaluateState, findPatternMatch, type AgentState, type Ev
 import { startInventoryOffload, type InventoryOffload } from './inventory-offload.js';
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
 import { decryptEphemeral, encryptEphemeral, getDevicePublicKey, initDeviceCrypto, type EncryptedEphemeralPayload } from './crypto.js';
+import { createTurnWatchers, type TurnWatchControl } from './turn-watch.js';
+import { diskTurnRing } from './turn-ring.js';
 import { createInputSequencer, type InputSequencer, type SequencedInput } from './input-sequencer.js';
 import { startKeepAwake } from './keep-awake.js';
 
@@ -1436,6 +1438,13 @@ export interface SessionForgetResult {
     requestId: string;
     sessionName: string;
     forgotten?: true;
+    /**
+     * Set when the record went but the chat scrollback file would not delete.
+     * The session is no longer resumable either way; this says the prompts and
+     * tool targets it collected are still on the machine, which a flat
+     * `forgotten: true` would have claimed otherwise.
+     */
+    scrollbackKept?: true;
     error?: string;
     at: string;
 }
@@ -1480,9 +1489,17 @@ export const handleSessionForgetRequest = (
     if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return reply({ error: 'rate_limited' });
 
     if (sessionExists(sessionName)) return reply({ error: 'still_running' });
-    if (!forgetSession(sessionName)) {
+    const outcome = forgetSession(sessionName);
+    if (outcome === 'unknown') {
         log(`✗ forget ${sessionName}: never seen on this machine`);
         return reply({ error: 'unknown_session' });
+    }
+    if (outcome === 'scrollback_kept') {
+        // The registry entry is gone, so the session is no longer resumable —
+        // but its chat scrollback would not delete, and answering a flat
+        // "forgotten" would overstate what actually happened.
+        log(`🗑 forget ${sessionName}: dropped from the record, but its chat scrollback would not delete`);
+        return reply({ forgotten: true, scrollbackKept: true });
     }
 
     log(`🗑 forget ${sessionName}: dropped from this machine's record`);
@@ -2050,6 +2067,35 @@ interface ActiveStream {
 const leaseFor = (renewing: boolean): number => (renewing ? STREAM_LEASE_MS : STREAM_MAX_MS);
 
 const activeStreams = new Map<string, ActiveStream>();
+
+/**
+ * The live agent-chat timeline (`turn-watch.ts`), kept beside `activeStreams`
+ * rather than inside it: both are per-session and both end on socket close, but
+ * their lifetimes are driven by different things — a tmux pane for one, a
+ * viewer's lease over a growing file for the other — and merging them would tie
+ * a terminal mirror's death to a chat tab's.
+ */
+const turnWatchers = createTurnWatchers({
+    deviceId: () => computeListenerDeviceId(),
+    resolveTranscript: (sessionName) => {
+        const info = readPaneInfo(sessionName);
+        if (!info.currentPath) return null;
+        // Ask the agent actually running in the pane, through the same detector
+        // the session sweep uses — start_command first, because the foreground
+        // process is usually the interpreter, and quote-stripped, because a
+        // leading `"` once made this exact check miss every wrapped session.
+        // A Codex or Gemini pane carries no resolver yet and answers null, which
+        // the watcher reports as `no_transcript` — the EXTENSION POINT rule the
+        // session-id and session-name resolvers already follow.
+        const agent = detectRemoteAgent(info);
+        return agent?.resolveTranscript?.(info.currentPath, info.panePid ?? undefined) ?? null;
+    },
+    sessionExists: (sessionName) => sessionExists(sessionName),
+    initCrypto: async () => { await initDeviceCrypto(); },
+    seal: (plaintext, subscriberPublicKey) => encryptEphemeral(plaintext, subscriberPublicKey),
+    ring: diskTurnRing,
+    log: (message) => log(message),
+});
 
 /** Inbound key ordering, one per (streamed session, sender device) — see the
  *  `agent.command.input` section below. Lives here so stopStream can drop them
@@ -3241,6 +3287,17 @@ export const writeRemoteMarker = (
     }
 };
 
+/** Take back a marker whose text never reached the pane. Best-effort, like the write. */
+const clearRemoteMarker = (paneCwd: string): void => {
+    const hash = projectHash(paneCwd);
+    if (!hash) return;
+    try {
+        rmSync(remoteMarkerPath(hash), { force: true });
+    } catch {
+        /* a marker we can't remove just expires (15 min) — never fail the push over it */
+    }
+};
+
 const defaultPaneCwd = (session: string): string | null => readPaneInfo(session).currentPath;
 
 /**
@@ -3256,6 +3313,11 @@ const defaultPaneCwd = (session: string): string | null => readPaneInfo(session)
  * submit is the user's own keypress. Text they edit before sending simply
  * fails the match and the marker expires, which is the best-effort contract
  * that path already has.
+ *
+ * The marker goes down BEFORE the keys. An idle agent submits the instant the
+ * Enter lands and its prompt hook looks for the marker right then; written
+ * after the inject, it lost that race and the phone message read as typed at
+ * the keyboard. A failed inject takes the marker back out.
  */
 const tryInject = (session: string, text: string, deps: HandlePushDeps, submit = true): boolean => {
     if (!text) {
@@ -3263,16 +3325,15 @@ const tryInject = (session: string, text: string, deps: HandlePushDeps, submit =
         return false;
     }
     if (!passesInjectGuards(session, deps, SUBMIT_COST)) return false;
+    const cwd = (deps.paneCwd ?? defaultPaneCwd)(session);
+    const marked = cwd !== null && writeRemoteMarker(cwd, text);
     const ok = submit
         ? (deps.inject ?? injectKeys)(session, text)
         : (deps.insertText ?? pasteText)(session, text);
     const preview = text.length > 60 ? text.slice(0, 60) + '…' : text;
     log(`${ok ? (submit ? '→' : '⇢') : '✗'} ${session}: ${preview}`);
-    if (ok) {
-        noteStreamInput(session);
-        const cwd = (deps.paneCwd ?? defaultPaneCwd)(session);
-        if (cwd) writeRemoteMarker(cwd, text);
-    }
+    if (ok) noteStreamInput(session);
+    else if (marked) clearRemoteMarker(cwd);
     return ok;
 };
 
@@ -3810,6 +3871,10 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                 if (
                     !handleCommandInput(m.data as AgentCommandInput, sendEphemeral) &&
                     !handleStreamControl(m.data as StreamControl, sendEphemeral) &&
+                    // The chat timeline's own control messages. Same envelope,
+                    // same addressing rule, different source — a transcript file
+                    // rather than the pane.
+                    !turnWatchers.handle(m.data as TurnWatchControl, sendEphemeral) &&
                     // A page of scrollback answers through `send` rather than by
                     // return value: on an encrypted stream it finishes after the
                     // seal, exactly like the frames it is history for.
@@ -3853,6 +3918,11 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
 
         sock.on('close', (code, reasonBuf) => {
             stopAllStreams();
+            // `send` is a closure over THIS socket, so a watcher that outlived it
+            // would tick forever into a dead connection. Viewers re-arm with a
+            // fresh watch.start after reconnecting, exactly as they re-lease a
+            // terminal stream.
+            turnWatchers.stopAll('socket closed');
             cleanup();
             resolve({ closeCode: code, reason: reasonBuf?.toString('utf-8') ?? '', connected: opened });
         });

@@ -1097,6 +1097,24 @@ describe('writeRemoteMarker (ADR-0002)', () => {
         expect(existsSync(markerPath('/proj/app'))).toBe(true);
     });
 
+    it('is on disk before the keys reach the pane — the prompt hook fires on that Enter', async () => {
+        // An idle agent submits the instant the Enter lands, and its
+        // UserPromptSubmit hook checks for the marker right then. Written
+        // after the inject, the marker lost that race: the phone message read
+        // as typed at the keyboard and sticky REMOTE never started.
+        let markerAtInject = false;
+        await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-app', body: 'hello' },
+            {
+                paneCommand: () => 'claude',
+                inject: () => { markerAtInject = existsSync(markerPath('/proj/order')); return true; },
+                rateLimit: () => true,
+                paneCwd: () => '/proj/order',
+            },
+        );
+        expect(markerAtInject).toBe(true);
+    });
+
     it('is written for an insert too, so a later manual Enter still reads as remote', async () => {
         // The prompt-submit hook matches the submitted text against this
         // digest. After an insert the user presses Enter themselves, so

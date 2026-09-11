@@ -5,23 +5,18 @@
  * refuses to store, is a security property, not bookkeeping.
  */
 
-import { mkdtempSync, mkdirSync, rmSync, statSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { chmodSync, mkdirSync, statSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
-import { describe, expect, it, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it } from 'vitest';
+import { withTmpStateDir } from './test-state-dir.js';
 
-let TMP: string;
-const originalState = process.env.XDG_STATE_HOME;
+withTmpStateDir('zeph-registry-');
 
-beforeEach(() => {
-    TMP = mkdtempSync(join(tmpdir(), 'zeph-registry-'));
-    process.env.XDG_STATE_HOME = TMP;
-});
-afterEach(() => {
-    rmSync(TMP, { recursive: true, force: true });
-    if (originalState === undefined) delete process.env.XDG_STATE_HOME;
-    else process.env.XDG_STATE_HOME = originalState;
-});
+const {
+    appendTurnRing,
+    readTurnRing,
+    turnRingDir,
+} = await import('./turn-ring.js');
 
 const {
     rememberSessions,
@@ -154,7 +149,7 @@ describe('forgetSession', () => {
     it('drops the named session and keeps the rest', () => {
         rememberSessions([live(), live({ name: 'zeph-web', cwd: '/Users/tak/work/web' })], T0);
 
-        expect(forgetSession('zeph-api')).toBe(true);
+        expect(forgetSession('zeph-api')).toBe('forgotten');
         expect(knownSessions(T0).map((e) => e.name)).toEqual(['zeph-web']);
     });
 
@@ -167,14 +162,42 @@ describe('forgetSession', () => {
         expect(recallSession('zeph-api', T0)).toBeNull();
     });
 
+    it('takes the chat scrollback with it', () => {
+        rememberSessions([live(), live({ name: 'zeph-web', cwd: '/Users/tak/work/web' })], T0);
+        appendTurnRing('zeph-api', [{ kind: 'text', text: 'a week of prompts' }]);
+        appendTurnRing('zeph-web', [{ kind: 'text', text: 'still watched' }]);
+
+        forgetSession('zeph-api');
+
+        // Forgetting a session everywhere except the one file holding a week of
+        // its prompts and tool targets is not forgetting it.
+        expect(readTurnRing('zeph-api')).toEqual([]);
+        expect(readTurnRing('zeph-web')).toEqual([{ kind: 'text', text: 'still watched' }]);
+    });
+
     it('says so when it never knew the name, and writes nothing', () => {
         rememberSessions([live()], T0);
 
-        expect(forgetSession('zeph-never')).toBe(false);
+        expect(forgetSession('zeph-never')).toBe('unknown');
         expect(knownSessions(T0).map((e) => e.name)).toEqual(['zeph-api']);
     });
 
     it('is safe on a machine with no registry at all', () => {
-        expect(forgetSession('zeph-api')).toBe(false);
+        expect(forgetSession('zeph-api')).toBe('unknown');
+    });
+
+    it('says the scrollback stayed when its file will not delete', () => {
+        rememberSessions([live()], T0);
+        appendTurnRing('zeph-api', [{ kind: 'text', text: 'a week of prompts' }]);
+        // Read-only directory: the file is there and unlink fails, which is
+        // exactly the case where answering a flat "forgotten" would be a lie
+        // about where the user's prompts are.
+        chmodSync(turnRingDir(), 0o500);
+
+        try {
+            expect(forgetSession('zeph-api')).toBe('scrollback_kept');
+        } finally {
+            chmodSync(turnRingDir(), 0o700);
+        }
     });
 });

@@ -42,8 +42,9 @@ import { ZEPH_CORE_HOOK_DRIVEN, ZEPH_CORE_RULE_ONLY } from './zeph-core.generate
 // `--pushmode-default normal` is what keeps the first half of that true. The
 // built-in default for a project with no dial is quiet, and quiet only lets a
 // `high` Push Signal marker through — a marker these hooks have no way to
-// emit. Without the flag they would install and then never push again. The
-// user's own dial still outranks it, so /zeph-quiet keeps working here.
+// emit — or a turn the user was away for (presence.ts). Without the flag they
+// would install and then stay silent whenever the user is at the terminal.
+// The user's own dial still outranks it, so /zeph-quiet keeps working here.
 //
 // Older installed `zeph` versions parse both flags as unknown booleans and
 // ignore them — graceful backward compatibility, and for `--pushmode-default`

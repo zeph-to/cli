@@ -59,6 +59,17 @@ export interface RemoteAgent {
      * name at all, so there is nothing to read and the computed label stands.
      */
     resolveSessionName?: (paneCwd: string, panePid?: number) => string | null;
+    /**
+     * Resolve the file this agent is writing its session transcript to, for the
+     * live chat timeline (`turn-watch`).
+     *
+     * Same shape and the same EXTENSION POINT rule as the two above: a row
+     * carries this only once that agent's transcript format is confirmed, and a
+     * pane whose agent omits it answers `no_transcript` rather than guessing.
+     * That is the seam a second agent hangs off — the reader that parses the
+     * file is the other half, and lives beside this one.
+     */
+    resolveTranscript?: (paneCwd: string, panePid?: number) => string | null;
 }
 
 /**
@@ -317,6 +328,16 @@ export interface PidResolveDeps {
 }
 
 /**
+ * Whether this machine's Claude Code writes `~/.claude/sessions` records at all.
+ *
+ * The difference between "no records anywhere" (an older CC — the mtime
+ * heuristic is the only option) and "records exist, none match this pane" (the
+ * pane is not a Claude session) is the difference between a useful fallback and
+ * a wrong answer, so callers that care ask it explicitly.
+ */
+export const pidSessionRecordsExist = (): boolean => cachedPidSessionRecords().length > 0;
+
+/**
  * Exact resolution: the session record whose pid lives in the pane's
  * process tree AND whose cwd matches (guards against OS pid reuse
  * leaving a stale record pointing elsewhere). Null → caller falls back
@@ -355,6 +376,52 @@ export const detectClaudeSessionNameByPid = (
     paneCwd: string | null,
     deps: PidResolveDeps = {},
 ): string | null => nonBlank(detectClaudeSessionByPid(panePid, paneCwd, deps)?.name);
+
+/**
+ * The transcript file for the Claude Code session running in a tmux pane.
+ *
+ * Pid first, cwd only as a fallback, and the order is the whole point: the cwd
+ * heuristic picks the newest `*.jsonl` in the directory, so a second `claude`
+ * started in the same repo steals the first one's transcript (the comment above
+ * `detectClaudeSessionIdByPid` records that failure). Live-timeline viewers are
+ * per tmux session, so two sessions in one directory must resolve to two files
+ * or each phone reads the other's work.
+ *
+ * Returns null when this pane is not running Claude Code at all — a Codex or
+ * Gemini pane has no transcript here, and that is an answer, not a failure.
+ */
+export const claudeTranscriptPath = (paneCwd: string | null, panePid?: number): string | null => {
+    if (!paneCwd) return null;
+
+    let sessionId: string | null = null;
+    if (panePid) {
+        sessionId = detectClaudeSessionIdByPid(panePid, paneCwd);
+        // Records exist but this pane matched none: the pane is not running
+        // Claude Code, or its record has not landed yet. Falling through to the
+        // mtime heuristic here is what lets a *second* `claude` in the same
+        // directory hand this pane the other session's transcript — and a
+        // viewer reading another session's work is worse than one reading none.
+        // Only an installation that writes no records at all earns the fallback.
+        if (!sessionId && pidSessionRecordsExist()) return null;
+    }
+    sessionId ??= detectClaudeSessionId(paneCwd);
+    if (!sessionId) return null;
+
+    // Claude Code flattens the cwd into one directory name by replacing every
+    // `/` AND `.` with `-`: `/Users/x/.claude-mem/y` becomes
+    // `-Users-x--claude-mem-y`. Encoding only the slashes yields a path that
+    // never exists, and the watcher would then poll a missing file forever
+    // without ever saying so.
+    const projectDir = join(CLAUDE_PROJECTS_DIR, paneCwd.replace(/[/.]/g, '-'));
+    const path = join(projectDir, `${sessionId}.jsonl`);
+    // Prove it before handing it out. The pid path never touches the filesystem,
+    // so without this a mis-encoded directory reads as a healthy silent session.
+    try {
+        return statSync(path).isFile() ? path : null;
+    } catch {
+        return null;
+    }
+};
 
 // ── Agents whose session store keeps no pid ──────────────────────
 //
@@ -584,6 +651,7 @@ const REMOTE_AGENT_TABLE = [
             ?? detectClaudeSessionId(paneCwd),
         resolveSessionName: (paneCwd, panePid) =>
             panePid !== undefined ? detectClaudeSessionNameByPid(panePid, paneCwd) : null,
+        resolveTranscript: (paneCwd, panePid) => claudeTranscriptPath(paneCwd, panePid),
     },
     {
         kind: 'codex',
