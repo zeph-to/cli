@@ -49,7 +49,9 @@ binary.
 Once installed, the hooks fire in **every** session of each configured
 agent — `zeph cc` is the phone-control bridge, not the notification
 switch. In Claude Code the routine per-turn push starts off (`quiet` is
-the default); `/zeph-normal` turns it on for a project, `/zeph-loud`
+the default) — while you're at the terminal; once you've stepped away, a
+finished turn still pushes ([Quiet while away](#quiet-while-away)).
+`/zeph-normal` turns it on for a project, `/zeph-loud`
 pushes on every turn, `/zeph-mute` silences a project entirely, and
 `/zeph-status` shows what's in effect. See
 [Mute & push mode](#mute--push-mode).
@@ -650,8 +652,8 @@ this order — first hit wins:
 It is now `quiet`, so upgrading turns the routine per-turn push off until
 you run `/zeph-normal`. Row 4 is why the hooks this CLI installs are
 unaffected: they name `normal` themselves, since a hook that supplies no
-`high` marker would be permanently silent under `quiet` rather than
-merely quieter. Row 4 sits *below* the state files on purpose — the flag
+`high` marker would be silent under `quiet` whenever you're at the terminal,
+rather than merely quieter. Row 4 sits *below* the state files on purpose — the flag
 names a default, it does not override a dial the user set.
 
 Under `normal` the JSON hook configs push on every turn, because they see
@@ -661,6 +663,24 @@ they pass real `--tools` / `--nonreadonly` counts and go quiet where the
 others cannot: a turn with no tool calls, a turn with exactly one (a
 lone edit included — the gate wants two), and a turn whose calls were
 all reads. `/zeph-loud` still pushes on all of them.
+
+#### Quiet while away
+
+`quiet` silences routine pushes because you are watching the pane. When
+you've walked away, nobody is, so `notify --auto` under `quiet` still sends
+the push (normal priority) once it decides you're away. It checks three
+signals, and the first that answers wins:
+
+1. Inside tmux and **no client attached to the tmux server** → away.
+2. Not over SSH and macOS `ioreg` reports **`HIDIdleTime`** (system-wide
+   input idle) → that alone decides.
+3. Inside tmux → the newest tmux **`client_activity`** (SSH and non-macOS).
+
+Anything unreadable counts as present. The threshold is `ZEPH_AWAY_SEC`
+seconds in the hook's environment (default `300`, `0` turns detection off,
+and a non-number falls back to the default). The probe runs only on a
+quiet turn with no `high` marker. The Claude Code plugin's Stop hook
+applies the same rule (`zeph_is_away` in its `hooks/gate.sh`).
 
 A dial file that exists but reads empty resolves to `normal`, not to row
 5: an empty file is a failed write, and resolving breakage to silence

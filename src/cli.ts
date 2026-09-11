@@ -17,6 +17,7 @@ import {
   autoPushMode, decidePush, GATE_DEFAULTS, isMuted, NONREADONLY_COUNT_FLAG, normalizeMarker,
   PUSHMODE_DEFAULT_FLAG, TOOL_COUNT_FLAG,
 } from './gate.js';
+import { awayForGate } from './presence.js';
 import { findAgentBySubcommand, REMOTE_AGENTS } from './remote-agents.js';
 import { isRemoteHookAgent, runRemoteHook } from './remote-hook.js';
 
@@ -303,14 +304,17 @@ const handleNotify = async (args: Record<string, string | boolean>): Promise<num
   // always-push behavior in normal mode, while the /zeph-quiet | /zeph-loud
   // dial now works for every hook-driven agent. Gated-out → silent success.
   // With no dial the mode falls back to --pushmode-default, then to quiet.
+  // Quiet still pushes when the user has left the terminal (presence.ts).
   if (args.auto === true) {
+    const marker = normalizeMarker(typeof args.marker === 'string' ? args.marker : undefined);
+    const pushMode = autoPushMode(projectDir, args[PUSHMODE_DEFAULT_FLAG]);
     const verdict = decidePush({
       toolCount: gateCount(args[TOOL_COUNT_FLAG], GATE_DEFAULTS.toolCount),
       nonReadonlyCount: gateCount(args[NONREADONLY_COUNT_FLAG], GATE_DEFAULTS.nonReadonlyCount),
       alreadyAsked: GATE_DEFAULTS.alreadyAsked,
-      marker: normalizeMarker(typeof args.marker === 'string' ? args.marker : undefined),
-      pushMode: autoPushMode(projectDir, args[PUSHMODE_DEFAULT_FLAG]),
-      away: false,
+      marker,
+      pushMode,
+      away: awayForGate(pushMode, marker),
     });
     if (!verdict.push) return 0;
     if (verdict.priority === 'high' && !args.priority) args.priority = 'high';

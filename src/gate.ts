@@ -35,7 +35,7 @@ export interface GateInput {
   alreadyAsked: boolean;
   marker: GateMarker;
   pushMode: GatePushMode;
-  /** The user is away from the terminal (the caller probes it) — lets quiet
+  /** The user is away from the terminal (presence.ts awayForGate) — lets quiet
    *  push. Optional so existing callers keep compiling; absent = present,
    *  matching the bash twin's missing 6th argument. */
   away?: boolean;
@@ -53,10 +53,10 @@ export interface GateVerdict {
  * hooks — while quiet/loud now work everywhere.
  *
  * These defaults cannot rescue a quiet dial: quiet only lets a `high` marker
- * or an away user through, and a hook with no turn facts has no marker
- * either. That is why the installed templates pass `--pushmode-default
+ * or an away user (presence.ts) through, and a hook with no turn facts has no
+ * marker either. That is why the installed templates pass `--pushmode-default
  * normal` (see templates.ts) — for them quiet is not a lower volume, it is
- * silence unless `away` is set.
+ * silence while the user is at the terminal.
  */
 export const GATE_DEFAULTS = {
   toolCount: 2,
