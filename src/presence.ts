@@ -25,10 +25,6 @@ import type { GateMarker, GatePushMode } from './gate.js';
 
 const AWAY_SEC_DEFAULT = 300;
 const PROBE_TIMEOUT_MS = 2000;
-// `ioreg -c IOHIDSystem` printed 375 KiB on the dev Mac (2026-09-11) — inside
-// spawnSync's 1 MiB default, but a machine with many HID devices must not overflow it and
-// fall through to tmux activity (the browser false positive probe 2 exists for).
-const PROBE_MAX_BUFFER = 16 * 1024 * 1024;
 
 export interface PresenceDeps {
   env: NodeJS.ProcessEnv;
@@ -42,7 +38,6 @@ const runProbe = (cmd: string, args: string[]): string | null => {
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'ignore'],
     timeout: PROBE_TIMEOUT_MS,
-    maxBuffer: PROBE_MAX_BUFFER,
   });
   return r.status === 0 ? (r.stdout ?? '') : null;
 };
@@ -71,7 +66,8 @@ export const isAway = (deps: PresenceDeps = defaultDeps()): boolean => {
   if (clients !== null && clients.trim() === '') return true;
 
   if (!deps.env.SSH_CONNECTION) {
-    const idle = hidIdleSec(deps.run('ioreg', ['-c', 'IOHIDSystem']));
+    // -r -k -d 1: just the IOHIDSystem node (~4 KB), not its ~380 KB subtree.
+    const idle = hidIdleSec(deps.run('ioreg', ['-r', '-k', 'HIDIdleTime', '-d', '1', '-c', 'IOHIDSystem']));
     if (idle !== null) return idle >= threshold;
   }
 
