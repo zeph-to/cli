@@ -17,7 +17,7 @@
  * - The transcript viewer (ctrl+o) overlays the pane; the agent may
  *   still be working underneath, so it must not change the state.
  *
- * codex/gemini start with no rules: they report `unknown` until a
+ * codex/gemini/pi start with no rules: they report `unknown` until a
  * vetted rule set ships via OTA. Honest ignorance beats guessed state.
  */
 import { ENGINE_VERSION, type DetectionManifest } from './agent-state.js';

@@ -1,8 +1,9 @@
+import { readFileSync } from 'node:fs';
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
     advanceState, clearRegexCache, evaluateState,
     ENGINE_VERSION,
-    type DetectionManifest, type StateTracker,
+    type DetectionManifest, type DetectionRule, type StateTracker,
 } from './agent-state.js';
 import { DEFAULT_MANIFEST } from './agent-rules.default.js';
 
@@ -233,5 +234,54 @@ describe('working detection on hint-less CC skins (2026.07.04.2 rules)', () => {
             '  ? for shortcuts',
         ].join('\n');
         expect(evaluateState(pane, 'claude', DEFAULT_MANIFEST).state).toBe('idle');
+    });
+});
+
+// The candidate pi rules on screens the bench did not capture. Each line below
+// is the vendor's own string (pi v0.85.1 dist/modes/interactive/components) or
+// a live pane's footer, so these pin the pattern edges the bench cannot reach.
+describe('candidate pi rules — screens not captured', () => {
+    const candidate = JSON.parse(
+        readFileSync(new URL('./fixtures/pi-rules.candidate.json', import.meta.url), 'utf-8'),
+    ) as { rules: DetectionRule[] };
+    const manifest: DetectionManifest = { engineVersion: ENGINE_VERSION, version: '2026.01.01.1', agents: { pi: candidate.rules } };
+    const pi = (lines: string[]) => evaluateState(lines.join('\n'), 'pi', manifest).state;
+
+    beforeEach(() => clearRegexCache());
+
+    it('pi core selector dialog → blocked', () => {
+        expect(pi(['  Pick a branch', '→ main', '  dev', ' ↑↓ navigate  enter select  escape/ctrl+c cancel', '───', '0.4%/1.0M (auto)'])).toBe('blocked');
+    });
+
+    it('pi core input dialog → blocked', () => {
+        expect(pi(['  Branch name', '> feat/x', ' enter submit  escape/ctrl+c cancel', '───', '0.4%/1.0M (auto)'])).toBe('blocked');
+    });
+
+    it("an ask picker's free-text Other entry → blocked", () => {
+        expect(pi(['  Other answer', '> foo', ' Enter to submit • Esc to go back', '───', '0.4%/1.0M'])).toBe('blocked');
+    });
+
+    it('a picker still wins over the Working spinner it opened under', () => {
+        expect(pi(['── ⠦ Working ──', '> 1. Alpha', '  2. Beta', ' ↑↓ navigate • Enter select • Esc cancel', '0.4%/1.0M'])).toBe('blocked');
+    });
+
+    it('footer right after a compaction (context usage unknown) → idle', () => {
+        expect(pi(['▎', ' dou-app on  feat/x [░░░░░░░░░░] ?/1.0M', ' ↑258k ↓24k 99.6%'])).toBe('idle');
+    });
+
+    it('the startup key legend is not a dialog', () => {
+        expect(pi([' escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more', '───', '0.0%/1.0M (auto)'])).toBe('idle');
+    });
+
+    it('a status line drawn in braille that is not a spinner frame stays idle', () => {
+        expect(pi(['───', '↑531k ↓139k $0.316 5.0%/1.0M (auto)', '⠠⠄ caveman level: FULL'])).toBe('idle');
+    });
+
+    it('the spinner counts bare at line start, as a custom editor draws it', () => {
+        expect(pi([' ⠦ Working', '▎', ' dou-app on  main [░░░] 7.0%/1.0M'])).toBe('working');
+    });
+
+    it('a braille glyph mid-line in leftover output is not the spinner', () => {
+        expect(pi(['  build: 12 files ⠙ cached', '───', '↑3.8k ↓33 0.4%/1.0M (auto)'])).toBe('idle');
     });
 });

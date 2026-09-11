@@ -10,7 +10,7 @@
  * (the boundary in agent-rules.default.ts:5-7 and SPEC-AGENT-AWARENESS.md:7).
  *
  * The bench reports a matrix of harness × state. A blank cell is NOT a failure:
- * codex and gemini ship with empty rule sets on purpose ("Honest ignorance
+ * codex, gemini and pi ship with empty rule sets on purpose ("Honest ignorance
  * beats guessed state" — agent-rules.default.ts:20-21), because rules arrive as
  * OTA data rather than in a release (§S7). What the bench asserts is that the
  * engine's answer matches what the bundle claims to know:
@@ -64,7 +64,9 @@ interface BenchCase {
 
 /**
  * Captured 2026-08-11 — Claude Code v2.1.227, Gemini CLI v0.46.0, both in a
- * 110x45 tmux pane, using the recipe above.
+ * 110x45 tmux pane, using the recipe above. pi v0.85.1 captured 2026-09-11 the
+ * same way, run as `pi -ne -e <ask_user_question extension>` so the capture
+ * could not push to a phone; the blocked screen is that extension's picker.
  */
 const CASES: readonly BenchCase[] = [
     { agent: 'claude', expected: 'working', fixture: 'claude-working.txt', screen: 'spinner with elapsed time + token counter' },
@@ -74,6 +76,9 @@ const CASES: readonly BenchCase[] = [
     { agent: 'gemini', expected: 'working', fixture: 'gemini-working.txt', screen: 'Thinking… spinner with cancel hint' },
     { agent: 'gemini', expected: 'blocked', fixture: 'gemini-blocked-trust-dialog.txt', screen: 'folder trust dialog' },
     { agent: 'gemini', expected: 'idle', fixture: 'gemini-idle.txt', screen: 'input box at rest' },
+    { agent: 'pi', expected: 'working', fixture: 'pi-working.txt', screen: 'Working spinner in the editor border' },
+    { agent: 'pi', expected: 'blocked', fixture: 'pi-blocked.txt', screen: 'ask_user_question picker' },
+    { agent: 'pi', expected: 'idle', fixture: 'pi-idle.txt', screen: 'fresh session at rest' },
 ];
 
 const readPane = (fixture: string): string => readFileSync(join(PANES_DIR, fixture), 'utf-8');
@@ -136,8 +141,8 @@ describe('harness bench — bundled rules vs real panes', () => {
  *
  * Rules for an agent the bundle deliberately leaves empty still have to be
  * proven against real panes before they go out, or publishing walks straight
- * past the gate this file exists to be. The candidate set lives as data in
- * fixtures/gemini-rules.candidate.json and is copied verbatim into
+ * past the gate this file exists to be. Each candidate set lives as data in
+ * fixtures/<agent>-rules.candidate.json and is copied verbatim into
  * zeph/apps/server/src/agent-rules/manifest.json when published; the engine
  * that runs it here is the same one the listener runs.
  *
@@ -146,45 +151,47 @@ describe('harness bench — bundled rules vs real panes', () => {
  * this does buy: rules cannot be *authored* without a real pane proving each
  * one, and a vendor UI change turns these red exactly like the bundled set.
  */
-const CANDIDATE_CASES: readonly BenchCase[] = CASES.filter((c) => c.agent === 'gemini');
+const CANDIDATE_AGENTS: readonly AgentKind[] = ['gemini', 'pi'];
 
-describe('candidate gemini rules — verified before publishing', () => {
-    const candidate = JSON.parse(
-        readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'gemini-rules.candidate.json'), 'utf-8'),
-    ) as { rules: DetectionRule[] };
+for (const agent of CANDIDATE_AGENTS) {
+    describe(`candidate ${agent} rules — verified before publishing`, () => {
+        const candidate = JSON.parse(
+            readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures', `${agent}-rules.candidate.json`), 'utf-8'),
+        ) as { rules: DetectionRule[] };
 
-    const manifest: DetectionManifest = {
-        engineVersion: ENGINE_VERSION,
-        version: DEFAULT_MANIFEST.version,
-        agents: { gemini: candidate.rules },
-    };
+        const manifest: DetectionManifest = {
+            engineVersion: ENGINE_VERSION,
+            version: DEFAULT_MANIFEST.version,
+            agents: { [agent]: candidate.rules },
+        };
 
-    for (const c of CANDIDATE_CASES) {
-        it(`${c.screen} → ${c.expected}`, () => {
-            clearRegexCache();
-            const result = evaluateState(readPane(c.fixture), c.agent, manifest);
-            expect(result.state).toBe(c.expected);
-            expect(result.ruleId).toBeTruthy();
-        });
-    }
-
-    it('leaves the bundle alone — an offline listener still reports unknown', () => {
-        // The whole point of publishing over the air: a daemon that cannot
-        // reach the endpoint must keep saying `unknown` rather than carry a
-        // half-verified guess in its binary.
-        expect(DEFAULT_MANIFEST.agents.gemini ?? []).toHaveLength(0);
-    });
-
-    it('every candidate rule is structurally valid for the listener validator', () => {
-        for (const rule of candidate.rules) {
-            expect(rule.id.length).toBeGreaterThan(0);
-            expect(['working', 'blocked', 'idle', 'unknown']).toContain(rule.state);
-            expect(typeof rule.priority).toBe('number');
+        for (const c of CASES.filter((x) => x.agent === agent)) {
+            it(`${c.screen} → ${c.expected}`, () => {
+                clearRegexCache();
+                const result = evaluateState(readPane(c.fixture), c.agent, manifest);
+                expect(result.state).toBe(c.expected);
+                expect(result.ruleId).toBeTruthy();
+            });
         }
-        const ids = candidate.rules.map((r) => r.id);
-        expect(new Set(ids).size).toBe(ids.length);
+
+        it('leaves the bundle alone — an offline listener still reports unknown', () => {
+            // The whole point of publishing over the air: a daemon that cannot
+            // reach the endpoint must keep saying `unknown` rather than carry a
+            // half-verified guess in its binary.
+            expect(DEFAULT_MANIFEST.agents[agent] ?? []).toHaveLength(0);
+        });
+
+        it('every candidate rule is structurally valid for the listener validator', () => {
+            for (const rule of candidate.rules) {
+                expect(rule.id.length).toBeGreaterThan(0);
+                expect(['working', 'blocked', 'idle', 'unknown']).toContain(rule.state);
+                expect(typeof rule.priority).toBe('number');
+            }
+            const ids = candidate.rules.map((r) => r.id);
+            expect(new Set(ids).size).toBe(ids.length);
+        });
     });
-});
+}
 
 /**
  * The bundle must never claim a version the published manifest hasn't reached.
