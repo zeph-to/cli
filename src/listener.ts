@@ -3287,6 +3287,17 @@ export const writeRemoteMarker = (
     }
 };
 
+/** Take back a marker whose text never reached the pane. Best-effort, like the write. */
+const clearRemoteMarker = (paneCwd: string): void => {
+    const hash = projectHash(paneCwd);
+    if (!hash) return;
+    try {
+        rmSync(remoteMarkerPath(hash), { force: true });
+    } catch {
+        /* a marker we can't remove just expires (15 min) — never fail the push over it */
+    }
+};
+
 const defaultPaneCwd = (session: string): string | null => readPaneInfo(session).currentPath;
 
 /**
@@ -3302,6 +3313,11 @@ const defaultPaneCwd = (session: string): string | null => readPaneInfo(session)
  * submit is the user's own keypress. Text they edit before sending simply
  * fails the match and the marker expires, which is the best-effort contract
  * that path already has.
+ *
+ * The marker goes down BEFORE the keys. An idle agent submits the instant the
+ * Enter lands and its prompt hook looks for the marker right then; written
+ * after the inject, it lost that race and the phone message read as typed at
+ * the keyboard. A failed inject takes the marker back out.
  */
 const tryInject = (session: string, text: string, deps: HandlePushDeps, submit = true): boolean => {
     if (!text) {
@@ -3309,16 +3325,15 @@ const tryInject = (session: string, text: string, deps: HandlePushDeps, submit =
         return false;
     }
     if (!passesInjectGuards(session, deps, SUBMIT_COST)) return false;
+    const cwd = (deps.paneCwd ?? defaultPaneCwd)(session);
+    const marked = cwd !== null && writeRemoteMarker(cwd, text);
     const ok = submit
         ? (deps.inject ?? injectKeys)(session, text)
         : (deps.insertText ?? pasteText)(session, text);
     const preview = text.length > 60 ? text.slice(0, 60) + '…' : text;
     log(`${ok ? (submit ? '→' : '⇢') : '✗'} ${session}: ${preview}`);
-    if (ok) {
-        noteStreamInput(session);
-        const cwd = (deps.paneCwd ?? defaultPaneCwd)(session);
-        if (cwd) writeRemoteMarker(cwd, text);
-    }
+    if (ok) noteStreamInput(session);
+    else if (marked) clearRemoteMarker(cwd);
     return ok;
 };
 
