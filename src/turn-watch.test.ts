@@ -167,6 +167,152 @@ describe('turn watch streaming', () => {
         expect(latest.seq).toBe(deltas().length);
     });
 
+    // A busy tick — many calls landing at once — used to go out as one frame of
+    // any size, past the transport's frame limit (see MAX_TURN_FRAME_BYTES).
+    it('pages a large live tick so no frame can exceed the transport limit', async () => {
+        const watchers = createTurnWatchers(makeDeps());
+        writeFileSync(transcriptFor('s1'), userPrompt('go'));
+        watchers.handle(start('s1'), send);
+        await watchers.tick('s1');
+        const before = deltas().length;
+
+        const label = 'd'.repeat(400);
+        appendFileSync(
+            transcriptFor('s1'),
+            Array.from({ length: 60 }, (_, i) => toolUse(`t${i}`, 'Bash', { description: `${i}-${label}` })).join(''),
+        );
+        await watchers.tick('s1');
+
+        const live = deltas().slice(before);
+        expect(live.length).toBeGreaterThan(1);
+        for (const frame of live) {
+            expect(Buffer.byteLength(JSON.stringify(frame.events ?? []), 'utf-8')).toBeLessThanOrEqual(MAX_TURN_FRAME_BYTES);
+        }
+        expect(live.flatMap((f) => f.events as TurnEvent[]).map((e) => (e as { id: string }).id)).toEqual(
+            Array.from({ length: 60 }, (_, i) => `t${i}`),
+        );
+        expect(deltas().map((f) => f.seq)).toEqual(deltas().map((_, i) => i + 1));
+        // The ring records every page that went out, in order.
+        expect(ring.get('s1')!.filter((e) => e.kind === 'tool')).toHaveLength(60);
+    });
+
+    /** A tick of 60 labelled calls — three pages' worth at MAX_TURN_FRAME_BYTES. */
+    const busyTick = () =>
+        Array.from({ length: 60 }, (_, i) => toolUse(`b${i}`, 'Bash', { description: `${i}-${'d'.repeat(400)}` })).join('');
+
+    // One unsealable page drops the rest of its tick, as a whole batch was
+    // dropped before paging: the failure counts once per tick, so a burst of
+    // pages cannot spend MAX_TURN_SEAL_FAILURES in milliseconds.
+    it('drops the rest of a paged tick once one page will not seal', async () => {
+        let failNext = false;
+        let seals = 0;
+        const watchers = createTurnWatchers(
+            makeDeps({
+                seal: async (plaintext) => {
+                    seals++;
+                    if (failNext) throw new Error('transient');
+                    return { ciphertext: `sealed:${plaintext.length}` };
+                },
+            }),
+        );
+        writeFileSync(transcriptFor('s1'), userPrompt('go'));
+        watchers.handle(start('s1', { subscriberPublicKey: 'pk' }), send);
+        await watchers.tick('s1');
+        const before = { frames: deltas().length, seals, held: (ring.get('s1') ?? []).length };
+
+        failNext = true;
+        appendFileSync(transcriptFor('s1'), busyTick());
+        await watchers.tick('s1');
+
+        expect(seals - before.seals).toBe(1);
+        expect(deltas()).toHaveLength(before.frames);
+        expect((ring.get('s1') ?? []).length).toBe(before.held);
+        expect(watchers.size()).toBe(1);
+    });
+
+    it('stops a busy tick\'s remaining pages when a start re-seeds the watch mid-seal', async () => {
+        let reseedOnSeal = false;
+        const watchers = createTurnWatchers(
+            makeDeps({
+                seal: async (plaintext) => {
+                    if (reseedOnSeal) {
+                        reseedOnSeal = false;
+                        watchers.handle(start('s1', { subscriberPublicKey: 'pk' }), send);
+                    }
+                    return { ciphertext: `sealed:${plaintext.length}` };
+                },
+            }),
+        );
+        writeFileSync(transcriptFor('s1'), userPrompt('go'));
+        watchers.handle(start('s1', { subscriberPublicKey: 'pk' }), send);
+        await watchers.tick('s1');
+        const firstEpoch = deltas().at(-1)!.epoch;
+        const before = deltas().length;
+
+        reseedOnSeal = true;
+        appendFileSync(transcriptFor('s1'), busyTick());
+        await watchers.tick('s1');
+
+        // The page already sealing goes out; the other two belong to a tail the
+        // re-seeded watcher no longer reads. Its own backfill re-reads them, cut
+        // at the ring's newest stamp — which drops any event sharing that exact
+        // stamp, a limit of `afterRingTail` older than paging.
+        const fromOldBatch = deltas().slice(before).filter((f) => f.epoch === firstEpoch);
+        expect(fromOldBatch).toHaveLength(1);
+    });
+
+    it('stops a busy tick when the viewer stops the watch mid-seal', async () => {
+        let stopOnSeal = false;
+        const watchers = createTurnWatchers(
+            makeDeps({
+                seal: async (plaintext) => {
+                    if (stopOnSeal) {
+                        stopOnSeal = false;
+                        watchers.handle({ subtype: 'agent.turn.watch.stop', targetDeviceId: DEVICE, sessionName: 's1' }, send);
+                    }
+                    return { ciphertext: `sealed:${plaintext.length}` };
+                },
+            }),
+        );
+        writeFileSync(transcriptFor('s1'), userPrompt('go'));
+        watchers.handle(start('s1', { subscriberPublicKey: 'pk' }), send);
+        await watchers.tick('s1');
+        const before = deltas().length;
+
+        stopOnSeal = true;
+        appendFileSync(transcriptFor('s1'), busyTick());
+        await watchers.tick('s1');
+
+        expect(deltas().length - before).toBe(1);
+        expect(watchers.size()).toBe(0);
+    });
+
+    it('stops a busy tick when the watch ends on its last allowed seal failure', async () => {
+        let fail = false;
+        const watchers = createTurnWatchers(
+            makeDeps({
+                seal: async (plaintext) => {
+                    if (fail) throw new Error('gone');
+                    return { ciphertext: `sealed:${plaintext.length}` };
+                },
+            }),
+        );
+        writeFileSync(transcriptFor('s1'), userPrompt('go'));
+        watchers.handle(start('s1', { subscriberPublicKey: 'pk' }), send);
+        await watchers.tick('s1');
+        const before = deltas().length;
+
+        fail = true;
+        for (let i = 0; i < MAX_TURN_SEAL_FAILURES; i++) {
+            appendFileSync(transcriptFor('s1'), busyTick());
+            await watchers.tick('s1');
+        }
+
+        expect(deltas()).toHaveLength(before);
+        expect(watchers.size()).toBe(0);
+        expect(sent.some((f) => f.error === 'seal_failed')).toBe(true);
+    });
+
     it('sends nothing when the transcript did not move', async () => {
         const watchers = createTurnWatchers(makeDeps());
         writeFileSync(transcriptFor('s1'), userPrompt('go'));
