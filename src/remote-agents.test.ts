@@ -259,11 +259,58 @@ describe('parseProcTable', () => {
         expect(startTimes.size).toBe(0);
     });
 
+    it('reads comm with spaces after the 5-token lstart, plus pgid/tpgid', async () => {
+        const { parseProcTable } = await import('./remote-agents.js');
+        const t = parseProcTable('  501   400   501   501 Fri Aug  7 11:12:59 2026 tmux: client\n  502   501   777   777 Fri Aug  7 11:13:59 2026 pi');
+        expect(t.pgidOf.get(501)).toBe(501);
+        expect(t.tpgidOf.get(501)).toBe(501);
+        expect(t.commOf.get(501)).toBe('tmux: client');
+        expect(t.pgidOf.get(502)).toBe(777);
+        expect(t.tpgidOf.get(502)).toBe(777);
+        expect(t.commOf.get(502)).toBe('pi');
+        expect(Number.isFinite(t.startTimes.get(501))).toBe(true);
+    });
+
     it('ignores lines that are not a process row', async () => {
         const { parseProcTable } = await import('./remote-agents.js');
         const { children } = parseProcTable('PID PPID STARTED\n\n  90     1 Fri Aug  7 11:12:59 2026');
         expect(children.get(1)).toEqual([90]);
         expect(children.size).toBe(1);
+    });
+});
+
+describe('foregroundAgentFor — subagent pane detection', () => {
+    // A subagent pane's tmux view: pane_pid is the login zsh, but the tty's
+    // foreground group is the bash→pi script's group (measured 15:25). A plain
+    // prompt has the shell's own group in the foreground.
+    const TABLE = [
+        '  600     1   600   900 Fri Aug  7 11:12:59 2026 zsh',      // subagent pane's login shell — tty fg group is 900
+        '  601   600   900   900 Fri Aug  7 11:12:59 2026 bash',     // the script
+        '  602   601   900   900 Fri Aug  7 11:12:59 2026 pi',       // pi in the fg group
+        '  610     1   610   610 Fri Aug  7 11:12:59 2026 zsh',      // plain prompt pane
+        '  611   610   910   610 Fri Aug  7 11:12:59 2026 vim',      // suspended-ish: fg tty group is the shell's
+    ].join('\n');
+
+    it('detects the agent in the foreground group of a subagent pane', async () => {
+        const { foregroundAgentFor, parseProcTable } = await import('./remote-agents.js');
+        const agent = foregroundAgentFor(600, parseProcTable(TABLE));
+        expect(agent?.kind).toBe('pi');
+    });
+
+    it('a pane at its login shell prompt is not a subagent', async () => {
+        const { foregroundAgentFor, parseProcTable } = await import('./remote-agents.js');
+        expect(foregroundAgentFor(610, parseProcTable(TABLE))).toBeNull();
+    });
+
+    it('a pane whose tty group holds no registered agent is not a subagent', async () => {
+        const { foregroundAgentFor, parseProcTable } = await import('./remote-agents.js');
+        const noAgent = parseProcTable('  620     1   620   620 Fri Aug  7 11:12:59 2026 zsh\n  621   620   920   920 Fri Aug  7 11:12:59 2026 bash');
+        expect(foregroundAgentFor(620, noAgent)).toBeNull();
+    });
+
+    it('answers null without a usable table (ps failed — no subagents this cycle)', async () => {
+        const { foregroundAgentFor } = await import('./remote-agents.js');
+        expect(foregroundAgentFor(600, null)).toBeNull();
     });
 });
 

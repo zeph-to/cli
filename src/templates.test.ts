@@ -284,38 +284,61 @@ describe('templates.ts: the OpenCode plugin bills tool calls to the right sessio
 // withUIPrompt) and emits tool_execution_start before the tool_call handlers
 // that raise a guard's dialog (pi-agent-core dist/agent-loop.js). The timing
 // and the env handoff are behavior, so drive the compiled artifact.
-describe('templates.ts: the pi extension pushes when pi waits on the user', () => {
-    type Handler = (event: unknown, ctx: unknown) => unknown;
+type Handler = (event: unknown, ctx: unknown) => unknown;
 
-    const loadExtension = () => {
-        const js = transformSync(templates.PI_EXTENSION, { loader: 'ts', format: 'cjs' }).code;
-        const spawned: { command: string; env: Record<string, string | undefined> }[] = [];
-        const mod = { exports: {} as Record<string, unknown> };
+/**
+ * Load PI_EXTENSION as CJS with child_process stubbed. `env` is applied for
+ * the module's top-level reads; the subagent/tmux keys are normalized on every
+ * run so the host terminal can't leak in — this suite itself runs inside tmux,
+ * and a bare load once picked up the session's real TMUX_PANE.
+ */
+const loadExtension = (env: Record<string, string | undefined> = {}) => {
+    const js = transformSync(templates.PI_EXTENSION, { loader: 'ts', format: 'cjs' }).code;
+    const spawned: { cmd: string; command: string; argv: string[]; env: Record<string, string | undefined> }[] = [];
+    const mod = { exports: {} as Record<string, unknown> };
+    const saved: Record<string, string | undefined> = {};
+    for (const k of new Set([...Object.keys(env), 'PI_SUBAGENT_NAME', 'TMUX_PANE', 'TMUX', 'ZEPH_AGENT_SESSION_NAME'])) {
+        saved[k] = process.env[k];
+        if (env[k] === undefined) delete process.env[k];
+        else process.env[k] = env[k] as string;
+    }
+    try {
         new Function('exports', 'module', 'require', js)(mod.exports, mod, () => ({
-            spawn: (_sh: string, argv: string[], opts: { env?: Record<string, string> }) => {
-                spawned.push({ command: argv[1], env: opts.env ?? {} });
+            spawn: (cmd: string, argv: string[], opts: { env?: Record<string, string> }) => {
+                spawned.push({ cmd, command: argv[1], argv, env: opts.env ?? {} });
                 // Enough of a ChildProcess for the remote-hook reader, which
                 // then waits forever — its turn resets run before that await.
                 return { on: () => {}, unref: () => {}, stdout: { on: () => {} }, stdin: { end: () => {} } };
             },
+            execFileSync: (_bin: string, argv: string[]) => (argv.includes('#S') ? 'zeph-a\n' : ''),
         }));
-        const handlers: Record<string, Handler> = {};
-        (mod.exports.default as (pi: unknown) => void)({
-            on: (name: string, handler: Handler) => (handlers[name] = handler),
-        });
-        const ctx = { cwd: '/work/dou-app' };
-        const emit = (name: string, event: Record<string, unknown> = {}) => handlers[name]({ type: name, ...event }, ctx);
-        const assistant = (text: string, stopReason = 'stop', errorMessage?: string) =>
-            emit('message_end', { message: { role: 'assistant', content: [{ type: 'text', text }], stopReason, errorMessage } }) as
-                | { message: { content: { text: string }[] } }
-                | undefined;
-        return {
-            emit,
-            assistant,
-            /** notify invocations only — the remote-hook reader spawns too. */
-            pushes: () => spawned.filter((s) => s.command.includes(' notify')),
-        };
+    } finally {
+        for (const k of Object.keys(saved)) {
+            if (saved[k] === undefined) delete process.env[k];
+            else process.env[k] = saved[k];
+        }
+    }
+    const handlers: Record<string, Handler> = {};
+    (mod.exports.default as (pi: unknown) => void)({
+        on: (name: string, handler: Handler) => (handlers[name] = handler),
+    });
+    const ctx = { cwd: '/work/dou-app' };
+    const emit = (name: string, event: Record<string, unknown> = {}) => handlers[name]({ type: name, ...event }, ctx);
+    const assistant = (text: string, stopReason = 'stop', errorMessage?: string) =>
+        emit('message_end', { message: { role: 'assistant', content: [{ type: 'text', text }], stopReason, errorMessage } }) as
+            | { message: { content: { text: string }[] } }
+            | undefined;
+    return {
+        emit,
+        assistant,
+        /** notify invocations only — the remote-hook reader and pane label spawn too. */
+        pushes: () => spawned.filter((s) => s.command.includes(' notify')),
+        /** tmux invocations as full argv — the pane-label set-option. */
+        tmuxCalls: () => spawned.filter((s) => s.cmd === 'tmux').map((s) => [s.cmd, ...s.argv]),
     };
+};
+
+describe('templates.ts: the pi extension pushes when pi waits on the user', () => {
 
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => vi.useRealTimers());
@@ -423,6 +446,56 @@ describe('templates.ts: the pi extension pushes when pi waits on the user', () =
         pi.assistant('partial', 'aborted');
         pi.emit('agent_settled');
         expect(pi.pushes()).toEqual([]);
+    });
+});
+
+// Subagent mode (PI_SUBAGENT_NAME): the same extension must label the tmux
+// pane, name the prompt push after the subagent, file the push under the
+// subagent's session key, and stay silent on agent_settled — the parent
+// pushes when it settles on their results.
+describe('templates.ts: the pi extension runs subagent panes view-only-by-push', () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it('labels the pane, names the push, and files it under the subagent key', () => {
+        const pi = loadExtension({ PI_SUBAGENT_NAME: 'review-01', TMUX_PANE: '%9' });
+        expect(pi.tmuxCalls()).toContainEqual(
+            ['tmux', 'set-option', '-p', '-t', '%9', '@zeph_pane_label', 'review-01']);
+
+        pi.emit('agent_start');
+        pi.emit('tool_execution_start', { toolName: 'bash', args: { command: 'git push' } });
+        pi.emit('ui_prompt_start', { kind: 'custom' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
+
+        const pushes = pi.pushes();
+        expect(pushes).toHaveLength(1);
+        expect(pushes[0].env.ZEPH_PUSH_TITLE).toBe('pi asks: dou-app · review-01');
+        expect(pushes[0].env.ZEPH_AGENT_SESSION_NAME).toBe('zeph-a.9');
+    });
+
+    // Decision, pinned: a subagent sends NO settle push — not for completion,
+    // not for an error. The parent owns the conversation and settles on their
+    // results; an error stays live in the subagent's own mirror.
+    it('sends no settle push — completion or error', () => {
+        const pi = loadExtension({ PI_SUBAGENT_NAME: 'review-01', TMUX_PANE: '%9' });
+        pi.emit('agent_start');
+        pi.assistant('done');
+        pi.emit('agent_settled');
+        pi.assistant('', 'error', '429 rate limit');
+        pi.emit('agent_settled');
+        expect(pi.pushes()).toEqual([]);
+    });
+
+    it('a subagent without TMUX_PANE pushes under the parent key, unlabelled', () => {
+        const pi = loadExtension({ PI_SUBAGENT_NAME: 'review-01' });
+        expect(pi.tmuxCalls()).toEqual([]);
+        pi.emit('agent_start');
+        pi.emit('tool_execution_start', { toolName: 'bash', args: { command: 'git push' } });
+        pi.emit('ui_prompt_start', { kind: 'custom' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
+        const pushes = pi.pushes();
+        expect(pushes[0].env.ZEPH_PUSH_TITLE).toBe('pi asks: dou-app · review-01');
+        expect(pushes[0].env.ZEPH_AGENT_SESSION_NAME).toBeUndefined();
     });
 });
 

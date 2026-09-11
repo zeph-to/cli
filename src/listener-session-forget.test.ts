@@ -21,7 +21,7 @@ const fakeTmux = (args: readonly string[]) => {
     const a = args[0] === '-S' ? args.slice(2) : args;
     if (a[0] === 'list-panes') {
         const rows = liveSessions
-            .map((n, i) => [n, '0', '1700000000', '1700000000', '0', '0', `%${i}`, 'node', 'claude', '/tmp/proj', '1234'].join(FIELD_SEP))
+            .map((n, i) => [n, '0', '1700000000', '1700000000', '0', '0', `%${i}`, 'node', 'claude', '/tmp/proj', '1234', ''].join(FIELD_SEP))
             .join('\n');
         return { status: 0, stdout: rows + '\n', stderr: '' };
     }

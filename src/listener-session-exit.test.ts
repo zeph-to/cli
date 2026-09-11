@@ -29,7 +29,7 @@ const fakeTmux = (args: readonly string[]) => {
     tmuxCalls.push([...a]);
     if (a[0] === 'list-panes') {
         const rows = liveSessions
-            .map((n, i) => [n, '0', '1700000000', '1700000000', '0', '0', `%${i}`, 'node', 'claude', '/tmp/proj', '1234'].join(FIELD_SEP))
+            .map((n, i) => [n, '0', '1700000000', '1700000000', '0', '0', `%${i}`, 'node', 'claude', '/tmp/proj', '1234', ''].join(FIELD_SEP))
             .join('\n');
         paneNameById = new Map(liveSessions.map((n, i) => [`%${i}`, n]));
         return { status: 0, stdout: rows + '\n', stderr: '' };
@@ -47,7 +47,7 @@ const fakeTmux = (args: readonly string[]) => {
         return { status: 0, stdout: '', stderr: '' };
     }
     if (a[0] === 'display-message') {
-        return { status: 0, stdout: ['node', 'claude', '/tmp/proj', '1234'].join(FIELD_SEP), stderr: '' };
+        return { status: 0, stdout: ['node', 'claude', '/tmp/proj', '1234', ''].join(FIELD_SEP), stderr: '' };
     }
     if (a[0] === 'capture-pane') return { status: 0, stdout: 'idle pane\n', stderr: '' };
     return { status: 1, stdout: '', stderr: '' };
