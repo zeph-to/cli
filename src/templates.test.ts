@@ -284,7 +284,7 @@ describe('templates.ts: the OpenCode plugin bills tool calls to the right sessio
 // withUIPrompt) and emits tool_execution_start before the tool_call handlers
 // that raise a guard's dialog (pi-agent-core dist/agent-loop.js). The timing
 // and the env handoff are behavior, so drive the compiled artifact.
-describe('templates.ts: the pi extension pushes a prompt left unanswered', () => {
+describe('templates.ts: the pi extension pushes when pi waits on the user', () => {
     type Handler = (event: unknown, ctx: unknown) => unknown;
 
     const loadExtension = () => {
@@ -294,7 +294,9 @@ describe('templates.ts: the pi extension pushes a prompt left unanswered', () =>
         new Function('exports', 'module', 'require', js)(mod.exports, mod, () => ({
             spawn: (_sh: string, argv: string[], opts: { env?: Record<string, string> }) => {
                 spawned.push({ command: argv[1], env: opts.env ?? {} });
-                return { on: () => {}, unref: () => {} };
+                // Enough of a ChildProcess for the remote-hook reader, which
+                // then waits forever — its turn resets run before that await.
+                return { on: () => {}, unref: () => {}, stdout: { on: () => {} }, stdin: { end: () => {} } };
             },
         }));
         const handlers: Record<string, Handler> = {};
@@ -302,9 +304,16 @@ describe('templates.ts: the pi extension pushes a prompt left unanswered', () =>
             on: (name: string, handler: Handler) => (handlers[name] = handler),
         });
         const ctx = { cwd: '/work/dou-app' };
+        const emit = (name: string, event: Record<string, unknown> = {}) => handlers[name]({ type: name, ...event }, ctx);
+        const assistant = (text: string, stopReason = 'stop', errorMessage?: string) =>
+            emit('message_end', { message: { role: 'assistant', content: [{ type: 'text', text }], stopReason, errorMessage } }) as
+                | { message: { content: { text: string }[] } }
+                | undefined;
         return {
-            spawned,
-            emit: (name: string, event: Record<string, unknown> = {}) => handlers[name]({ type: name, ...event }, ctx),
+            emit,
+            assistant,
+            /** notify invocations only — the remote-hook reader spawns too. */
+            pushes: () => spawned.filter((s) => s.command.includes(' notify')),
         };
     };
 
@@ -313,32 +322,35 @@ describe('templates.ts: the pi extension pushes a prompt left unanswered', () =>
 
     it('pushes the guarded bash command at high priority once the grace passes', () => {
         const pi = loadExtension();
+        pi.emit('agent_start');
         pi.emit('tool_execution_start', { toolName: 'bash', args: { command: 'git status | head' } });
         pi.emit('ui_prompt_start', { kind: 'custom' });
         vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS - 1);
-        expect(pi.spawned).toEqual([]);
+        expect(pi.pushes()).toEqual([]);
 
         vi.advanceTimersByTime(1);
-        expect(pi.spawned).toHaveLength(1);
-        expect(pi.spawned[0].command).toContain('notify');
-        expect(pi.spawned[0].command).toContain('--priority high');
+        expect(pi.pushes()).toHaveLength(1);
+        const [push] = pi.pushes();
+        expect(push.command).toContain('--priority high');
         // The command reaches the shell as an env var, not as command text.
-        expect(pi.spawned[0].command).not.toContain('git status');
-        expect(pi.spawned[0].env.ZEPH_PROMPT_TITLE).toBe('pi asks: dou-app');
-        expect(pi.spawned[0].env.ZEPH_PROMPT_BODY).toBe('$ git status | head');
+        expect(push.command).not.toContain('git status');
+        expect(push.env.ZEPH_PUSH_TITLE).toBe('pi asks: dou-app');
+        expect(push.env.ZEPH_PUSH_BODY).toBe('$ git status | head');
     });
 
     it('stays silent when the prompt is answered inside the grace', () => {
         const pi = loadExtension();
+        pi.emit('agent_start');
         pi.emit('ui_prompt_start', { kind: 'confirm', title: 'Delete branch?' });
         vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS - 1);
         pi.emit('ui_prompt_end', { kind: 'confirm', title: 'Delete branch?' });
         vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
-        expect(pi.spawned).toEqual([]);
+        expect(pi.pushes()).toEqual([]);
     });
 
     it('prefers the dialog title, and falls back once the tool call ends', () => {
         const pi = loadExtension();
+        pi.emit('agent_start');
         pi.emit('tool_execution_start', { toolName: 'bash', args: { command: 'rm -rf dist' } });
         pi.emit('ui_prompt_start', { kind: 'select', title: 'Pick a target' });
         vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
@@ -347,7 +359,70 @@ describe('templates.ts: the pi extension pushes a prompt left unanswered', () =>
         pi.emit('ui_prompt_start', { kind: 'custom' });
         vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
 
-        expect(pi.spawned.map((s) => s.env.ZEPH_PROMPT_BODY)).toEqual(['Pick a target', 'Waiting for your input']);
+        expect(pi.pushes().map((s) => s.env.ZEPH_PUSH_BODY)).toEqual(['Pick a target', 'Waiting for your input']);
+    });
+
+    it('ignores a dialog the user opened between turns', () => {
+        // `/caveman config` or a settings picker: nothing is running, so the
+        // user is at the terminal by definition.
+        const pi = loadExtension();
+        pi.emit('ui_prompt_start', { kind: 'custom' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS * 2);
+
+        pi.emit('agent_start');
+        pi.emit('agent_settled');
+        const settlePushes = pi.pushes().length;
+        pi.emit('ui_prompt_start', { kind: 'select', title: 'pi-cbm settings' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS * 2);
+        expect(pi.pushes()).toHaveLength(settlePushes);
+    });
+
+    it('reads a Push Signal marker, strips it, and hands it to the settle push', () => {
+        const pi = loadExtension();
+        pi.emit('agent_start');
+        const replaced = pi.assistant('Which branch should I target?\n\n<!-- zeph: high -->');
+        expect(replaced?.message.content[0].text).toBe('Which branch should I target?');
+        pi.emit('agent_settled');
+
+        const [push] = pi.pushes();
+        expect(push.command).toContain('--auto');
+        expect(push.command).toContain('--marker high');
+    });
+
+    it('passes --marker none without a marker, and forgets last turn\'s marker', () => {
+        const pi = loadExtension();
+        pi.emit('agent_start');
+        expect(pi.assistant('Done. <!-- zeph: skip -->')).toBeDefined();
+        pi.emit('agent_settled');
+        void pi.emit('before_agent_start', { prompt: 'next' });
+        pi.emit('agent_start');
+        // No marker, so the message is left as it was.
+        expect(pi.assistant('Plain answer.')).toBeUndefined();
+        pi.emit('agent_settled');
+
+        expect(pi.pushes().map((p) => p.command.match(/--marker (\S+)/)?.[1])).toEqual(['skip', 'none']);
+    });
+
+    it('turns a provider error into a high push instead of "Task done"', () => {
+        const pi = loadExtension();
+        pi.emit('agent_start');
+        pi.assistant('', 'error', '429 rate limit');
+        pi.emit('agent_settled');
+
+        const pushes = pi.pushes();
+        expect(pushes).toHaveLength(1);
+        expect(pushes[0].command).not.toContain('--auto');
+        expect(pushes[0].command).toContain('--priority high');
+        expect(pushes[0].env.ZEPH_PUSH_TITLE).toBe('pi stopped: dou-app');
+        expect(pushes[0].env.ZEPH_PUSH_BODY).toBe('429 rate limit');
+    });
+
+    it('sends nothing for a turn the user aborted', () => {
+        const pi = loadExtension();
+        pi.emit('agent_start');
+        pi.assistant('partial', 'aborted');
+        pi.emit('agent_settled');
+        expect(pi.pushes()).toEqual([]);
     });
 });
 

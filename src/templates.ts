@@ -79,13 +79,19 @@ const TURN_FACT_FLAGS =
 const remoteHookCmd = (agent: 'gemini' | 'codex' | 'pi'): string =>
   `$(command -v zeph || echo "npx -y @zeph-to/cli") remote-hook ${agent} 2>/dev/null || true`;
 
-// Waiting-on-you push — the pi twin of the plugin's zeph-ask.sh: same `high`
-// priority, so it gets through the quiet dial, and plain `notify` (no --auto)
-// so only a mute stops it. Title and body arrive as env vars, never spliced
-// into the string: the body can carry the model's own bash command.
-const promptNotifyCmd =
+// One-off `high` push from the pi extension — a prompt left waiting (the twin
+// of the plugin's zeph-ask.sh) or a turn that died on an error. `high` gets
+// through the quiet dial, and plain `notify` (no --auto) means only a mute
+// stops it. Title and body arrive as env vars, never spliced into the string:
+// the body can carry the model's own bash command or a provider error.
+const highNotifyCmd =
   '$(command -v zeph || echo "npx -y @zeph-to/cli") notify'
-  + ' --title "$ZEPH_PROMPT_TITLE" --body "$ZEPH_PROMPT_BODY" --priority high 2>/dev/null || true';
+  + ' --title "$ZEPH_PUSH_TITLE" --body "$ZEPH_PUSH_BODY" --priority high 2>/dev/null || true';
+
+// The pi turn's Push Signal marker, as a JS template placeholder (single quotes:
+// `${marker}` must reach the artifact unexpanded). The artifact only ever
+// assigns it a word the marker regex captured, or "none".
+const PUSH_SIGNAL_FLAG = ' --marker ${marker}';
 
 /** Grace before the pi extension turns an unanswered prompt into a push. Exported for the tests. */
 export const PI_PROMPT_GRACE_MS = 10_000;
@@ -159,10 +165,32 @@ tool instead — same semantics:
 - zeph_notify → \`zeph notify --title "…" --body "…" [--priority high]\`
 - AskUserQuestion → pi's own terminal prompt.`;
 
+// Push Signal preamble — pi only. The shared core has no Push Signal section:
+// Claude Code gets it from the plugin's SessionStart hook, per push dial. The
+// pi extension reads the same markers (PI_EXTENSION, message_end), so pi's
+// rules carry a dial-independent version here.
+const PI_PUSH_SIGNAL = `## Push Signal — steer the end-of-turn push
+
+When a turn ends, the zeph extension decides whether to push by tool volume
+and the user's push dial. Put ONE marker anywhere in your final response to
+override that for this turn. The extension removes it before the message is
+shown or kept:
+
+- \`<!-- zeph: high -->\` — push at high priority. The only marker that gets
+  through the quiet dial, so use it whenever the user must act: you ended the
+  turn with a question for them, or you are blocked on a decision only they
+  can make. Never on routine completions.
+- \`<!-- zeph: push -->\` — push a turn the heuristic would skip.
+- \`<!-- zeph: skip -->\` — no push for a turn not worth a ping.
+
+No marker → the heuristic: fewer than 2 tool calls, or only read-only ones,
+stays silent. Markers are lowercase and exact.`;
+
 /** Assemble a full rule document from optional frontmatter + preambles + core. */
-const buildRule = (opts: { frontmatter?: string; notify: string; toolAccess?: string; remoteEntry?: string; core: string }): string => {
+const buildRule = (opts: { frontmatter?: string; notify: string; toolAccess?: string; pushSignal?: string; remoteEntry?: string; core: string }): string => {
   const fm = opts.frontmatter ? `${opts.frontmatter}\n\n` : '';
   const tools = opts.toolAccess ? `${opts.toolAccess}\n\n` : '';
+  const signal = opts.pushSignal ? `${opts.pushSignal}\n\n` : '';
   const entry = opts.remoteEntry ? `${opts.remoteEntry}\n\n` : '';
   return `${fm}# Zeph — Remote-Control Rules
 
@@ -172,7 +200,7 @@ the user.
 
 ${opts.notify}
 
-${tools}${entry}${opts.core}
+${tools}${signal}${entry}${opts.core}
 `;
 };
 
@@ -228,6 +256,7 @@ export const AIDER_RULE = buildRule({
 export const PI_RULE = buildRule({
   notify: HOOK_DRIVEN_NOTIFY,
   toolAccess: PI_TOOL_ACCESS,
+  pushSignal: PI_PUSH_SIGNAL,
   core: ZEPH_CORE_HOOK_DRIVEN,
 });
 
@@ -366,6 +395,25 @@ const READ_ONLY = new Set(["read", "grep", "find", "ls"]);
 // can raise several prompts a turn — pushing each one at once would be noise.
 const PROMPT_GRACE_MS = ${PI_PROMPT_GRACE_MS};
 
+// Push Signal markers — the pattern the Claude Code Stop hook reads
+// (plugin/hooks/zeph-stop.sh MARKER_RE). pi's markdown renders an HTML comment
+// as plain text, so message_end also strips it from what the user sees.
+const MARKER_RE = /<!--[ \\t]*zeph:[ \\t]*(skip|push|high)[ \\t]*-->/g;
+
+const projectOf = (cwd: string): string => cwd.split("/").pop() || cwd;
+
+// Fire-and-forget: never block pi on the notify network call.
+const pushHigh = (cwd: string, title: string, body: string): void => {
+  const env = {
+    ...process.env,
+    ZEPH_PUSH_TITLE: title,
+    ZEPH_PUSH_BODY: body.length > 200 ? body.slice(0, 199) + "…" : body,
+  };
+  const child = spawn("sh", ["-c", ${JSON.stringify(highNotifyCmd)}], { cwd, env, stdio: "ignore", detached: true });
+  child.on("error", () => {});
+  child.unref();
+};
+
 export default function (pi: ExtensionAPI) {
   // Turn facts for the push gate. One agent per process, so plain counters
   // suffice — no session keying.
@@ -375,7 +423,32 @@ export default function (pi: ExtensionAPI) {
   // tool_call handlers, so a guard's prompt always finds its own call here.
   let running: { toolName: string; args: any } | undefined;
   let promptTimer: ReturnType<typeof setTimeout> | undefined;
+  // A prompt only counts inside a turn. Outside one it is a dialog the user
+  // opened at the terminal themselves (/caveman config, a settings picker).
+  let agentRunning = false;
+  // This turn's Push Signal, and why its last assistant message stopped.
+  let marker = "none";
+  let stop: { reason: string; error?: string } | undefined;
 
+  pi.on("agent_start", () => {
+    agentRunning = true;
+  });
+  pi.on("message_end", (event) => {
+    const message = event.message;
+    if (message.role !== "assistant") return;
+    stop = { reason: message.stopReason, error: message.errorMessage };
+    let found = false;
+    const content = message.content.map((part) => {
+      if (part.type !== "text") return part;
+      const text = part.text.replace(MARKER_RE, (_match: string, word: string) => {
+        marker = word;
+        found = true;
+        return "";
+      });
+      return text === part.text ? part : { ...part, text: text.trimEnd() };
+    });
+    if (found) return { message: { ...message, content } };
+  });
   pi.on("tool_execution_start", (event) => {
     running = event;
   });
@@ -389,20 +462,14 @@ export default function (pi: ExtensionAPI) {
   // A custom dialog carries no title, so name the call that raised it instead.
   pi.on("ui_prompt_start", (event, ctx) => {
     clearTimeout(promptTimer);
+    if (!agentRunning) return;
     const command = running?.toolName === "bash" ? running.args?.command : undefined;
     const body = event.title
       ?? (typeof command === "string" ? "$ " + command : undefined)
       ?? (running ? running.toolName + " is waiting for your answer" : "Waiting for your input");
-    const env = {
-      ...process.env,
-      ZEPH_PROMPT_TITLE: "pi asks: " + (ctx.cwd.split("/").pop() || ctx.cwd),
-      ZEPH_PROMPT_BODY: body.length > 200 ? body.slice(0, 199) + "…" : body,
-    };
     promptTimer = setTimeout(() => {
       promptTimer = undefined;
-      const child = spawn("sh", ["-c", ${JSON.stringify(promptNotifyCmd)}], { cwd: ctx.cwd, env, stdio: "ignore", detached: true });
-      child.on("error", () => {});
-      child.unref();
+      pushHigh(ctx.cwd, "pi asks: " + projectOf(ctx.cwd), body);
     }, PROMPT_GRACE_MS);
     promptTimer.unref?.();
   });
@@ -413,7 +480,18 @@ export default function (pi: ExtensionAPI) {
   // Stop-equivalent: agent_settled fires once per user turn, after retries/compaction.
   // Fire-and-forget: never block pi's turn-end on the notify network call.
   pi.on("agent_settled", (_event, ctx) => {
-    const child = spawn("sh", ["-c", ${notifyCmdLiteral(TURN_FACT_FLAGS)}], { cwd: ctx.cwd, stdio: "ignore", detached: true });
+    agentRunning = false;
+    clearTimeout(promptTimer);
+    promptTimer = undefined;
+    // Esc (at the terminal, or a key sent from the phone): whoever stopped the
+    // turn is already looking at it.
+    if (stop?.reason === "aborted") return;
+    // A turn that died on a provider error is a blocker, not a completion.
+    if (stop?.reason === "error") {
+      pushHigh(ctx.cwd, "pi stopped: " + projectOf(ctx.cwd), stop.error || "The model request failed");
+      return;
+    }
+    const child = spawn("sh", ["-c", ${notifyCmdLiteral(TURN_FACT_FLAGS + PUSH_SIGNAL_FLAG)}], { cwd: ctx.cwd, stdio: "ignore", detached: true });
     child.on("error", () => {});
     child.unref();
   });
@@ -423,6 +501,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     tools = 0;
     nonReadonly = 0;
+    marker = "none";
+    stop = undefined;
     const out = await sh(${JSON.stringify(remoteHookCmd('pi'))}, ctx.cwd,
       JSON.stringify({ prompt: event.prompt, cwd: ctx.cwd }));
     try {
