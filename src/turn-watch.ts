@@ -246,6 +246,9 @@ const pagesOf = (events: readonly TurnEvent[]): TurnEvent[][] => {
 export const createTurnWatchers = (deps: TurnWatchDeps) => {
     const now = deps.now ?? Date.now;
     const watchers = new Map<string, Watcher>();
+    /** Still the same incarnation it was at `epoch` — not stopped, not re-seeded since. */
+    const isCurrent = (watcher: Watcher, epoch: number): boolean =>
+        watchers.get(watcher.sessionName) === watcher && watcher.epoch === epoch;
 
     const stop = (sessionName: string, reason: string): void => {
         const watcher = watchers.get(sessionName);
@@ -337,7 +340,7 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
                 for (const page of pagesOf(events)) {
                     if (!(await emit(watcher, page))) return;
                     recordSent(watcher, page);
-                    if (watchers.get(sessionName) !== watcher || watcher.epoch !== epoch) return;
+                    if (!isCurrent(watcher, epoch)) return;
                 }
             }
         }
@@ -441,8 +444,6 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
         // that has been superseded stops here instead of interleaving its pages
         // with the newer one's.
         const epoch = watcher.epoch;
-        const superseded = (): boolean =>
-            watchers.get(watcher.sessionName) !== watcher || watcher.epoch !== epoch;
         for (const page of pagesOf(recent)) {
             // A refused page is not the end of the history: `emit` already
             // counts seal failures and ends the watch at MAX_TURN_SEAL_FAILURES
@@ -450,7 +451,7 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
             // transient failure would leave scrollback silently short,
             // indistinguishable from a quiet session.
             await emit(watcher, page);
-            if (superseded()) return;
+            if (!isCurrent(watcher, epoch)) return;
         }
     };
 
