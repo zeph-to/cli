@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, afterAll, vi } from 'vitest';
+import { ZEPH_CORE_HOOK_DRIVEN } from './zeph-core.generated.js';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -32,6 +33,16 @@ afterAll(() => {
  * (listener.ts writeRemoteMarker), so every match test is a full
  * write→read roundtrip: a parity break between the two sides fails here.
  */
+/** Drop every generated-core section from an injected context, leaving the cli-authored prose. */
+const stripCoreSections = (ctx: string): string => {
+    let out = ctx;
+    for (const section of ZEPH_CORE_HOOK_DRIVEN.split(/^(?=### )/m)) {
+        const trimmed = section.trim();
+        if (trimmed) out = out.replace(trimmed, '');
+    }
+    return out;
+};
+
 describe('runRemoteHook (ADR-0002, gemini/codex)', () => {
     let stateHome: string;
     let savedXdg: string | undefined;
@@ -144,8 +155,44 @@ describe('runRemoteHook (ADR-0002, gemini/codex)', () => {
         seedState(exited);
         const exit = contextOf(runRemoteHook('gemini', stdin('typed at the terminal', exited), TWO_WAY, () => NOW));
         for (const ctx of [entry, exit]) {
-            expect(ctx).not.toMatch(/\b[Rr]ules?\s+\d+/);
+            // The core sections the entry note carries keep their own numbering
+            // (they are the generated core, verbatim); only cli-authored prose is checked.
+            expect(stripCoreSections(ctx)).not.toMatch(/\b[Rr]ules?\s+\d+/);
         }
+    });
+
+    // The static rule file of a prompt-hook agent carries the NORMAL branch
+    // only (templates.ts PROMPT_HOOK_CORE), so the turn that enters REMOTE is
+    // where the contract has to arrive in full — the twin of the plugin's
+    // zeph-remote.sh reading CORE_RULES.md on entry.
+    it('entering REMOTE from NORMAL injects the REMOTE contract in full', () => {
+        const cwd = '/proj/entry-contract';
+        writeRemoteMarker(cwd, 'from the phone', () => NOW);
+        const ctx = contextOf(runRemoteHook('pi', stdin('from the phone', cwd), TWO_WAY, () => NOW));
+        for (const heading of ['When zeph_ask is MANDATORY', 'Sticky REMOTE mode', 'When to use AskUserQuestion vs zeph_ask']) {
+            expect(ctx).toContain(`### ${heading}`);
+        }
+        // Every rule number the injected text cites is a rule it carries.
+        const carried = new Set([...ctx.matchAll(/^(\d+)\. /gm)].map((m) => m[1]));
+        for (const ref of ctx.matchAll(/\b[Rr]ules?\s+(\d+(?:(?:,\s*|\s+and\s+)\d+)*)/g)) {
+            for (const n of ref[1].split(/,\s*|\s+and\s+/)) expect(carried, `Rule ${n}`).toContain(n);
+        }
+    });
+
+    it('a phone prompt on a session already in REMOTE gets the note without the contract', () => {
+        const cwd = '/proj/entry-repeat';
+        seedState(cwd);
+        writeRemoteMarker(cwd, 'again from the phone', () => NOW);
+        const ctx = contextOf(runRemoteHook('pi', stdin('again from the phone', cwd), TWO_WAY, () => NOW));
+        expect(ctx).toContain('REMOTE mode');
+        expect(ctx).not.toContain('### Sticky REMOTE mode');
+    });
+
+    it('one-way entry never carries the two-way contract', () => {
+        const cwd = '/proj/entry-one-way';
+        writeRemoteMarker(cwd, 'from the phone', () => NOW);
+        const ctx = contextOf(runRemoteHook('pi', stdin('from the phone', cwd), ONE_WAY, () => NOW));
+        expect(ctx).not.toContain('### Sticky REMOTE mode');
     });
 
     it('text mismatch → silent, marker kept (terminal race cannot false-match)', () => {

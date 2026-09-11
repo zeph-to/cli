@@ -30,6 +30,8 @@
  */
 import { readFileSync, unlinkSync } from 'fs';
 import { resolveHookId } from './config.js';
+import { coreSection } from './core-sections.js';
+import { ZEPH_CORE_HOOK_DRIVEN } from './zeph-core.generated.js';
 import {
   clearRemoteActive,
   isMuted,
@@ -65,6 +67,24 @@ const FRESH_WINDOW_SEC = 900;
 const TWO_WAY_CONTEXT = `# System note (Zeph remote-origin detect)
 
 This user message arrived from the user's phone via Zeph agent chat (verified by the listener — exact text match). The user is driving this session remotely and is NOT at the terminal. Enter sticky REMOTE mode now (the "Sticky REMOTE mode" rule in your Zeph rules): end EVERY response with \`zeph_ask\` (buttons + free-text) until the user exits — an exit signal (done/stop/exit), or a prompt they type at the terminal, which this hook will tell you about. Plain-text questions are invisible to them.`;
+
+// The static rule file of these agents carries the NORMAL branch only
+// (templates.ts PROMPT_HOOK_CORE), so the turn that enters REMOTE is where the
+// contract has to arrive in full — the twin of plugin/hooks/zeph-remote.sh
+// reading CORE_RULES.md on entry. Read from the generated core rather than
+// restated here: a copy would be one more place for the rule to drift. The
+// four sections together cite only rules they carry (1–4, 7–9), so no
+// cross-reference dangles; remote-hook.test.ts checks that. Sent once per
+// entry: a later phone prompt on a session already in REMOTE gets the note
+// alone, since the contract is already in its context.
+const REMOTE_ENTRY_SECTIONS = [
+  'When zeph_ask is MANDATORY',
+  'When zeph_ask is the DEFAULT',
+  'Sticky REMOTE mode',
+  'When to use AskUserQuestion vs zeph_ask',
+]
+  .map((heading) => coreSection(ZEPH_CORE_HOOK_DRIVEN, heading))
+  .join('\n\n');
 
 const ONE_WAY_CONTEXT = `# System note (Zeph remote-origin detect)
 
@@ -125,8 +145,9 @@ export const runRemoteHook = (
     if (!resolveHookId(env)) return emit(ONE_WAY_CONTEXT);
     // Only a two-way session has a mode to stay in — without zeph_ask there is
     // nothing for a later turn to be reminded of, so no state is recorded.
+    const entering = !isRemoteActive(cwd, now);
     touchRemoteActive(cwd, now);
-    return emit(TWO_WAY_CONTEXT);
+    return emit(entering ? `${TWO_WAY_CONTEXT}\n\n${REMOTE_ENTRY_SECTIONS}` : TWO_WAY_CONTEXT);
   }
 
   if (origin === 'keyboard' && isRemoteActive(cwd, now) && resolveHookId(env)) {
