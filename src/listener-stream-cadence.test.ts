@@ -20,11 +20,16 @@ let cursorProbe = '';
 const fakeTmux = (args: readonly string[]) => {
     // Drop the optional `-S <socket>` prefix tmuxArgs() prepends.
     const a = args[0] === '-S' ? args.slice(2) : args;
-    if (a[0] === 'list-sessions') {
-        const stdout = SESSIONS.map((n) => [n, '0', '1700000000', '1700000000'].join(FIELD_SEP)).join('\n');
-        return { status: 0, stdout, stderr: '' };
+    if (a[0] === 'list-panes') {
+        const rows = SESSIONS.map((n, i) => [n, '0', '1700000000', '1700000000', '0', '0', `%${i}`, 'node', 'claude', '/tmp/proj', '1234'].join(FIELD_SEP));
+        return { status: 0, stdout: rows.join('\n') + '\n', stderr: '' };
     }
+    if (a[0] === 'list-sessions') return { status: 0, stdout: '', stderr: '' };
     if (a[0] === 'display-message') {
+        const target = a[a.indexOf('-t') + 1];
+        const session = SESSIONS[Number(target.slice(1))] ?? target;
+        // Inject guard's two-field probe: command + owning session.
+        if (a[4]?.includes('#{session_name}')) return { status: 0, stdout: ['node', session].join(FIELD_SEP), stderr: '' };
         if (a[4] === '#{pane_current_command}') return { status: 0, stdout: 'node', stderr: '' };
         // Unset by default, which fails to parse — the same "pane reports no
         // cursor" path every other test in this file runs on.

@@ -19,14 +19,21 @@ const fakeTmux = (args: readonly string[]) => {
     // Drop the optional `-S <socket>` prefix tmuxArgs() prepends.
     const a = args[0] === '-S' ? args.slice(2) : args;
     tmuxCalls.push([...a]);
-    if (a[0] === 'list-sessions') {
-        const stdout = SESSIONS.map((n) => [n, '0', '1700000000', '1700000000'].join(FIELD_SEP)).join('\n');
-        return { status: 0, stdout, stderr: '' };
+    // One pane per session, pinned id `%<index>` — what the sweep records in
+    // its targets map, so display/capture/send calls arrive with pane ids.
+    if (a[0] === 'list-panes') {
+        const rows = SESSIONS.map((n, i) => [n, '0', '1700000000', '1700000000', '0', '0', `%${i}`, 'node', 'claude', '/tmp/proj', '1234'].join(FIELD_SEP));
+        return { status: 0, stdout: rows.join('\n') + '\n', stderr: '' };
     }
+    if (a[0] === 'list-sessions') return { status: 0, stdout: '', stderr: '' };
     if (a[0] === 'display-message') {
-        const paneCommand = a[3] === 'zeph-shell' ? 'zsh' : 'node';
-        // Two callers, two formats: the inject guard asks for the current
-        // command alone, the inventory asks for the four-field pane record.
+        const target = a[a.indexOf('-t') + 1];
+        const session = SESSIONS[Number(target.slice(1))] ?? target;
+        const paneCommand = session === 'zeph-shell' ? 'zsh' : 'node';
+        // Three callers, three formats: the inject guard asks for the current
+        // command AND the owning session (a stale pane id must not receive an
+        // inject), the bare-command probe, and the four-field pane record.
+        if (a[4]?.includes('#{session_name}')) return { status: 0, stdout: [paneCommand, session].join(FIELD_SEP), stderr: '' };
         if (a[4] === '#{pane_current_command}') return { status: 0, stdout: paneCommand, stderr: '' };
         return { status: 0, stdout: [paneCommand, 'claude', '/tmp/proj', '1234'].join(FIELD_SEP), stderr: '' };
     }
@@ -118,7 +125,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
     it('injects whitelisted keys into a session with a live stream', () => {
         openStream('zeph-a');
         expect(handleCommandInput(input(), send)).toBe(true);
-        expect(injections()).toEqual(['-t zeph-a Down']);
+        expect(injections()).toEqual(['-t %0 Down']);
         expect(rejections()).toEqual([]);
     });
 
@@ -134,8 +141,8 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
             // buffer contents are data to paste-buffer — same property `-l`
             // had: no escape inside a message can drive another tmux command.
             'set-buffer -b zeph-inject -- hello; rm -rf /',
-            'paste-buffer -d -p -b zeph-inject -t zeph-a',
-            'send-keys -t zeph-a Enter',
+            'paste-buffer -d -p -b zeph-inject -t %0',
+            'send-keys -t %0 Enter',
         ]);
     });
 
@@ -152,7 +159,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         handleCommandInput(input({ keys: undefined, insert: 'y' }), send);
         expect(tmuxInvocations()).toEqual([
             'set-buffer -b zeph-inject -- y',
-            'paste-buffer -d -p -b zeph-inject -t zeph-a',
+            'paste-buffer -d -p -b zeph-inject -t %0',
         ]);
         expect(rejections()).toEqual([]);
     });
@@ -198,7 +205,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         );
         expect(tmuxInvocations()).toEqual([
             'set-buffer -b zeph-inject -- y',
-            'paste-buffer -d -p -b zeph-inject -t zeph-a',
+            'paste-buffer -d -p -b zeph-inject -t %0',
         ]);
     });
 
@@ -207,7 +214,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         bufferFails = true;
         openStream('zeph-a');
         handleCommandInput(input({ keys: undefined, body: 'hello' }), send);
-        expect(injections()).toEqual(['-l -t zeph-a hello', '-t zeph-a Enter']);
+        expect(injections()).toEqual(['-l -t %0 hello', '-t %0 Enter']);
     });
 
     it('drops the buffer it filled when the paste fails, then falls back', () => {
@@ -216,7 +223,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         openStream('zeph-a');
         handleCommandInput(input({ keys: undefined, body: 'hello' }), send);
         expect(tmuxInvocations()).toContain('delete-buffer -b zeph-inject');
-        expect(injections()).toEqual(['-l -t zeph-a hello', '-t zeph-a Enter']);
+        expect(injections()).toEqual(['-l -t %0 hello', '-t %0 Enter']);
     });
 
     it('refuses input for a session with no live stream', () => {
@@ -396,7 +403,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         handleCommandInput(input({ deviceId: 'dev_phone', seq: 1, epoch: 100, keys: ['up'] }), send);
         handleCommandInput(input({ deviceId: 'dev_web', seq: 1, epoch: 200, keys: ['down'] }), send);
         handleCommandInput(input({ deviceId: 'dev_phone', seq: 2, epoch: 100, keys: ['left'] }), send);
-        expect(injections()).toEqual(['-t zeph-a Up', '-t zeph-a Down', '-t zeph-a Left']);
+        expect(injections()).toEqual(['-t %0 Up', '-t %0 Down', '-t %0 Left']);
     });
 
     it('drops every sender\'s ordering state when the stream stops', () => {
@@ -405,7 +412,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         stopAllStreams();
         openStream('zeph-a');
         handleCommandInput(input({ deviceId: 'dev_phone', seq: 1, epoch: 100, keys: ['down'] }), send);
-        expect(injections()).toEqual(['-t zeph-a Down']);
+        expect(injections()).toEqual(['-t %0 Down']);
     });
 
     it('refuses plaintext input on an E2EE stream', () => {
@@ -475,23 +482,23 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         handleCommandInput(input({ seq: 1, keys: ['up'] }), send);
         handleCommandInput(input({ seq: 3, keys: ['left'] }), send);
         handleCommandInput(input({ seq: 2, keys: ['down'] }), send);
-        expect(injections()).toEqual(['-t zeph-a Up', '-t zeph-a Down', '-t zeph-a Left']);
+        expect(injections()).toEqual(['-t %0 Up', '-t %0 Down', '-t %0 Left']);
     });
 
     it('types a held key once its gap times out rather than dropping it', () => {
         openStream('zeph-a');
         handleCommandInput(input({ seq: 1, keys: ['up'] }), send);
         handleCommandInput(input({ seq: 3, keys: ['left'] }), send);
-        expect(injections()).toEqual(['-t zeph-a Up']);
+        expect(injections()).toEqual(['-t %0 Up']);
         vi.advanceTimersByTime(INPUT_HOLD_MS);
-        expect(injections()).toEqual(['-t zeph-a Up', '-t zeph-a Left']);
+        expect(injections()).toEqual(['-t %0 Up', '-t %0 Left']);
     });
 
     it('drops a duplicate rather than typing the key twice', () => {
         openStream('zeph-a');
         handleCommandInput(input({ seq: 1, keys: ['up'] }), send);
         handleCommandInput(input({ seq: 1, keys: ['up'] }), send);
-        expect(injections()).toEqual(['-t zeph-a Up']);
+        expect(injections()).toEqual(['-t %0 Up']);
     });
 
     it('accepts the first key of a re-subscribed stream', () => {
@@ -502,7 +509,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         stopAllStreams();
         openStream('zeph-a');
         handleCommandInput(input({ seq: 1, epoch: 100, keys: ['down'] }), send);
-        expect(injections()).toEqual(['-t zeph-a Down']);
+        expect(injections()).toEqual(['-t %0 Down']);
     });
 
     it('validateInputMessage keeps the wire contract without touching tmux', () => {
@@ -622,7 +629,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
                 send,
             );
             await pendingInputDecrypts();
-            expect(injections()).toEqual(['-t zeph-a Down']);
+            expect(injections()).toEqual(['-t %0 Down']);
         });
 
         it('injects keys carried inside an envelope from the stream subscriber', async () => {
@@ -631,7 +638,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
             handleCommandInput(input({ keys: undefined, encrypted: await seal({ keys: ['down'] }) }), send);
             await pendingInputDecrypts();
 
-            expect(injections()).toEqual(['-t zeph-a Down']);
+            expect(injections()).toEqual(['-t %0 Down']);
             expect(rejections()).toEqual([]);
         });
 
@@ -643,8 +650,8 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
 
             expect(tmuxInvocations()).toEqual([
                 'set-buffer -b zeph-inject -- hello; rm -rf /',
-                'paste-buffer -d -p -b zeph-inject -t zeph-a',
-                'send-keys -t zeph-a Enter',
+                'paste-buffer -d -p -b zeph-inject -t %0',
+                'send-keys -t %0 Enter',
             ]);
         });
 
@@ -656,7 +663,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
 
             expect(tmuxInvocations()).toEqual([
                 'set-buffer -b zeph-inject -- y',
-                'paste-buffer -d -p -b zeph-inject -t zeph-a',
+                'paste-buffer -d -p -b zeph-inject -t %0',
             ]);
         });
 
@@ -674,7 +681,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
 
             expect(tmuxInvocations()).toEqual([
                 'set-buffer -b zeph-inject -- y',
-                'paste-buffer -d -p -b zeph-inject -t zeph-a',
+                'paste-buffer -d -p -b zeph-inject -t %0',
             ]);
         });
 
@@ -710,7 +717,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
             handleCommandInput(input({ seq: 2, keys: undefined, encrypted }), send);
             await pendingInputDecrypts();
 
-            expect(injections()).toEqual(['-t zeph-a Down']);
+            expect(injections()).toEqual(['-t %0 Down']);
             expect(rejections()).toHaveLength(1);
         });
 
@@ -827,7 +834,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
             handleCommandInput(input({ keys: ['up'], body: undefined, encrypted: await seal({ keys: ['down'] }) }), send);
             await pendingInputDecrypts();
 
-            expect(injections()).toEqual(['-t zeph-a Down']);
+            expect(injections()).toEqual(['-t %0 Down']);
         });
 
         it('refuses input for a stream that was replaced while the decrypt was in flight', async () => {

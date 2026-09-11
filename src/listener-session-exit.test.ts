@@ -21,23 +21,28 @@ let tmuxCalls: string[][] = [];
 /** Signals after which the fake session gives up, or null for one that never does. */
 let diesAfterSignals: number | null = 1;
 let signalsSeen = 0;
+/** Pane id → session name, as the sweep pinned them (send-keys targets pane ids). */
+let paneNameById = new Map<string, string>();
 
 const fakeTmux = (args: readonly string[]) => {
     const a = args[0] === '-S' ? args.slice(2) : args;
     tmuxCalls.push([...a]);
-    if (a[0] === 'list-sessions') {
-        const stdout = liveSessions
-            .map((n) => [n, '0', '1700000000', '1700000000'].join(FIELD_SEP))
+    if (a[0] === 'list-panes') {
+        const rows = liveSessions
+            .map((n, i) => [n, '0', '1700000000', '1700000000', '0', '0', `%${i}`, 'node', 'claude', '/tmp/proj', '1234'].join(FIELD_SEP))
             .join('\n');
-        return { status: 0, stdout, stderr: '' };
+        paneNameById = new Map(liveSessions.map((n, i) => [`%${i}`, n]));
+        return { status: 0, stdout: rows + '\n', stderr: '' };
     }
+    if (a[0] === 'list-sessions') return { status: 0, stdout: '', stderr: '' };
     if (a[0] === 'has-session') {
         return { status: liveSessions.includes(a[2]) ? 0 : 1, stdout: '', stderr: '' };
     }
     if (a[0] === 'send-keys') {
         signalsSeen += 1;
         if (diesAfterSignals !== null && signalsSeen >= diesAfterSignals) {
-            liveSessions = liveSessions.filter((n) => n !== a[2]);
+            const name = paneNameById.get(a[2]) ?? a[2];
+            liveSessions = liveSessions.filter((n) => n !== name);
         }
         return { status: 0, stdout: '', stderr: '' };
     }

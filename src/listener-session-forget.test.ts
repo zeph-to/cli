@@ -19,12 +19,13 @@ let liveSessions: string[] = [];
 
 const fakeTmux = (args: readonly string[]) => {
     const a = args[0] === '-S' ? args.slice(2) : args;
-    if (a[0] === 'list-sessions') {
-        const stdout = liveSessions
-            .map((n) => [n, '0', '1700000000', '1700000000'].join(FIELD_SEP))
+    if (a[0] === 'list-panes') {
+        const rows = liveSessions
+            .map((n, i) => [n, '0', '1700000000', '1700000000', '0', '0', `%${i}`, 'node', 'claude', '/tmp/proj', '1234'].join(FIELD_SEP))
             .join('\n');
-        return { status: 0, stdout, stderr: '' };
+        return { status: 0, stdout: rows + '\n', stderr: '' };
     }
+    if (a[0] === 'list-sessions') return { status: 0, stdout: '', stderr: '' };
     if (a[0] === 'has-session') {
         return { status: liveSessions.includes(a[2]) ? 0 : 1, stdout: '', stderr: '' };
     }

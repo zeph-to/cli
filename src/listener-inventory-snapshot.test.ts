@@ -27,10 +27,10 @@ process.env.XDG_STATE_HOME = join(TMP, 'state');
 const { isInventoried, recordInventory, handleScreenRequest, computeListenerDeviceId } =
     await import('./listener.js');
 
-// Socket discovery also runs `list-sessions` (bare); an inventory sweep is the
-// one that asks for the session fields.
+// Socket discovery also runs `list-sessions` (bare); an inventory sweep is
+// the one that asks for the pane fields (list-panes).
 const sweeps = () =>
-    spawnCalls.filter((args) => args.includes('list-sessions') && args.some((a) => a.includes('#{session_attached}'))).length;
+    spawnCalls.filter((args) => args.includes('list-panes') && args.some((a) => a.includes('#{session_attached}'))).length;
 
 describe('inventory membership from the last sweep', () => {
     beforeEach(() => {
