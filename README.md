@@ -664,6 +664,28 @@ others cannot: a turn with no tool calls, a turn with exactly one (a
 lone edit included — the gate wants two), and a turn whose calls were
 all reads. `/zeph-loud` still pushes on all of them.
 
+The Pi extension also pushes when pi is **waiting on you**: any blocking
+extension dialog — a bash guard's Run/Abort, an ask-user tool, a
+`ctx.ui.confirm` — that is still open 10 seconds after it appeared sends a
+`high` push ("pi asks: <project>", body = the dialog title or the guarded
+bash command). `high` gets through `quiet`; only `/zeph-mute` stops it.
+Answering inside the 10 seconds sends nothing. It is the pi twin of the
+Claude Code plugin's AskUserQuestion push, driven by pi's
+`ui_prompt_start` / `ui_prompt_end` events. Only dialogs that open while a
+turn is running count: a settings picker you open yourself between turns
+(`/caveman config`) never pushes.
+
+Two more end-of-turn cases differ from Claude Code:
+
+- **Push Signal markers** — pi's rules teach the same `<!-- zeph: skip|push|high -->`
+  markers, and the extension reads them from the final assistant message
+  (then strips them, since pi's terminal would otherwise print the comment).
+  `high` is how pi gets a "the turn ended with a question for you" push
+  through `quiet`.
+- **Errors and aborts** — a turn that ended on a provider error sends a
+  `high` "pi stopped: <project>" push with the error text instead of
+  "Task done"; a turn you aborted with Esc sends nothing.
+
 #### Quiet while away
 
 `quiet` silences routine pushes because you are watching the pane. When
@@ -789,7 +811,7 @@ try {
 | Copilot CLI | Session end hook + rules |
 | Cline | Rules file (`~/.cline/rules/zeph.md`) |
 | Aider | Conventions file + `read:` directive in `~/.aider.conf.yml` |
-| Pi | Extension (settle hook + remote detection) + rules — no MCP (pi has none; rules map zeph tools to the CLI) |
+| Pi | Extension (settle hook + waiting-on-you push + remote detection) + rules — no MCP (pi has none; rules map zeph tools to the CLI) |
 | OpenCode | MCP server + idle-notify plugin + rules |
 
 For remote-control via `zeph listener` the per-agent setup is the same
