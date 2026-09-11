@@ -48,7 +48,7 @@ import {
     rememberSessions,
     sessionDirectoryExists,
 } from './session-registry.js';
-import { matchAgentByPaneCommand, REMOTE_AGENTS, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
+import { foregroundAgentFor, matchAgentByPaneCommand, REMOTE_AGENTS, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 import {
     installService,
     restartService,
@@ -106,6 +106,11 @@ interface AgentSession {
     name: string;
     attached: boolean;
     agentKind: AgentKind;
+    /** Set when this session is a SUBAGENT — an extra pane of the parent
+     *  session `parentName` (`zeph-zeph.48` belongs to `zeph-zeph`). Subagent
+     *  sessions are view-only: input, keys, exit, resume and forget are
+     *  refused, and the server never pushes agent.state transitions for them. */
+    parentName?: string;
     agentSessionId?: string | null;
     project: string;
     label?: string | null;
@@ -285,7 +290,9 @@ export const checkRateLimit = (
  * session"), which refuses the inject until the next sweep re-pins.
  */
 export const paneCurrentCommand = (session: string): string | null => {
-    const result = spawnSync('tmux', tmuxArgs(['display-message', '-p', '-t', tmuxTargetFor(session),
+    const target = tmuxTargetFor(session);
+    if (target === null) return null; // unresolvable subagent — never spawn
+    const result = spawnSync('tmux', tmuxArgs(['display-message', '-p', '-t', target,
         `#{pane_current_command}${FIELD_SEP}#{session_name}`]), {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'ignore'],
@@ -306,9 +313,12 @@ const isShellPane = (command: string | null): boolean => {
  *  again the moment it has been delivered. */
 const INJECT_BUFFER = 'zeph-inject';
 
-const sendLiteral = (session: string, text: string): boolean =>
-    spawnSync('tmux', tmuxArgs(['send-keys', '-l', '-t', tmuxTargetFor(session), text]), { stdio: ['ignore', 'ignore', 'pipe'] })
+const sendLiteral = (session: string, text: string): boolean => {
+    const target = tmuxTargetFor(session);
+    if (target === null) return false; // unresolvable subagent — never spawn
+    return spawnSync('tmux', tmuxArgs(['send-keys', '-l', '-t', target, text]), { stdio: ['ignore', 'ignore', 'pipe'] })
         .status === 0;
+};
 
 /**
  * Put the message in the pane as a PASTE rather than as typing.
@@ -335,7 +345,9 @@ const pasteText = (session: string, text: string): boolean => {
     // drive another tmux command.
     const set = spawnSync('tmux', tmuxArgs(['set-buffer', '-b', INJECT_BUFFER, '--', text]), { stdio: ['ignore', 'ignore', 'pipe'] });
     if (set.status !== 0) return sendLiteral(session, text);
-    const paste = spawnSync('tmux', tmuxArgs(['paste-buffer', '-d', '-p', '-b', INJECT_BUFFER, '-t', tmuxTargetFor(session)]), { stdio: ['ignore', 'ignore', 'pipe'] });
+    const pasteTarget = tmuxTargetFor(session);
+    if (pasteTarget === null) return false; // unresolvable subagent — never spawn
+    const paste = spawnSync('tmux', tmuxArgs(['paste-buffer', '-d', '-p', '-b', INJECT_BUFFER, '-t', pasteTarget]), { stdio: ['ignore', 'ignore', 'pipe'] });
     if (paste.status === 0) return true;
     // `-d` never ran, so the buffer is still there holding the message.
     spawnSync('tmux', tmuxArgs(['delete-buffer', '-b', INJECT_BUFFER]), { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -353,7 +365,9 @@ const pasteText = (session: string, text: string): boolean => {
  */
 const injectKeys = (session: string, text: string): boolean => {
     if (!pasteText(session, text)) return false;
-    const b = spawnSync('tmux', tmuxArgs(['send-keys', '-t', tmuxTargetFor(session), 'Enter']), { stdio: ['ignore', 'ignore', 'pipe'] });
+    const enterTarget = tmuxTargetFor(session);
+    if (enterTarget === null) return false; // unresolvable subagent — never spawn
+    const b = spawnSync('tmux', tmuxArgs(['send-keys', '-t', enterTarget, 'Enter']), { stdio: ['ignore', 'ignore', 'pipe'] });
     return b.status === 0;
 };
 
@@ -412,7 +426,9 @@ export const resolveKeys = (keys: string[]): string[] | null => {
  * whole sequence in order.
  */
 const injectNamedKeys = (session: string, tokens: string[]): boolean => {
-    const r = spawnSync('tmux', tmuxArgs(['send-keys', '-t', tmuxTargetFor(session), ...tokens]), { stdio: ['ignore', 'ignore', 'pipe'] });
+    const target = tmuxTargetFor(session);
+    if (target === null) return false; // unresolvable subagent — never spawn
+    const r = spawnSync('tmux', tmuxArgs(['send-keys', '-t', target, ...tokens]), { stdio: ['ignore', 'ignore', 'pipe'] });
     return r.status === 0;
 };
 
@@ -720,6 +736,13 @@ const FIELD_SEP = '␟';
 /** Session name → pinned pane id, replaced wholesale by each inventory sweep. */
 let targetsBySession = new Map<string, string>();
 
+/**
+ * A subagent session name: `<session>.<pane id digits>` (`zeph-zeph.48`).
+ * tmux forbids `.` in session names, so the shape cannot collide; `#` would
+ * break the server's stream-sub keys and `:` is the web key separator.
+ */
+export const isSubagentSessionName = (name: string): boolean => /^zeph-.+\.\d+$/.test(name);
+
 /** Store the latest sweep's name → pane-id map (see `CollectResult.targets`). */
 export const recordTargets = (targets: Record<string, string> | null | undefined): void => {
     targetsBySession = new Map(Object.entries(targets ?? {}));
@@ -729,11 +752,24 @@ export const recordTargets = (targets: Record<string, string> | null | undefined
  * The tmux target for a wire session name: its pinned pane id when the last
  * sweep saw the session, else the name itself (a session younger than one
  * sweep, or tmux unreachable at startup — today's resolution, active pane).
+ *
+ * A SUBAGENT name is the one exception: it resolves ONLY through the map, and
+ * an unknown one is null — because tmux parses `zeph-zeph.48` as session
+ * `zeph-zeph`, pane INDEX 48, and silently falls back to the active pane when
+ * that index is missing (measured: `display -t zeph-zeph.99` → main pane,
+ * exit 0). Every caller treats null as "gone": no spawn, refusal, or capture
+ * failure — never a write to whichever pane happens to be focused.
  */
-export const tmuxTargetFor = (name: string): string => targetsBySession.get(name) ?? name;
+export const tmuxTargetFor = (name: string): string | null => {
+    const hit = targetsBySession.get(name);
+    if (hit !== undefined) return hit;
+    return isSubagentSessionName(name) ? null : name;
+};
 
 const readPaneInfo = (session: string): PaneInfo => {
-    const r = spawnSync('tmux', tmuxArgs(['display-message', '-p', '-t', tmuxTargetFor(session),
+    const target = tmuxTargetFor(session);
+    if (target === null) return { currentCommand: null, startCommand: null, currentPath: null, panePid: null };
+    const r = spawnSync('tmux', tmuxArgs(['display-message', '-p', '-t', target,
         `#{pane_current_command}${FIELD_SEP}#{pane_start_command}${FIELD_SEP}#{pane_current_path}${FIELD_SEP}#{pane_pid}`]), {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'ignore'],
@@ -814,8 +850,12 @@ export const resetSessionStates = (): void => {
     sessionStates.clear();
 };
 
-const capturePaneText = (session: string): string | null => {
-    const r = spawnSync('tmux', tmuxArgs(['capture-pane', '-p', '-t', tmuxTargetFor(session), '-S', `-${STATE_CAPTURE_LINES}`]), {
+const capturePaneText = (session: string, target?: string): string | null => {
+    // Explicit target for the sweep (subagent rows aren't in the recorded
+    // target map yet); otherwise resolve through it.
+    const resolved = target ?? tmuxTargetFor(session);
+    if (resolved === null) return null; // unresolvable subagent — never spawn
+    const r = spawnSync('tmux', tmuxArgs(['capture-pane', '-p', '-t', resolved, '-S', `-${STATE_CAPTURE_LINES}`]), {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -1306,6 +1346,10 @@ export const handleSessionResumeRequest = (
         return true;
     };
 
+    // A subagent is a pane OF a live session, not a session to start — and
+    // before the rate bucket, so refused subagent traffic costs nothing.
+    if (isSubagentSessionName(sessionName)) return reply({ error: 'subagent_view_only' });
+
     // Charged like a submitted command, not like a keystroke: this starts a
     // process, and the two share one budget so a flood cannot be laundered
     // through whichever path is cheaper.
@@ -1421,6 +1465,10 @@ export const handleSessionExitRequest = (
     // Same budget as resume and as a submitted command: ending a session is a
     // session-lifecycle action, and pricing it like a keystroke would let a
     // flood through the cheaper door.
+    // Subagent refusal first, though — outside the bucket, like resume's:
+    // ending a subagent pane is a kill(2) on the parent's child, not a
+    // lifecycle action the phone is ever offered.
+    if (isSubagentSessionName(sessionName)) return answer({ error: 'subagent_view_only' });
     if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return answer({ error: 'rate_limited' });
     if (!sessionExists(sessionName)) return answer({ error: 'unknown_session' });
 
@@ -1520,6 +1568,10 @@ export const handleSessionForgetRequest = (
 
     // Charged like a submitted command: it writes to disk and is irreversible,
     // so it shares the budget with the paths that start and stop processes.
+    // Subagent refusal before the bucket: a subagent has no registry record
+    // to forget (the sweep never remembers panes), so the honest answer is
+    // the view-only one, not unknown_session.
+    if (isSubagentSessionName(sessionName)) return reply({ error: 'subagent_view_only' });
     if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return reply({ error: 'rate_limited' });
 
     if (sessionExists(sessionName)) return reply({ error: 'still_running' });
@@ -1540,11 +1592,19 @@ export const handleSessionForgetRequest = (
     return reply({ forgotten: true });
 };
 
-/** Whether tmux already holds a session by this name. */
-const sessionExists = (name: string): boolean =>
-    spawnSync('tmux', tmuxArgs(['has-session', '-t', name]), {
+/**
+ * Whether this machine currently holds a session by this name. A subagent
+ * pane cannot be asked with has-session: tmux would parse `zeph-x.48` as
+ * session `zeph-x`, pane index 48 and answer for the WRONG thing (or exit 1
+ * for a missing index) — so subs are answered from the sweep's target map,
+ * which is exactly what "a pane we can address without ambiguity" means.
+ */
+const sessionExists = (name: string): boolean => {
+    if (isSubagentSessionName(name)) return targetsBySession.has(name);
+    return spawnSync('tmux', tmuxArgs(['has-session', '-t', name]), {
         stdio: ['ignore', 'ignore', 'ignore'],
     }).status === 0;
+};
 
 // ─── Deep pull: scrollback above the live window ───────────────────
 //
@@ -1610,9 +1670,11 @@ const isPageOffset = (v: unknown): v is number =>
 /** How many lines of scrollback the pane is holding, or null when tmux won't
  *  say — which is also how a dead pane answers. */
 const paneHistorySize = (sessionName: string): number | null => {
+    const target = tmuxTargetFor(sessionName);
+    if (target === null) return null;
     const r = spawnSync(
         'tmux',
-        tmuxArgs(['display-message', '-p', '-t', tmuxTargetFor(sessionName), '#{history_size}']),
+        tmuxArgs(['display-message', '-p', '-t', target, '#{history_size}']),
         { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
     );
     if (r.status !== 0) return null;
@@ -1627,10 +1689,12 @@ const capturePaneRange = (
     start: number,
     end: number,
 ): { content: string; truncated: boolean } | null => {
+    const target = tmuxTargetFor(sessionName);
+    if (target === null) return null;
     const r = spawnSync(
         'tmux',
         tmuxArgs([
-            'capture-pane', '-p', '-e', '-t', tmuxTargetFor(sessionName),
+            'capture-pane', '-p', '-e', '-t', target,
             '-S', String(start), '-E', String(end),
         ]),
         { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
@@ -1753,9 +1817,11 @@ const capturePane = (
     // `lines` sets how far back the capture reaches — the live stream grabs
     // more history so the mirror has room to scroll; SCREEN_PEEK_MAX_BYTES
     // still caps the payload below.
+    const target = tmuxTargetFor(sessionName);
+    if (target === null) return null;
     const captureArgs = escapes
-        ? ['capture-pane', '-p', '-e', '-t', tmuxTargetFor(sessionName), '-S', `-${lines}`]
-        : ['capture-pane', '-p', '-t', tmuxTargetFor(sessionName), '-S', `-${lines}`];
+        ? ['capture-pane', '-p', '-e', '-t', target, '-S', `-${lines}`]
+        : ['capture-pane', '-p', '-t', target, '-S', `-${lines}`];
     const r = spawnSync('tmux', tmuxArgs(captureArgs), {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -1780,10 +1846,12 @@ const capturePane = (
  * spawn per SENT frame rather than per tick.
  */
 const capturePaneCursor = (sessionName: string): PaneGeometry | null => {
+    const target = tmuxTargetFor(sessionName);
+    if (target === null) return null;
     const r = spawnSync(
         'tmux',
         tmuxArgs([
-            'display-message', '-p', '-t', tmuxTargetFor(sessionName),
+            'display-message', '-p', '-t', target,
             '#{cursor_x},#{cursor_y},#{pane_height},#{history_size}',
         ]),
         { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] },
@@ -3046,7 +3114,7 @@ export const collectSessionsVerbose = (): CollectResult => {
     // per-session display-message) would multiply with split panes; the worker
     // thread keeps the one blocking sweep off the event loop.
     const list = spawnSync('tmux', tmuxArgs(['list-panes', '-a', '-F',
-        `#{session_name}${FIELD_SEP}#{session_attached}${FIELD_SEP}#{session_created}${FIELD_SEP}#{session_activity}${FIELD_SEP}#{window_index}${FIELD_SEP}#{pane_index}${FIELD_SEP}#{pane_id}${FIELD_SEP}#{pane_current_command}${FIELD_SEP}#{pane_start_command}${FIELD_SEP}#{pane_current_path}${FIELD_SEP}#{pane_pid}`]), {
+        `#{session_name}${FIELD_SEP}#{session_attached}${FIELD_SEP}#{session_created}${FIELD_SEP}#{session_activity}${FIELD_SEP}#{window_index}${FIELD_SEP}#{pane_index}${FIELD_SEP}#{pane_id}${FIELD_SEP}#{pane_current_command}${FIELD_SEP}#{pane_start_command}${FIELD_SEP}#{pane_current_path}${FIELD_SEP}#{pane_pid}${FIELD_SEP}#{@zeph_pane_label}`]), {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -3074,17 +3142,17 @@ export const collectSessionsVerbose = (): CollectResult => {
 
     const sessions: AgentSession[] = [];
     const rejected: Array<{ name: string; reason: string }> = [];
-    /** 11 fields per row; a mismatch is the mangled-separator failure the
+    /** 12 fields per row; a mismatch is the mangled-separator failure the
      *  sanity log above exists for — skip the row loudly, never misparse it. */
-    const PANE_FIELDS = 11;
-    interface PaneRow { paneId: string; win: number; idx: number; info: PaneInfo }
+    const PANE_FIELDS = 12;
+    interface PaneRow { paneId: string; win: number; idx: number; label: string; info: PaneInfo }
     interface PaneGroup { attached: boolean; created?: string; activity?: string; panes: PaneRow[] }
     const groups = new Map<string, PaneGroup>();
     let malformed = 0;
     for (const line of rawLines) {
         const f = line.split(FIELD_SEP);
         if (f.length !== PANE_FIELDS) { malformed += 1; continue; }
-        const [name, attached, created, activity, win, idx, paneId, current, start, path, pid] = f;
+        const [name, attached, created, activity, win, idx, paneId, current, start, path, pid, label] = f;
         if (!parseSessionName(name)) {
             // Not noisy enough to log every plain tmux session here —
             // would clutter the verbose output on machines with many
@@ -3099,6 +3167,7 @@ export const collectSessionsVerbose = (): CollectResult => {
             paneId,
             win: numeric(win),
             idx: numeric(idx),
+            label: label ?? '',
             info: {
                 currentCommand: current || null,
                 startCommand: start || null,
@@ -3159,8 +3228,44 @@ export const collectSessionsVerbose = (): CollectResult => {
             providerSessionName,
             createdAt: epochToIso(group.created),
             lastActivityAt: epochToIso(group.activity),
-            ...deriveSessionState(name, main.agent.kind, capturePaneText(main.row.paneId)),
+            ...deriveSessionState(name, main.agent.kind, capturePaneText(name, main.row.paneId)),
         });
+        // Subagent panes: every OTHER pane of this session whose tty's
+        // foreground process group runs a registered agent (measured:
+        // pane_current_command alone says `bash` for a pi subagent — the
+        // fg group's `comm` is what names it). View-only wire entities
+        // named `<session>.<pane id digits>`; ordered by pane id so the
+        // phone's switcher is stable across sweeps (tmux pane ids are
+        // monotonic server-wide).
+        const paneNum = (p: PaneRow): number => Number(p.paneId.slice(1)) || 0;
+        const extras = group.panes
+            .filter((p) => p !== main.row)
+            .sort((a, b) => paneNum(a) - paneNum(b));
+        const fallbackCounts = new Map<string, number>();
+        for (const extra of extras) {
+            const subAgent = foregroundAgentFor(extra.info.panePid ?? 0);
+            if (!subAgent) continue; // a shell / non-agent pane — not reportable
+            const subName = `${name}.${paneNum(extra)}`;
+            targets[subName] = extra.paneId;
+            const n = (fallbackCounts.get(subAgent.kind) ?? 0) + 1;
+            fallbackCounts.set(subAgent.kind, n);
+            sessions.push({
+                name: subName,
+                parentName: name,
+                attached: group.attached,
+                agentKind: subAgent.kind,
+                agentSessionId: null,
+                project: parsed.project,
+                // The subagent names itself by setting @zeph_pane_label
+                // (PI_EXTENSION); a manual `tmux set-option -p` works too.
+                // Fallback names per agent kind so two subagents of the
+                // same kind stay distinguishable.
+                label: extra.label.trim() || `${subAgent.displayName} ${n}`,
+                createdAt: epochToIso(group.created),
+                lastActivityAt: epochToIso(group.activity),
+                ...deriveSessionState(subName, subAgent.kind, capturePaneText(subName, extra.paneId)),
+            });
+        }
     }
     pruneSessionStates(new Set(sessions.map((s) => s.name)));
     // Write down what each live session IS, while it still exists to be read.
@@ -3168,7 +3273,10 @@ export const collectSessionsVerbose = (): CollectResult => {
     // phone wants it back — and a resume must take its directory and its binary
     // from what this machine observed, never from the wire.
     rememberSessions(
-        sessions.map((s) => ({
+        // Subagents are view-only panes OF a session, not resumable ones:
+        // the registry records what a session IS so exit/resume can act on
+        // it, and neither is ever offered for a subagent.
+        sessions.filter((s) => !s.parentName).map((s) => ({
             name: s.name,
             cwd: paneCwdOf.get(s.name) ?? null,
             agentKind: s.agentKind,
@@ -3244,6 +3352,11 @@ const publishedTmuxNames = new Map<string, string>();
 export const syncTmuxAgentNames = (sessions: ReadonlyArray<AgentSession>): void => {
     const liveKeys = new Set<string>();
     for (const s of sessions) {
+        // Subagents are view-only panes of the parent; publishing a name
+        // for them would run set-option against a `<session>.<pane>` name
+        // that tmux parses as the PARENT session (pane index) — clobbering
+        // the main pane's published name.
+        if (s.parentName) continue;
         const key = `${s.name}\u241f${s.createdAt ?? ''}`;
         liveKeys.add(key);
         const value = s.providerSessionName ?? '';
@@ -3340,6 +3453,15 @@ interface HandlePushDeps {
  * prefix path route through here so the defense layers can't diverge.
  */
 const passesInjectGuards = (session: string, deps: HandlePushDeps, cost = 1): boolean => {
+    // Subagent panes are view-only: the phone reads them but the agent
+    // itself answers at the terminal. This sits above the rate bucket so a
+    // flood of refused subagent writes costs nothing and spawns nothing —
+    // with an unresolvable name every downstream tmux call is a no-op, but
+    // the refusal must not depend on the pane still being mapped.
+    if (isSubagentSessionName(session)) {
+        log(`! ${session}: subagent pane is view-only — drop`);
+        return false;
+    }
     // Rate bucket first: the pane probe below is a blocking tmux spawnSync,
     // and the sequencer can flush several held messages back-to-back — an
     // empty bucket must refuse before paying that probe N times, not after.

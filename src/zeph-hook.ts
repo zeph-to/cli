@@ -20,6 +20,11 @@ const PREVIEW_LENGTH = 200;
  */
 const agentSessionContext = (): { agentDeviceId: string; agentSessionName: string } | null => {
   if (!process.env.TMUX) return null;
+  // A pi subagent pane carries its own wire name (<#S>.<pane> — the
+  // listener's naming) in this env, set by the extension for its notify
+  // children. It wins over #S, which would file the push under the parent.
+  const fromEnv = process.env.ZEPH_AGENT_SESSION_NAME?.trim();
+  if (fromEnv) return { agentDeviceId: listenerDeviceId(), agentSessionName: fromEnv };
   let name: string;
   try {
     name = execFileSync('tmux', ['display-message', '-p', '#S'], { encoding: 'utf-8' }).trim();

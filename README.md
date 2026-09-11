@@ -146,6 +146,14 @@ an answerable `zeph_ask`).
 | Pi | `before_agent_start` → `zeph remote-hook pi` (via extension) | `zeph setup` |
 | Cursor CLI | — none yet | — |
 
+**Subagents (view-only).** A pi subagent spawned into an extra pane of the
+same tmux window shows up on your phone as a child of its parent card, named
+`<session>.<pane>` — its terminal mirror streams live, but input, keys, exit,
+resume and forget are all refused: you watch from the phone and answer at the
+terminal, where the parent owns the conversation. The pane is labelled from
+`@zeph_pane_label` (the pi extension sets it from `PI_SUBAGENT_NAME`), and a
+prompt push from a subagent names it and opens its stream directly.
+
 Detection is exact-match: a terminal keystroke racing a phone message
 can never false-flag. Muted projects are never flagged.
 

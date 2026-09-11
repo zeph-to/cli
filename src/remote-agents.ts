@@ -15,7 +15,7 @@
  */
 import { readdirSync, readFileSync, statSync } from 'fs';
 import { homedir } from 'os';
-import { join } from 'path';
+import { join, basename } from 'path';
 import { spawnSync } from 'child_process';
 
 export interface RemoteAgent {
@@ -234,6 +234,15 @@ export interface ProcTable {
     children: Map<number, number[]>;
     /** pid → process start time in epoch ms. Only pids whose `lstart` parsed. */
     startTimes: Map<number, number>;
+    /** pid → its process group id. Absent when the row carried no pgid. */
+    pgidOf: Map<number, number>;
+    /** pid → the foreground process group of its controlling tty. A pane
+     *  shell whose tpgid equals its own pgid IS the foreground — a plain
+     *  prompt; anything else is running a foreground command. */
+    tpgidOf: Map<number, number>;
+    /** pid → its command name (`comm`), last column because it may contain
+     *  spaces (`tmux: client`). Basename-matched against the agent registry. */
+    commOf: Map<number, string>;
 }
 
 /**
@@ -251,21 +260,47 @@ export interface ProcTable {
  * allowed to go missing, and every consumer of `startTimes` treats an absent
  * entry as "no match" rather than guessing.
  */
+/**
+ * Parse `ps -axo pid=,ppid=,pgid=,tpgid=,lstart=,comm=`. A row is
+ * `<pid> <ppid> <pgid> <tpgid> [<lstart>] [<comm>]`, e.g.
+ * `  902     1   902   902 Fri Aug  7 11:12:59 2026 zsh` — note the two spaces
+ * before a single-digit day and the trailing padding.
+ *
+ * Token positions, not one regex: `lstart` is a fixed 5 tokens when present
+ * and `comm` is LAST because it may contain spaces. A row with fewer tokens
+ * simply contributes fewer maps — the shape is load-bearing rather than
+ * defensive: parent links must survive an unreadable timestamp (the reason
+ * `lstart` is optional), and the pgid/tpgid/comm columns are absent only when
+ * a caller fed the old narrower argv, which nothing in production does.
+ */
 export const parseProcTable = (table: string): ProcTable => {
     const children = new Map<number, number[]>();
     const startTimes = new Map<number, number>();
+    const pgidOf = new Map<number, number>();
+    const tpgidOf = new Map<number, number>();
+    const commOf = new Map<number, string>();
     for (const line of table.split('\n')) {
-        const m = line.trim().match(/^(\d+)\s+(\d+)(?:\s+(.*))?$/);
-        if (!m) continue;
-        const [pid, ppid] = [Number(m[1]), Number(m[2])];
+        const tok = line.trim().split(/\s+/);
+        const pid = Number(tok[0]);
+        const ppid = Number(tok[1]);
+        if (!Number.isInteger(pid) || !Number.isInteger(ppid)) continue;
         const list = children.get(ppid) ?? [];
         list.push(pid);
         children.set(ppid, list);
-        if (m[3] === undefined) continue;
-        const started = Date.parse(m[3].trim());
-        if (Number.isFinite(started)) startTimes.set(pid, started);
+        let rest = tok.slice(2);
+        if (rest.length >= 2 && Number.isInteger(Number(rest[0]))) {
+            pgidOf.set(pid, Number(rest[0]));
+            tpgidOf.set(pid, Number(rest[1]));
+            rest = rest.slice(2);
+        }
+        if (rest.length >= 5) {
+            const started = Date.parse(rest.slice(0, 5).join(' '));
+            if (Number.isFinite(started)) startTimes.set(pid, started);
+            rest = rest.slice(5);
+        }
+        if (rest.length > 0) commOf.set(pid, rest.join(' '));
     }
-    return { children, startTimes };
+    return { children, startTimes, pgidOf, tpgidOf, commOf };
 };
 
 /**
@@ -275,9 +310,37 @@ export const parseProcTable = (table: string): ProcTable => {
  * second `ps` spawn to learn that would undo what this memo is for.
  */
 const readPsSnapshot = ttlMemo(SNAPSHOT_TTL_MS, (): ProcTable | null => {
-    const r = spawnSync('ps', ['-axo', 'pid=,ppid=,lstart='], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+    // pgid/tpgid/comm ride along for the subagent detection (foreground
+    // process group), so the extra panes cost zero new spawns — one `ps`
+    // per report cycle is still the whole table (KB precedent).
+    const r = spawnSync('ps', ['-axo', 'pid=,ppid=,pgid=,tpgid=,lstart=,comm='], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
     return r.status === 0 ? parseProcTable(r.stdout ?? '') : null;
 });
+
+/**
+ * The agent running in the FOREGROUND process group of the tty owned by a
+ * pane shell, or null. This is what separates a subagent pane from a plain
+ * prompt: the subagent pane reports `pane_current_command=bash` (a script
+ * execs pi), so the pane-level command identifies nothing — but the tty's
+ * foreground group is pi's, and `comm` names it. A pane sitting at its login
+ * shell has the shell's own group in the foreground (tpgid === pgid) and is
+ * not a subagent, no matter what the registry would match.
+ */
+export const foregroundAgentFor = (
+    panePid: number,
+    table: ProcTable | null = readPsSnapshot(),
+): RegisteredRemoteAgent | null => {
+    if (!Number.isInteger(panePid) || panePid <= 0 || !table) return null;
+    const pgid = table.pgidOf.get(panePid);
+    const tpgid = table.tpgidOf.get(panePid);
+    if (pgid === undefined || tpgid === undefined || tpgid === pgid) return null;
+    for (const [pid, pgrp] of table.pgidOf) {
+        if (pgrp !== tpgid) continue;
+        const agent = matchAgentByPaneCommand(basename(table.commOf.get(pid) ?? ''));
+        if (agent) return agent;
+    }
+    return null;
+};
 
 /** Start times for this cycle's snapshot. Empty when `ps` is unavailable. */
 export const psStartTimes = (): Map<number, number> => readPsSnapshot()?.startTimes ?? new Map();
