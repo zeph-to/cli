@@ -86,7 +86,7 @@ describe('rules-sync: REMOTE entry for agents without a prompt-submit hook', () 
 // almost always NORMAL — it carries the NORMAL branch only, the way the plugin's
 // SessionStart hook does for Claude Code, plus a stub saying what starts REMOTE.
 describe('rules-sync: prompt-hook agents carry the NORMAL branch only', () => {
-    const REMOTE_ONLY = ['When zeph_ask is MANDATORY', 'Sticky REMOTE mode', 'When to use AskUserQuestion vs zeph_ask'];
+    const REMOTE_ONLY = ['When zeph_ask is MANDATORY', 'When zeph_ask is the DEFAULT', 'Sticky REMOTE mode', 'When to use AskUserQuestion vs zeph_ask'];
     const NORMAL = ['Handling the response', 'What starts REMOTE', 'Persistence'];
 
     it('pi / gemini / codex omit the REMOTE-scoped sections and keep the NORMAL ones', async () => {

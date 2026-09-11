@@ -26,7 +26,7 @@
 // That file is read on every turn, and a session is NORMAL nearly all of the
 // time, so for the three hook agents it carries the NORMAL branch only
 // (PROMPT_HOOK_CORE) — the REMOTE sections arrive from the hook on the turn
-// that enters REMOTE (remote-hook.ts REMOTE_ENTRY_SECTIONS), the way the
+// that enters REMOTE (remote-hook.ts remoteEntrySections), the way the
 // plugin's SessionStart / UserPromptSubmit pair does it for Claude Code. The
 // hook-less agents have no such turn, so their file keeps the whole core.
 //

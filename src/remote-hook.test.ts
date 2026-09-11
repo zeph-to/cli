@@ -1,11 +1,10 @@
 import { describe, expect, it, beforeEach, afterEach, afterAll, vi } from 'vitest';
-import { ZEPH_CORE_HOOK_DRIVEN } from './zeph-core.generated.js';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { projectHash } from './gate.js';
 import { writeRemoteMarker } from './listener.js';
-import { isRemoteHookAgent, runRemoteHook } from './remote-hook.js';
+import { isRemoteHookAgent, runRemoteHook, remoteEntrySections } from './remote-hook.js';
 
 // config.ts binds ~/.zeph/config.json to $HOME at import time, so HOME moves
 // BEFORE the imports run (vi.hoisted) — the same real-$HOME seam cli.test.ts
@@ -33,15 +32,8 @@ afterAll(() => {
  * (listener.ts writeRemoteMarker), so every match test is a full
  * write→read roundtrip: a parity break between the two sides fails here.
  */
-/** Drop every generated-core section from an injected context, leaving the cli-authored prose. */
-const stripCoreSections = (ctx: string): string => {
-    let out = ctx;
-    for (const section of ZEPH_CORE_HOOK_DRIVEN.split(/^(?=### )/m)) {
-        const trimmed = section.trim();
-        if (trimmed) out = out.replace(trimmed, '');
-    }
-    return out;
-};
+/** The entry note minus the generated core it carries — the cli-authored prose only. */
+const stripCoreSections = (ctx: string): string => ctx.replace(remoteEntrySections(), '');
 
 describe('runRemoteHook (ADR-0002, gemini/codex)', () => {
     let stateHome: string;

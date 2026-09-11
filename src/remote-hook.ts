@@ -76,15 +76,13 @@ This user message arrived from the user's phone via Zeph agent chat (verified by
 // four sections together cite only rules they carry (1–4, 7–9), so no
 // cross-reference dangles; remote-hook.test.ts checks that. Sent once per
 // entry: a later phone prompt on a session already in REMOTE gets the note
-// alone, since the contract is already in its context.
-const REMOTE_ENTRY_SECTIONS = [
-  'When zeph_ask is MANDATORY',
-  'When zeph_ask is the DEFAULT',
-  'Sticky REMOTE mode',
-  'When to use AskUserQuestion vs zeph_ask',
-]
-  .map((heading) => coreSection(ZEPH_CORE_HOOK_DRIVEN, heading))
-  .join('\n\n');
+// alone, since the contract is already in its context. Sliced on that turn
+// only — this command runs on every prompt submit, and the common path is a
+// silent no-op. Exported for the tests.
+export const remoteEntrySections = (): string =>
+  ['When zeph_ask is MANDATORY', 'When zeph_ask is the DEFAULT', 'Sticky REMOTE mode', 'When to use AskUserQuestion vs zeph_ask']
+    .map((heading) => coreSection(ZEPH_CORE_HOOK_DRIVEN, heading))
+    .join('\n\n');
 
 const ONE_WAY_CONTEXT = `# System note (Zeph remote-origin detect)
 
@@ -147,7 +145,7 @@ export const runRemoteHook = (
     // nothing for a later turn to be reminded of, so no state is recorded.
     const entering = !isRemoteActive(cwd, now);
     touchRemoteActive(cwd, now);
-    return emit(entering ? `${TWO_WAY_CONTEXT}\n\n${REMOTE_ENTRY_SECTIONS}` : TWO_WAY_CONTEXT);
+    return emit(entering ? `${TWO_WAY_CONTEXT}\n\n${remoteEntrySections()}` : TWO_WAY_CONTEXT);
   }
 
   if (origin === 'keyboard' && isRemoteActive(cwd, now) && resolveHookId(env)) {
