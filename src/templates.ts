@@ -462,7 +462,9 @@ const SUBAGENT_SESSION = (() => {
     const pane = spawn("tmux", ["set-option", "-p", "-t", process.env.TMUX_PANE, "@zeph_pane_label", SUBAGENT_NAME], { stdio: "ignore", detached: true });
     pane.on("error", () => {});
     pane.unref();
-    const s = execFileSync("tmux", ["display-message", "-p", "#S"], { encoding: "utf8" }).trim();
+    // Targeted at this pane and bounded: this runs while pi loads, so a
+    // wedged tmux server must cost at most 2s, never the whole startup.
+    const s = execFileSync("tmux", ["display-message", "-p", "-t", process.env.TMUX_PANE, "#S"], { encoding: "utf8", timeout: 2000 }).trim();
     return s ? s + "." + process.env.TMUX_PANE.slice(1) : "";
   } catch { return ""; }
 })();

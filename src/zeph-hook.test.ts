@@ -52,6 +52,7 @@ beforeEach(() => {
 
 afterEach(() => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
 });
 
 describe('ZephHook.notify — short body (inline)', () => {
@@ -79,6 +80,26 @@ describe('ZephHook.notify — short body (inline)', () => {
         const { ZephHook } = await loadHookModule();
         const hook = new ZephHook({ apiKey: 'ak_test', baseUrl: 'https://api.example.com/v1' });
         await expect(hook.notify({ title: 'oops' })).rejects.toThrow(/no pushId/);
+    });
+});
+
+describe('ZephHook.notify — agent session key', () => {
+    it('files the push under ZEPH_AGENT_SESSION_NAME instead of the tmux session', async () => {
+        // A pi subagent's notify runs in the parent's tmux session, so #S would
+        // file it under the parent. The extension hands down the subagent's own
+        // wire name; it must win (and tmux is never asked).
+        vi.stubEnv('TMUX', '/private/tmp/tmux-501/default,1,0');
+        vi.stubEnv('ZEPH_AGENT_SESSION_NAME', 'zeph-zeph.48');
+        sequenceResponses([
+            noEncryptionResponse,
+            { ok: true, json: { data: { pushId: 'push_sub_01' } } },
+        ]);
+        const { ZephHook } = await loadHookModule();
+        const hook = new ZephHook({ apiKey: 'ak_test', baseUrl: 'https://api.example.com/v1' });
+        await hook.notify({ title: 'pi asks: zeph · review-01', body: 'waiting' });
+        const sent = JSON.parse(lastCalls.find((c) => c.url.endsWith('/pushes/send'))!.init!.body as string);
+        expect(sent.agentSessionName).toBe('zeph-zeph.48');
+        expect(typeof sent.agentDeviceId).toBe('string');
     });
 });
 

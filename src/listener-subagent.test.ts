@@ -54,9 +54,12 @@ let panes: FakePane[] = [];
 const resetPanes = (): void => {
     panes = [
         { session: 'zeph-a', paneId: '%0', idx: 0, current: 'node', start: 'claude', pid: 100 },
-        { session: 'zeph-a', paneId: '%5', idx: 1, current: 'bash', start: 'zsh', pid: 600 },
+        // Pane index runs opposite to pane id (measured on a live pi session:
+        // the newest subagent split sits at the lowest index), so ordering by
+        // index would put %9 before %5.
+        { session: 'zeph-a', paneId: '%5', idx: 3, current: 'bash', start: 'zsh', pid: 600 },
         { session: 'zeph-a', paneId: '%7', idx: 2, current: 'zsh', start: 'zsh', pid: 610 },
-        { session: 'zeph-a', paneId: '%9', idx: 3, current: 'bash', start: 'zsh', pid: 620, label: 'Scout' },
+        { session: 'zeph-a', paneId: '%9', idx: 1, current: 'bash', start: 'zsh', pid: 620, label: 'Scout' },
     ];
 };
 
