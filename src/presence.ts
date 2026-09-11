@@ -16,7 +16,10 @@
  *      one client between sessions must not read as leaving.
  *   2. not over SSH and ioreg reports HIDIdleTime (macOS) → that decides, and
  *      nothing below runs: tmux activity only sees keys typed into tmux, so a
- *      user reading a browser would look idle to it.
+ *      user reading a browser would look idle to it. Inside tmux, "over SSH"
+ *      comes from the session environment (`show-environment`), which tmux
+ *      refreshes on every attach — the process's own SSH_CONNECTION is frozen
+ *      at server start.
  *   3. inside tmux → the newest client_activity (SSH and non-macOS hosts).
  * Anything else is present: an unreadable signal must never add a push.
  */
@@ -57,6 +60,13 @@ const newestActivitySec = (clientsOut: string): number | null => {
   return stamps.length > 0 ? Math.max(...stamps) : null;
 };
 
+// null = tmux had no answer for the variable, so the process env decides.
+const isOverSsh = (deps: PresenceDeps, inTmux: boolean): boolean => {
+  const sessionVar = inTmux ? deps.run('tmux', ['show-environment', 'SSH_CONNECTION']) : null;
+  if (sessionVar !== null) return sessionVar.startsWith('SSH_CONNECTION=');
+  return Boolean(deps.env.SSH_CONNECTION);
+};
+
 export const isAway = (deps: PresenceDeps = defaultDeps()): boolean => {
   const threshold = awayThresholdSec(deps.env.ZEPH_AWAY_SEC);
   if (threshold === 0) return false;
@@ -65,7 +75,7 @@ export const isAway = (deps: PresenceDeps = defaultDeps()): boolean => {
   const clients = deps.env.TMUX ? deps.run('tmux', ['list-clients', '-F', '#{client_activity}']) : null;
   if (clients !== null && clients.trim() === '') return true;
 
-  if (!deps.env.SSH_CONNECTION) {
+  if (!isOverSsh(deps, clients !== null)) {
     // -r -k -d 1: just the IOHIDSystem node (~4 KB), not its ~380 KB subtree.
     const idle = hidIdleSec(deps.run('ioreg', ['-r', '-k', 'HIDIdleTime', '-d', '1', '-c', 'IOHIDSystem']));
     if (idle !== null) return idle >= threshold;

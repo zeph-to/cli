@@ -673,7 +673,9 @@ signals, and the first that answers wins:
 
 1. Inside tmux and **no client attached to the tmux server** → away.
 2. Not over SSH and macOS `ioreg` reports **`HIDIdleTime`** (system-wide
-   input idle) → that alone decides.
+   input idle) → that alone decides. Inside tmux, "over SSH" follows the
+   session environment tmux refreshes on each attach, not the value frozen
+   at server start.
 3. Inside tmux → the newest tmux **`client_activity`** (SSH and non-macOS).
 
 Anything unreadable counts as present. The threshold is `ZEPH_AWAY_SEC`

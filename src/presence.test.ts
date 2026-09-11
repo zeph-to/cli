@@ -16,15 +16,20 @@ interface Probes {
     hidIdleSec?: number;
     /** list-clients activity lines; undefined = tmux fails. */
     clients?: number[];
+    /** `tmux show-environment SSH_CONNECTION` output; undefined = tmux fails. */
+    tmuxSsh?: string;
 }
 
 const makeDeps = (env: Record<string, string>, probes: Probes) => {
     const calls: string[] = [];
-    const run = vi.fn((cmd: string): string | null => {
+    const run = vi.fn((cmd: string, args: string[]): string | null => {
         calls.push(cmd);
         if (cmd === 'ioreg') {
             if (probes.hidIdleSec === undefined) return null;
             return `    | |   "HIDIdleTime" = ${probes.hidIdleSec * 1_000_000_000}\n`;
+        }
+        if (cmd === 'tmux' && args[0] === 'show-environment') {
+            return probes.tmuxSsh === undefined ? null : `${probes.tmuxSsh}\n`;
         }
         if (cmd === 'tmux') {
             if (probes.clients === undefined) return null;
@@ -84,6 +89,14 @@ describe('isAway', () => {
         const env = { ...TMUX_ENV, ...SSH_ENV };
         expect(isAway(makeDeps(env, { hidIdleSec: 5, clients: [NOW_SEC - 3600, NOW_SEC - 7200] }).deps)).toBe(true);
         expect(isAway(makeDeps(env, { hidIdleSec: 9999, clients: [NOW_SEC - 3600, NOW_SEC - 2] }).deps)).toBe(false);
+    });
+
+    it('inside tmux the session environment decides SSH, not the frozen process env', () => {
+        const attachedLocally = { clients: [NOW_SEC - 3600], hidIdleSec: 5, tmuxSsh: '-SSH_CONNECTION' };
+        expect(isAway(makeDeps({ ...TMUX_ENV, ...SSH_ENV }, attachedLocally).deps)).toBe(false);
+        const overSsh = 'SSH_CONNECTION=10.0.0.1 22 10.0.0.2 22';
+        expect(isAway(makeDeps(TMUX_ENV, { clients: [NOW_SEC - 3600], hidIdleSec: 5, tmuxSsh: overSsh }).deps)).toBe(true);
+        expect(isAway(makeDeps(TMUX_ENV, { clients: [NOW_SEC - 2], hidIdleSec: 9999, tmuxSsh: overSsh }).deps)).toBe(false);
     });
 
     it('outside tmux the tmux probe never runs', () => {
