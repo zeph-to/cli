@@ -162,7 +162,10 @@ other way in: a `zeph_ask` answer that is not a Done-like button. Their rule
 files therefore keep the after-real-work `zeph_ask` — the "Entering REMOTE
 without a prompt hook" preamble in `src/templates.ts` — so the phone always
 has a button to tap that starts the loop. Agents with the hook drop that
-obligation while at the terminal.
+obligation while at the terminal — and their rule file carries only the
+NORMAL branch of the core (about a quarter of it), since it is read on every
+turn; the hook injects the REMOTE sections in full on the turn a phone
+message enters REMOTE, the way the Claude Code plugin's hooks do.
 
 `zeph cursor` has no remote-origin hook, so it never enters sticky REMOTE
 mode by itself. **Just ask for it** — one line, once per session:

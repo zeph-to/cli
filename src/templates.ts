@@ -22,10 +22,19 @@
 // ask itself — so for them the NORMAL branch must still send one after real
 // work, or the phone loop can never begin. That is REMOTE_ENTRY_NO_HOOK.
 //
+// The same axis decides how much of the core the static rule file carries.
+// That file is read on every turn, and a session is NORMAL nearly all of the
+// time, so for the three hook agents it carries the NORMAL branch only
+// (PROMPT_HOOK_CORE) — the REMOTE sections arrive from the hook on the turn
+// that enters REMOTE (remote-hook.ts remoteEntrySections), the way the
+// plugin's SessionStart / UserPromptSubmit pair does it for Claude Code. The
+// hook-less agents have no such turn, so their file keeps the whole core.
+//
 // Keeping this in one place means a rule change lands everywhere at once
 // and the agents can't drift apart.
 
 import { NONREADONLY_COUNT_FLAG, PUSHMODE_DEFAULT_FLAG, TOOL_COUNT_FLAG } from './gate.js';
+import { coreSection } from './core-sections.js';
 import { ZEPH_CORE_HOOK_DRIVEN, ZEPH_CORE_RULE_ONLY } from './zeph-core.generated.js';
 
 // Graceful resolution: prefer the installed `zeph` CLI, but fall back to
@@ -186,6 +195,32 @@ shown or kept:
 No marker → the heuristic: fewer than 2 tool calls, or only read-only ones,
 stays silent. Markers are lowercase and exact.`;
 
+// NORMAL-only core — agents WITH a prompt-submit hook (Gemini, Codex, Pi).
+// Mirrors plugin/hooks/zeph-setup.js `normal()`: the NORMAL branch owes no
+// `zeph_ask`, so it carries none of the REMOTE-scoped sections (MANDATORY /
+// DEFAULT / Sticky REMOTE / AskUserQuestion-vs) — about three quarters of the
+// core, paid on every turn of a session that is almost always NORMAL. What it
+// needs is the trigger: what flips the session, and what that turns on, stated
+// here rather than pointed at because a `zeph_ask` answer reporting
+// `zephState: "REMOTE"` flips it mid-turn with no hook to say so. The turn a
+// phone message arrives, remote-hook.ts injects the REMOTE sections in full.
+// Sections keep the numbers the core gave them (a render concern the extractor
+// settled per audience; the plugin's NORMAL branch has the same gaps).
+const REMOTE_STUB = `### What starts REMOTE
+
+The user sending a message from their phone starts sticky REMOTE — the prompt-submit hook says so on that turn and injects the contract in full. A \`zeph_ask\` result reporting \`zephState: "REMOTE"\` starts it mid-turn.
+
+From that response on: end EVERY response with \`zeph_ask\` (2–4 \`actions\` plus a Done-like \`fallback\`, \`timeout\` 300–600s), route button-friendly questions through it instead of \`AskUserQuestion\`, and never end on a plain-text question — until the user exits with a Done-like button, a free-text wrap-up you read as one (emit \`<!-- zeph: exit -->\` once), or a prompt they type at the terminal.`;
+
+const PROMPT_HOOK_CORE = [
+  `## NORMAL — the user is at the terminal
+
+Zeph can hand this session to the user's phone, but nobody has done that yet. **You owe no \`zeph_ask\`**: ask questions at the terminal or in prose, and let the end-of-turn push be the completion signal. A \`zeph_ask\` here blocks the turn until someone answers on a device or it times out.`,
+  coreSection(ZEPH_CORE_HOOK_DRIVEN, 'Handling the response'),
+  REMOTE_STUB,
+  coreSection(ZEPH_CORE_HOOK_DRIVEN, 'Persistence'),
+].join('\n\n');
+
 /** Assemble a full rule document from optional frontmatter + preambles + core. */
 const buildRule = (opts: { frontmatter?: string; notify: string; toolAccess?: string; pushSignal?: string; remoteEntry?: string; core: string }): string => {
   const fm = opts.frontmatter ? `${opts.frontmatter}\n\n` : '';
@@ -225,11 +260,11 @@ export const WINDSURF_RULE = buildRule({
   core: ZEPH_CORE_HOOK_DRIVEN,
 });
 
-/** Gemini CLI — appended into ~/.gemini/GEMINI.md. Has the prompt hook (GEMINI_HOOKS). */
-export const GEMINI_RULE = buildRule({ notify: HOOK_DRIVEN_NOTIFY, core: ZEPH_CORE_HOOK_DRIVEN });
+/** Gemini CLI — appended into ~/.gemini/GEMINI.md. Has the prompt hook (GEMINI_HOOKS), so NORMAL-only core. */
+export const GEMINI_RULE = buildRule({ notify: HOOK_DRIVEN_NOTIFY, core: PROMPT_HOOK_CORE });
 
-/** Codex CLI — appended into ~/.codex/AGENTS.md. Has the prompt hook (CODEX_HOOKS). */
-export const CODEX_RULE = buildRule({ notify: HOOK_DRIVEN_NOTIFY, core: ZEPH_CORE_HOOK_DRIVEN });
+/** Codex CLI — appended into ~/.codex/AGENTS.md. Has the prompt hook (CODEX_HOOKS), so NORMAL-only core. */
+export const CODEX_RULE = buildRule({ notify: HOOK_DRIVEN_NOTIFY, core: PROMPT_HOOK_CORE });
 
 /** GitHub Copilot CLI — written to ~/.copilot/instructions/zeph.instructions.md. No prompt hook. */
 export const COPILOT_RULE = buildRule({
@@ -252,12 +287,12 @@ export const AIDER_RULE = buildRule({
   core: ZEPH_CORE_RULE_ONLY,
 });
 
-/** Pi — managed block in ~/.pi/agent/AGENTS.md. Extension = Stop-equivalent + prompt hook + waiting-on-you push (PI_EXTENSION). */
+/** Pi — managed block in ~/.pi/agent/AGENTS.md. Extension = Stop-equivalent + prompt hook + waiting-on-you push (PI_EXTENSION), so NORMAL-only core. */
 export const PI_RULE = buildRule({
   notify: HOOK_DRIVEN_NOTIFY,
   toolAccess: PI_TOOL_ACCESS,
   pushSignal: PI_PUSH_SIGNAL,
-  core: ZEPH_CORE_HOOK_DRIVEN,
+  core: PROMPT_HOOK_CORE,
 });
 
 /** OpenCode — managed block in ~/.config/opencode/AGENTS.md. Stop hook via plugin, no prompt hook (v1). */

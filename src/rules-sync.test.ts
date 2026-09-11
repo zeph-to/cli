@@ -80,6 +80,37 @@ describe('rules-sync: REMOTE entry for agents without a prompt-submit hook', () 
     });
 });
 
+// A prompt-submit hook announces the phone message that starts REMOTE, and the
+// hook injects the REMOTE contract on that turn (remote-hook.ts). So the static
+// rule file of those three agents is read on every turn of a session that is
+// almost always NORMAL — it carries the NORMAL branch only, the way the plugin's
+// SessionStart hook does for Claude Code, plus a stub saying what starts REMOTE.
+describe('rules-sync: prompt-hook agents carry the NORMAL branch only', () => {
+    const REMOTE_ONLY = ['When zeph_ask is MANDATORY', 'When zeph_ask is the DEFAULT', 'Sticky REMOTE mode', 'When to use AskUserQuestion vs zeph_ask'];
+    const NORMAL = ['Handling the response', 'What starts REMOTE', 'Persistence'];
+
+    it('pi / gemini / codex omit the REMOTE-scoped sections and keep the NORMAL ones', async () => {
+        const tmpl = await import('./templates.js');
+        for (const rule of [tmpl.PI_RULE, tmpl.GEMINI_RULE, tmpl.CODEX_RULE]) {
+            for (const heading of REMOTE_ONLY) expect(rule).not.toContain(heading);
+            for (const heading of NORMAL) expect(rule).toContain(heading);
+            expect(rule).toContain('You owe no `zeph_ask`');
+        }
+    });
+
+    it('the NORMAL branch is well under half the full core', async () => {
+        const tmpl = await import('./templates.js');
+        expect(tmpl.PI_RULE.length).toBeLessThan(ZEPH_CORE_HOOK_DRIVEN.length / 2 + 2000);
+    });
+
+    it('agents without the hook still carry the full core', async () => {
+        const tmpl = await import('./templates.js');
+        for (const rule of [tmpl.CURSOR_RULE, tmpl.OPENCODE_RULE, tmpl.CLINE_RULE]) {
+            for (const heading of REMOTE_ONLY) expect(rule).toContain(heading);
+        }
+    });
+});
+
 // The core is sliced per audience, so a sentence that points at a section the
 // slice excludes reads as a dangling reference: the CLI cores never carry the
 // Push Signal / dial sections (`audiences: []` in the plugin manifest), yet the
