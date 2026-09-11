@@ -671,7 +671,20 @@ extension dialog — a bash guard's Run/Abort, an ask-user tool, a
 bash command). `high` gets through `quiet`; only `/zeph-mute` stops it.
 Answering inside the 10 seconds sends nothing. It is the pi twin of the
 Claude Code plugin's AskUserQuestion push, driven by pi's
-`ui_prompt_start` / `ui_prompt_end` events.
+`ui_prompt_start` / `ui_prompt_end` events. Only dialogs that open while a
+turn is running count: a settings picker you open yourself between turns
+(`/caveman config`) never pushes.
+
+Two more end-of-turn cases differ from Claude Code:
+
+- **Push Signal markers** — pi's rules teach the same `<!-- zeph: skip|push|high -->`
+  markers, and the extension reads them from the final assistant message
+  (then strips them, since pi's terminal would otherwise print the comment).
+  `high` is how pi gets a "the turn ended with a question for you" push
+  through `quiet`.
+- **Errors and aborts** — a turn that ended on a provider error sends a
+  `high` "pi stopped: <project>" push with the error text instead of
+  "Task done"; a turn you aborted with Esc sends nothing.
 
 #### Quiet while away
 
