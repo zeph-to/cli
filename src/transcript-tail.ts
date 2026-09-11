@@ -73,6 +73,8 @@ export interface TailState {
     readonly carry: string;
     /** Inside an oversized line: discard bytes until the next newline. */
     readonly resyncing: boolean;
+    /** tool_result ids read off the head of the oversized line being skipped, reported when it ends. */
+    readonly salvage: readonly string[];
 }
 
 export interface TailRead {
@@ -108,6 +110,38 @@ const completeUtf8Length = (buffer: Buffer, read: number): number => {
  * that has to stay below every real offset is a trap for the next `>=`.
  */
 export const initialTailState = (): TailState | null => null;
+
+/*
+ * An oversized line is dropped, but not its verdict. The line is almost always
+ * a tool_result carrying a screenshot, and without a result its call spins as
+ * running in the viewer forever. The ids sit at the head of the line, before
+ * the payload (measured on real screenshot results, 2026-09-12), so the head is
+ * read for ids and a content-free stand-in takes the line's place. The tail is
+ * read for `is_error`; a failure flagged anywhere else reads as ok — a wrong
+ * verdict on a rare case, against a spinner that never stops. Nothing in
+ * between is kept.
+ */
+const SALVAGE_HEAD_CHARS = 16 * 1024;
+const SALVAGE_TAIL_CHARS = 4 * 1024;
+
+const salvageIdsOf = (head: string): string[] =>
+    head.includes('"tool_result"')
+        ? [...head.slice(0, SALVAGE_HEAD_CHARS).matchAll(/"tool_use_id":"([^"\\]{1,200})"/g)].map((m) => m[1]!)
+        : [];
+
+/** A transcript line with just the verdicts, for the projection to read like any other. */
+const salvagedLine = (ids: readonly string[], tail: string): string =>
+    JSON.stringify({
+        type: 'user',
+        message: {
+            role: 'user',
+            content: ids.map((id) => ({
+                type: 'tool_result',
+                tool_use_id: id,
+                ...(/"is_error":\s*true/.test(tail.slice(-SALVAGE_TAIL_CHARS)) ? { is_error: true } : {}),
+            })),
+        },
+    });
 
 /**
  * Read what was appended since `prev`, or `null` when there is nothing to do —
@@ -157,12 +191,13 @@ export const readTranscriptDelta = (path: string, prev: TailState | null): TailR
     const truncatedStart = restart && start > 0;
     const carry = restart ? '' : prev.carry;
     let resyncing = restart ? false : prev.resyncing;
+    let salvage = restart ? [] : prev.salvage;
 
     const want = Math.min(size - start, MAX_TAIL_BYTES_PER_TICK);
     if (want <= 0) {
         return {
             lines: [],
-            state: { offset: start, size, mtimeMs, ino, carry, resyncing },
+            state: { offset: start, size, mtimeMs, ino, carry, resyncing, salvage },
             bytesRead: 0,
             droppedLines: 0,
         };
@@ -207,10 +242,14 @@ export const readTranscriptDelta = (path: string, prev: TailState | null): TailR
         if (resyncing) {
             // This newline ends the oversized line; the next one starts clean.
             resyncing = false;
+            if (salvage.length) lines.push(salvagedLine(salvage, complete));
+            salvage = [];
             continue;
         }
         if (complete.length > MAX_TRANSCRIPT_LINE_CHARS) {
             droppedLines += 1;
+            const ids = salvageIdsOf(complete.slice(0, SALVAGE_HEAD_CHARS));
+            if (ids.length) lines.push(salvagedLine(ids, complete));
             continue;
         }
         lines.push(complete);
@@ -225,13 +264,15 @@ export const readTranscriptDelta = (path: string, prev: TailState | null): TailR
         // discard bytes until the line ends. Holding it to completion would cost
         // megabytes for a record whose body never reaches the wire anyway.
         droppedLines += 1;
+        // Already resyncing means this is the middle of the same line, not its head.
+        if (!resyncing) salvage = salvageIdsOf(pending.slice(0, SALVAGE_HEAD_CHARS));
         pending = '';
         resyncing = true;
     }
 
     return {
         lines,
-        state: { offset: start + usable, size, mtimeMs, ino, carry: pending, resyncing },
+        state: { offset: start + usable, size, mtimeMs, ino, carry: pending, resyncing, salvage },
         bytesRead: usable,
         droppedLines,
     };

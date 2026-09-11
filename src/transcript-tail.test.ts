@@ -120,6 +120,59 @@ describe('readTranscriptDelta', () => {
         expect(rest[0]).toContain('after');
     });
 
+    /** Drain every tick after `from`, projecting what came through. */
+    const drainProjected = (from: ReturnType<typeof readTranscriptDelta>) => {
+        const lines: string[] = [];
+        let state = from!.state;
+        for (let i = 0; i < 40; i++) {
+            const read = readTranscriptDelta(file, state);
+            if (!read) break;
+            lines.push(...read.lines);
+            state = read.state;
+        }
+        return projectTranscriptEntries(lines);
+    };
+
+    /** A tool_result carrying an image too big for any line budget — a screenshot Read. */
+    const imageResultLine = (id: string, isError?: boolean) =>
+        line({
+            type: 'user',
+            message: {
+                role: 'user',
+                content: [
+                    {
+                        tool_use_id: id,
+                        type: 'tool_result',
+                        content: [{ type: 'image', source: { type: 'base64', data: 'A'.repeat(MAX_TRANSCRIPT_LINE_CHARS + 4096) } }],
+                        ...(isError ? { is_error: true } : {}),
+                    },
+                ],
+            },
+        });
+
+    // Dropping the whole line used to drop the verdict with it, and the call it
+    // answered then spun as "running" forever in the viewer.
+    it('keeps the verdict of a tool_result whose line is too big to read', () => {
+        writeFileSync(file, userLine('before'));
+        const first = readTranscriptDelta(file, initialTailState());
+        appendFileSync(file, imageResultLine('toolu_big') + textLine('after'));
+
+        const events = drainProjected(first);
+
+        expect(events).toEqual([
+            { kind: 'tool_result', id: 'toolu_big', ok: true },
+            { kind: 'text', text: 'after' },
+        ]);
+    });
+
+    it('reads a failure off the tail of an oversized result', () => {
+        writeFileSync(file, userLine('before'));
+        const first = readTranscriptDelta(file, initialTailState());
+        appendFileSync(file, imageResultLine('toolu_bad', true));
+
+        expect(drainProjected(first)).toEqual([{ kind: 'tool_result', id: 'toolu_bad', ok: false }]);
+    });
+
     it('never reads more than MAX_TAIL_BYTES_PER_TICK in one tick', () => {
         writeFileSync(file, userLine('seed'));
         const first = readTranscriptDelta(file, initialTailState())!;
