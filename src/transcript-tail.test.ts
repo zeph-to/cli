@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -176,8 +176,11 @@ describe('readTranscriptDelta', () => {
         // A replacement longer than the old offset — size alone reads this as an
         // ordinary append, and the offset then points into the middle of a record
         // that was never written.
-        rmSync(file);
-        writeFileSync(file, userLine('fresh one') + textLine('fresh two') + textLine('fresh three'));
+        // Written beside the old file and renamed over it, so the new inode is
+        // guaranteed distinct: rm-then-create lets ext4 hand the freed inode
+        // number straight back, which no inode check can tell apart (CI is Linux).
+        writeFileSync(`${file}.new`, userLine('fresh one') + textLine('fresh two') + textLine('fresh three'));
+        renameSync(`${file}.new`, file);
         const second = readTranscriptDelta(file, first.state)!;
 
         expect(second.lines).toHaveLength(3);
