@@ -252,11 +252,125 @@ export const readTranscriptDelta = (path: string, prev: TailState | null): TailR
  * answers.
  */
 export type TurnEvent = { at?: string } & (
-    | { kind: 'tool'; id: string; name: string; target?: string }
-    | { kind: 'tool_result'; id: string; ok: boolean }
+    | { kind: 'tool'; id: string; name: string; target?: string; add?: number; del?: number }
+    | { kind: 'tool_result'; id: string; ok: boolean; lines?: number }
     | { kind: 'text'; text: string }
     | { kind: 'prompt'; text: string }
+    | { kind: 'msg'; mid: string; model?: string; out: number; ctx: number; thinking?: number }
 );
+
+/*
+ * Safe metadata — numbers about the work, never the work. `add`/`del` are the
+ * lines an edit changed, `lines` how long a result was, and `msg` one API
+ * message's token usage, model and thinking-block count. None of it can carry a
+ * secret, which is the bar every field on this wire has to clear.
+ *
+ * `msg` is merged per projection call only. Claude Code writes each content
+ * block of a message as its own line and repeats the message's final usage on
+ * every one (measured 2026-09-12: 109 of 154 messages in one session spanned
+ * several lines), so a message split across two ticks reaches the viewer twice
+ * with the same numbers, and the viewer keeps one by `mid`. Holding the seen ids
+ * on the watcher instead would grow with the session.
+ */
+
+/** Edits larger than this are counted, not diffed: splitting them into lines
+ *  is the one allocation here that scales with what the agent wrote. */
+export const EDIT_DIFF_MAX_CHARS = 64 * 1024;
+
+/** Lines in `text`, counted without splitting it. A trailing newline ends the last line rather than starting another. */
+const countLines = (text: string): number => {
+    if (!text) return 0;
+    let lines = 1;
+    for (let i = text.indexOf('\n'); i !== -1; i = text.indexOf('\n', i + 1)) lines++;
+    return text.endsWith('\n') ? lines - 1 : lines;
+};
+
+/** Lines one edit removed and added, once the lines it merely quoted around the change are dropped. */
+const editDelta = (before: string, after: string): { add: number; del: number } => {
+    if (before.length + after.length > EDIT_DIFF_MAX_CHARS) return { add: countLines(after), del: countLines(before) };
+    const a = before.split('\n');
+    const b = after.split('\n');
+    let start = 0;
+    while (start < a.length && start < b.length && a[start] === b[start]) start++;
+    let endA = a.length;
+    let endB = b.length;
+    while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+        endA--;
+        endB--;
+    }
+    return { add: endB - start, del: endA - start };
+};
+
+const str = (value: unknown): string | undefined => (typeof value === 'string' ? value : undefined);
+
+/** `add`/`del` for a call that writes a file, or nothing for any other call. */
+const lineChangesOf = (name: string, input: unknown): { add?: number; del?: number } => {
+    if (!input || typeof input !== 'object') return {};
+    const record = input as Record<string, unknown>;
+    if (name === 'Write') {
+        const content = str(record.content);
+        return content ? { add: countLines(content) } : {};
+    }
+    let edits: Record<string, unknown>[];
+    if (name === 'Edit') {
+        // `replace_all` edits every occurrence; the input names the change
+        // once, so it counts once — a low count, never a made-up one.
+        edits = [record];
+    } else if (name === 'MultiEdit' && Array.isArray(record.edits)) {
+        edits = (record.edits as unknown[]).filter((e): e is Record<string, unknown> => !!e && typeof e === 'object');
+    } else {
+        return {};
+    }
+    let add = 0;
+    let del = 0;
+    for (const edit of edits) {
+        const before = str(edit.old_string);
+        const after = str(edit.new_string);
+        if (before === undefined || after === undefined) continue;
+        const delta = editDelta(before, after);
+        add += delta.add;
+        del += delta.del;
+    }
+    return add || del ? { add, del } : {};
+};
+
+/** Lines of a result's text — a string, or the text blocks of a block list. Images and the like count as nothing. */
+const resultLinesOf = (content: unknown): number => {
+    if (typeof content === 'string') return countLines(content);
+    if (!Array.isArray(content)) return 0;
+    let lines = 0;
+    for (const block of content) {
+        if (block && typeof block === 'object' && (block as Record<string, unknown>).type === 'text') {
+            lines += countLines(str((block as Record<string, unknown>).text) ?? '');
+        }
+    }
+    return lines;
+};
+
+const num = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0);
+
+/** The `msg` for an assistant entry, or null when it carries no usable usage. */
+const messageMetaOf = (entry: Record<string, unknown>, at: string | undefined): Extract<TurnEvent, { kind: 'msg' }> | null => {
+    if (entry.type !== 'assistant') return null;
+    const message = entry.message;
+    if (!message || typeof message !== 'object') return null;
+    const record = message as Record<string, unknown>;
+    const mid = str(record.id);
+    const usage = record.usage;
+    const model = str(record.model);
+    // `<synthetic>` is Claude Code standing in for the API (an error, an
+    // interruption) — no model ran, and its zeroed usage would read as one did.
+    if (!mid || !usage || typeof usage !== 'object' || model === '<synthetic>') return null;
+    const u = usage as Record<string, unknown>;
+    return {
+        kind: 'msg',
+        mid: clamp(mid),
+        ...(model ? { model: clamp(model) } : {}),
+        out: num(u.output_tokens),
+        ctx: num(u.input_tokens) + num(u.cache_read_input_tokens) + num(u.cache_creation_input_tokens),
+        ...(at ? { at } : {}),
+    };
+};
 
 /**
  * Which input field reads as "what this call is about". Ordered, first match
@@ -384,7 +498,8 @@ const nonEmpty = (text: string): string | null => {
  * Turn raw JSONL lines into wire events.
  *
  * Nothing a tool read or wrote survives this function: only the tool's name, a
- * short label for what it acted on, and whether it worked. That is the whole
+ * short label for what it acted on, whether it worked, and numbers about it —
+ * lines changed, result length, a message's tokens and model. That is the whole
  * privacy story of the feature — the transcript holds file contents and command
  * output, and this is the one place that decides none of it leaves the machine.
  *
@@ -408,6 +523,8 @@ export const projectTranscriptEntries = (
     opts: { sinceLastPrompt?: boolean } = {},
 ): TurnEvent[] => {
     const events: TurnEvent[] = [];
+    // One `msg` per API message in this batch, kept where it first appeared.
+    const messages = new Map<string, Extract<TurnEvent, { kind: 'msg' }>>();
 
     for (const raw of lines) {
         let entry: Record<string, unknown>;
@@ -431,14 +548,44 @@ export const projectTranscriptEntries = (
             continue;
         }
 
-        for (const block of contentBlocks(entry)) {
+        const blocks = contentBlocks(entry);
+        const meta = messageMetaOf(entry, at);
+        if (meta) {
+            const thinking = blocks.filter((b) => b.type === 'thinking' || b.type === 'redacted_thinking').length;
+            const seen = messages.get(meta.mid);
+            if (seen) {
+                // Same message, later line: usage is repeated, thinking is not.
+                Object.assign(seen, { out: meta.out, ctx: meta.ctx });
+                if (thinking) seen.thinking = (seen.thinking ?? 0) + thinking;
+            } else {
+                if (thinking) meta.thinking = thinking;
+                messages.set(meta.mid, meta);
+                events.push(meta);
+            }
+        }
+
+        for (const block of blocks) {
             if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
                 const target = targetOf(block.input);
-                events.push({ kind: 'tool', id: block.id, name: clamp(block.name), ...(target ? { target } : {}), ...(at ? { at } : {}) });
+                events.push({
+                    kind: 'tool',
+                    id: block.id,
+                    name: clamp(block.name),
+                    ...(target ? { target } : {}),
+                    ...lineChangesOf(block.name, block.input),
+                    ...(at ? { at } : {}),
+                });
                 continue;
             }
             if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
-                events.push({ kind: 'tool_result', id: block.tool_use_id, ok: block.is_error !== true, ...(at ? { at } : {}) });
+                const lines = resultLinesOf(block.content);
+                events.push({
+                    kind: 'tool_result',
+                    id: block.tool_use_id,
+                    ok: block.is_error !== true,
+                    ...(lines ? { lines } : {}),
+                    ...(at ? { at } : {}),
+                });
                 continue;
             }
             // Prose, only from the model. A user entry reaching here has already
@@ -454,7 +601,7 @@ export const projectTranscriptEntries = (
                 events.push({ kind: 'text', text: clamp(block.text, MAX_EVENT_TEXT_CHARS), ...(at ? { at } : {}) });
             }
             // `thinking` falls through on purpose — the timeline shows what the
-            // agent did, not what it considered.
+            // agent did, not what it considered. Only its count leaves, on `msg`.
         }
     }
 

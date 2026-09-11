@@ -12,6 +12,7 @@ import {
     TRANSCRIPT_BACKFILL_BYTES,
     MAX_EVENT_FIELD_CHARS,
     MAX_EVENT_TEXT_CHARS,
+    EDIT_DIFF_MAX_CHARS,
 } from './transcript-tail.js';
 
 let dir: string;
@@ -203,13 +204,13 @@ describe('projectTranscriptEntries', () => {
 
         expect(events).toEqual([
             { kind: 'tool', id: 't1', name: 'Read', target: '/tmp/a.ts' },
-            { kind: 'tool_result', id: 't1', ok: true },
+            { kind: 'tool_result', id: 't1', ok: true, lines: 1 },
         ]);
     });
 
     it('marks a failed tool result', () => {
         const events = projectTranscriptEntries([toolResultLine('t9', true)]);
-        expect(events).toEqual([{ kind: 'tool_result', id: 't9', ok: false }]);
+        expect(events).toEqual([{ kind: 'tool_result', id: 't9', ok: false, lines: 1 }]);
     });
 
     it('labels a Bash call with its description', () => {
@@ -421,6 +422,138 @@ describe('projectTranscriptEntries', () => {
         const events = projectTranscriptEntries(['not json', line({ type: 'ai-title', aiTitle: 'x' }), textLine('ok')]);
 
         expect(events).toEqual([{ kind: 'text', text: 'ok' }]);
+    });
+
+    // ── safe metadata: numbers only, never content ──────────────────────────
+
+    /** One assistant transcript line of API message `id`, as Claude Code splits them. */
+    const assistantPart = (id: string, content: unknown[], model = 'claude-opus-5') =>
+        line({
+            type: 'assistant',
+            message: {
+                id,
+                role: 'assistant',
+                model,
+                content,
+                usage: { input_tokens: 2, cache_read_input_tokens: 70000, cache_creation_input_tokens: 1473, output_tokens: 310 },
+            },
+        });
+
+    it('folds one API message split over several lines into one msg event', () => {
+        // Measured: Claude Code writes each content block as its own line and
+        // repeats the message's final usage on every one of them.
+        const events = projectTranscriptEntries([
+            assistantPart('msg_1', [{ type: 'thinking', thinking: 'private reasoning' }]),
+            assistantPart('msg_1', [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/tmp/a.ts' } }]),
+            assistantPart('msg_1', [{ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: '/tmp/b.ts' } }]),
+        ]);
+
+        const msgs = events.filter((e) => e.kind === 'msg');
+        expect(msgs).toEqual([{ kind: 'msg', mid: 'msg_1', model: 'claude-opus-5', out: 310, ctx: 71475, thinking: 1 }]);
+        expect(events[0]!.kind).toBe('msg');
+        expect(JSON.stringify(events)).not.toContain('private reasoning');
+    });
+
+    it('sends no msg for a message without an id or usage, or a synthetic one', () => {
+        const events = projectTranscriptEntries([
+            textLine('no id here'),
+            assistantPart('msg_s', [{ type: 'text', text: 'API error' }], '<synthetic>'),
+        ]);
+
+        expect(events.filter((e) => e.kind === 'msg')).toEqual([]);
+    });
+
+    it('counts an Edit as the lines it changed, not the lines it quoted', () => {
+        const old_string = ['a', 'b', 'x1', 'x2', 'z'].join('\n');
+        const new_string = ['a', 'b', 'y1', 'y2', 'y3', 'y4', 'z'].join('\n');
+        const events = projectTranscriptEntries([toolUseLine('t1', 'Edit', { file_path: '/tmp/a.ts', old_string, new_string })]);
+
+        expect(events[0]).toMatchObject({ kind: 'tool', add: 4, del: 2 });
+        expect(JSON.stringify(events)).not.toContain('y1');
+    });
+
+    it('sums a MultiEdit and counts a Write as all added', () => {
+        const events = projectTranscriptEntries([
+            toolUseLine('t1', 'MultiEdit', {
+                file_path: '/tmp/a.ts',
+                edits: [
+                    { old_string: 'a', new_string: 'b' },
+                    { old_string: 'c\nd', new_string: 'e' },
+                ],
+            }),
+            toolUseLine('t2', 'Write', { file_path: '/tmp/b.ts', content: 'l1\nl2\nl3\n' }),
+        ]);
+
+        expect(events[0]).toMatchObject({ add: 2, del: 3 });
+        expect(events[1]).toMatchObject({ add: 3 });
+        expect(events[1]).not.toHaveProperty('del');
+        expect(JSON.stringify(events)).not.toContain('l1');
+        expect(JSON.stringify(events)).not.toContain('"e"');
+    });
+
+    it('falls back to raw line counts on an edit too large to diff', () => {
+        const lines = Math.ceil(EDIT_DIFF_MAX_CHARS / 2 / 2) + 1;
+        const big = 'q\n'.repeat(lines);
+        const events = projectTranscriptEntries([
+            toolUseLine('t1', 'Edit', { file_path: '/tmp/a.ts', old_string: big, new_string: `${big}r\n` }),
+        ]);
+
+        // Diffed, this would be +1 −0; counted raw it is every line on each side.
+        expect(events[0]).toMatchObject({ add: lines + 1, del: lines });
+    });
+
+    it('still diffs an edit right at the size limit', () => {
+        const half = 'q\n'.repeat(EDIT_DIFF_MAX_CHARS / 4 - 1);
+        const before = `${half}x\n`;
+        const after = `${half}y\n`;
+        expect(before.length + after.length).toBe(EDIT_DIFF_MAX_CHARS);
+
+        const events = projectTranscriptEntries([toolUseLine('t1', 'Edit', { file_path: '/tmp/a.ts', old_string: before, new_string: after })]);
+
+        expect(events[0]).toMatchObject({ add: 1, del: 1 });
+    });
+
+    it('sends no msg for a message with an id but no usage', () => {
+        const events = projectTranscriptEntries([
+            line({ type: 'assistant', message: { id: 'msg_9', role: 'assistant', model: 'claude-opus-5', content: [{ type: 'text', text: 'hi' }] } }),
+        ]);
+
+        expect(events).toEqual([{ kind: 'text', text: 'hi' }]);
+    });
+
+    it('counts a result\'s lines from string or text-block content, skipping images', () => {
+        const events = projectTranscriptEntries([
+            line({
+                type: 'user',
+                message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'a\nb\nc\n' }] },
+            }),
+            line({
+                type: 'user',
+                message: {
+                    role: 'user',
+                    content: [
+                        {
+                            type: 'tool_result',
+                            tool_use_id: 't2',
+                            content: [
+                                { type: 'text', text: 'x\ny' },
+                                { type: 'image', source: { data: 'AAAA' } },
+                            ],
+                        },
+                    ],
+                },
+            }),
+            line({
+                type: 'user',
+                message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't3', content: '' }] },
+            }),
+        ]);
+
+        expect(events).toEqual([
+            { kind: 'tool_result', id: 't1', ok: true, lines: 3 },
+            { kind: 'tool_result', id: 't2', ok: true, lines: 2 },
+            { kind: 'tool_result', id: 't3', ok: true },
+        ]);
     });
 
     it('drops thinking blocks — they are not what the timeline shows', () => {
