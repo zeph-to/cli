@@ -310,6 +310,7 @@ const handleNotify = async (args: Record<string, string | boolean>): Promise<num
       alreadyAsked: GATE_DEFAULTS.alreadyAsked,
       marker: normalizeMarker(typeof args.marker === 'string' ? args.marker : undefined),
       pushMode: autoPushMode(projectDir, args[PUSHMODE_DEFAULT_FLAG]),
+      away: false,
     });
     if (!verdict.push) return 0;
     if (verdict.priority === 'high' && !args.priority) args.priority = 'high';

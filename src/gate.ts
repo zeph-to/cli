@@ -12,7 +12,7 @@
  *   1. alreadyAsked wins over EVERYTHING — even loud (dedup beats the dial).
  *   2. priority is high iff marker === 'high', decided BEFORE the mode
  *      switch, so quiet+high and loud+high both push at high priority.
- *   3. quiet → only a high marker pushes; loud → always push; normal →
+ *   3. quiet → a high marker or an away user pushes; loud → always push; normal →
  *      marker overrides the heuristic (skip → silent, push/high → push),
  *      no marker → push iff toolCount ≥ 2 AND nonReadonlyCount > 0
  *      (the B1 read-only floor).
@@ -35,6 +35,10 @@ export interface GateInput {
   alreadyAsked: boolean;
   marker: GateMarker;
   pushMode: GatePushMode;
+  /** The user is away from the terminal (the caller probes it) — lets quiet
+   *  push. Optional so existing callers keep compiling; absent = present,
+   *  matching the bash twin's missing 6th argument. */
+  away?: boolean;
 }
 
 export interface GateVerdict {
@@ -49,9 +53,10 @@ export interface GateVerdict {
  * hooks — while quiet/loud now work everywhere.
  *
  * These defaults cannot rescue a quiet dial: quiet only lets a `high` marker
- * through, and a hook with no turn facts has no marker either. That is why
- * the installed templates pass `--pushmode-default normal` (see templates.ts)
- * — for them quiet is not a lower volume, it is permanent silence.
+ * or an away user through, and a hook with no turn facts has no marker
+ * either. That is why the installed templates pass `--pushmode-default
+ * normal` (see templates.ts) — for them quiet is not a lower volume, it is
+ * silence unless `away` is set.
  */
 export const GATE_DEFAULTS = {
   toolCount: 2,
@@ -70,7 +75,7 @@ export const decidePush = (input: GateInput): GateVerdict => {
 
   const priority = input.marker === 'high' ? 'high' : 'normal';
 
-  if (input.pushMode === 'quiet') return { push: input.marker === 'high', priority };
+  if (input.pushMode === 'quiet') return { push: input.marker === 'high' || input.away === true, priority };
   if (input.pushMode === 'loud') return { push: true, priority };
 
   if (input.marker === 'skip') return { push: false, priority };
