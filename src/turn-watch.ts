@@ -78,6 +78,10 @@ export const TRANSCRIPT_RECHECK_MS = 10_000;
  * an empty timeline the viewer cannot tell from an idle session. The mirror
  * draws the same line with `STREAM_MAX_ENCRYPT_FAILURES`: fail closed, then stop
  * and send an error the other side can render.
+ *
+ * A live tick stops at its first unsealable page (see `readAndEmit`), so one
+ * busy tick spends one failure; a replay's pages each spend one, as they did
+ * before live ticks were paged.
  */
 export const MAX_TURN_SEAL_FAILURES = 3;
 
@@ -207,6 +211,33 @@ const afterRingTail = (events: TurnEvent[], held: readonly TurnEvent[]): TurnEve
 };
 
 /**
+ * Cut a batch into frames of at most MAX_TURN_FRAME_BYTES of plaintext. One
+ * event bigger than the whole budget still goes, alone: prose is clamped at
+ * MAX_EVENT_TEXT_CHARS characters, not bytes, so a Korean paragraph can reach
+ * ~15KB — the budget keeps a *batch* inside the transport, it is not a promise
+ * about every single event.
+ */
+const pagesOf = (events: readonly TurnEvent[]): TurnEvent[][] => {
+    // A page serialises as `[e1,e2,…]`: each event plus its comma, and one more
+    // byte for the brackets' remainder — so a page starts at 1, not 0.
+    const pages: TurnEvent[][] = [];
+    let page: TurnEvent[] = [];
+    let bytes = 1;
+    for (const event of events) {
+        const size = Buffer.byteLength(JSON.stringify(event), 'utf-8') + 1;
+        if (page.length && bytes + size > MAX_TURN_FRAME_BYTES) {
+            pages.push(page);
+            page = [];
+            bytes = 1;
+        }
+        page.push(event);
+        bytes += size;
+    }
+    if (page.length) pages.push(page);
+    return pages;
+};
+
+/**
  * A registry of transcript watchers plus the control handler that drives it.
  *
  * A factory rather than module state so a test can hold its own, and so two of
@@ -215,6 +246,9 @@ const afterRingTail = (events: TurnEvent[], held: readonly TurnEvent[]): TurnEve
 export const createTurnWatchers = (deps: TurnWatchDeps) => {
     const now = deps.now ?? Date.now;
     const watchers = new Map<string, Watcher>();
+    /** Still the same incarnation it was at `epoch` — not stopped, not re-seeded since. */
+    const isCurrent = (watcher: Watcher, epoch: number): boolean =>
+        watchers.get(watcher.sessionName) === watcher && watcher.epoch === epoch;
 
     const stop = (sessionName: string, reason: string): void => {
         const watcher = watchers.get(sessionName);
@@ -296,7 +330,18 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
                 // so recording the uncut batch would make the next replay resend
                 // what this one just skipped.
                 const events = backfilling ? afterRingTail(projected, deps.ring.read(sessionName)) : projected;
-                if (events.length && (await emit(watcher, events))) recordSent(watcher, events);
+                // Paged like the replay: a busy tick is otherwise one frame of any
+                // size, past the transport's frame limit (see MAX_TURN_FRAME_BYTES).
+                // A page that will not seal drops the rest of the tick — as a whole
+                // batch was dropped before paging — so a failure counts once per
+                // tick. A stop or a re-seed during a seal ends the batch too: the
+                // rest belongs to a tail the watcher no longer reads.
+                const epoch = watcher.epoch;
+                for (const page of pagesOf(events)) {
+                    if (!(await emit(watcher, page))) return;
+                    recordSent(watcher, page);
+                    if (!isCurrent(watcher, epoch)) return;
+                }
             }
         }
     };
@@ -399,32 +444,15 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
         // that has been superseded stops here instead of interleaving its pages
         // with the newer one's.
         const epoch = watcher.epoch;
-        const superseded = (): boolean =>
-            watchers.get(watcher.sessionName) !== watcher || watcher.epoch !== epoch;
-        let page: TurnEvent[] = [];
-        let bytes = 0;
-        for (const event of recent) {
-            const size = Buffer.byteLength(JSON.stringify(event), 'utf-8') + 1;
-            // `page.length &&` — one event bigger than the whole budget still
-            // goes, alone. Prose is clamped at MAX_EVENT_TEXT_CHARS characters,
-            // not bytes, so a Korean paragraph can reach ~15KB plaintext; the
-            // budget is what keeps a *batch* well inside the transport, not a
-            // promise about every single event.
-            if (page.length && bytes + size > MAX_TURN_FRAME_BYTES) {
-                // A refused page is not the end of the history: `emit` already
-                // counts seal failures and ends the watch at
-                // MAX_TURN_SEAL_FAILURES — which the viewer is told about — so
-                // stopping here on one transient failure would leave scrollback
-                // silently short, indistinguishable from a quiet session.
-                await emit(watcher, page);
-                if (superseded()) return;
-                page = [];
-                bytes = 0;
-            }
-            page.push(event);
-            bytes += size;
+        for (const page of pagesOf(recent)) {
+            // A refused page is not the end of the history: `emit` already
+            // counts seal failures and ends the watch at MAX_TURN_SEAL_FAILURES
+            // — which the viewer is told about — so stopping here on one
+            // transient failure would leave scrollback silently short,
+            // indistinguishable from a quiet session.
+            await emit(watcher, page);
+            if (!isCurrent(watcher, epoch)) return;
         }
-        if (page.length) await emit(watcher, page);
     };
 
     /**

@@ -44,6 +44,8 @@ import { projectHash, remoteDigest, remoteMarkerPath, stateDir } from './gate.js
 import {
     forgetSession,
     knownSessions,
+    recallRun,
+    runKey,
     recallSession,
     rememberSessions,
     sessionDirectoryExists,
@@ -186,9 +188,13 @@ export const knownSessionsToReport = (
     live: readonly AgentSession[],
     now: number = Date.now(),
 ): ReportedKnownSession[] => {
-    const running = new Set(live.map((s) => s.name));
+    // By name AND kind: a slot that is live under claude may still hold an
+    // ended pi run, and that run is a past session — excluding the whole name
+    // would drop it from the report exactly the way the registry used to drop
+    // it from disk. The live run itself stays out for the reason below.
+    const running = new Set(live.map((s) => runKey(s.name, s.agentKind)));
     return knownSessions(now)
-        .filter((e) => !running.has(e.name))
+        .filter((e) => !running.has(runKey(e.name, e.agentKind)))
         .slice(0, KNOWN_SESSIONS_REPORTED)
         .map((e) => ({
             name: e.name,
@@ -1302,6 +1308,13 @@ export interface SessionResumeRequest {
     subtype?: string;
     targetDeviceId?: string;
     sessionName?: string;
+    /**
+     * Which run of that name to start, when the slot has held more than one
+     * agent. Not authority the phone gains: it selects among runs THIS machine
+     * recorded, and a kind that matches nothing falls back to the newest run —
+     * the same answer a phone too old to send it gets.
+     */
+    agentKind?: string;
     requestId?: string;
 }
 
@@ -1355,7 +1368,14 @@ export const handleSessionResumeRequest = (
     // through whichever path is cheaper.
     if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return reply({ error: 'rate_limited' });
 
-    const known = recallSession(sessionName);
+    // A named agent is answered with that run or not at all. Falling back to the
+    // newest run would start claude for a phone that asked for pi — silently,
+    // which is the exact failure this path exists to remove. A phone that names
+    // nothing still means the newest run.
+    const known =
+        typeof req.agentKind === 'string'
+            ? recallRun(sessionName, req.agentKind)
+            : recallSession(sessionName);
     if (!known) {
         log(`✗ resume ${sessionName}: never seen on this machine`);
         return reply({ error: 'unknown_session' });
@@ -1512,6 +1532,10 @@ export interface SessionForgetRequest {
     subtype?: string;
     targetDeviceId?: string;
     sessionName?: string;
+    /** Which run of that name to delete. A name can hold one run per agent, and
+     *  the phone deletes the row it is looking at. Absent (older phone) deletes
+     *  every run under the name, which is what the request used to mean. */
+    agentKind?: string;
     requestId?: string;
 }
 
@@ -1575,7 +1599,10 @@ export const handleSessionForgetRequest = (
     if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return reply({ error: 'rate_limited' });
 
     if (sessionExists(sessionName)) return reply({ error: 'still_running' });
-    const outcome = forgetSession(sessionName);
+    const outcome = forgetSession(
+        sessionName,
+        typeof req.agentKind === 'string' ? req.agentKind : undefined,
+    );
     if (outcome === 'unknown') {
         log(`✗ forget ${sessionName}: never seen on this machine`);
         return reply({ error: 'unknown_session' });

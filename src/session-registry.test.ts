@@ -20,6 +20,7 @@ const {
 
 const {
     rememberSessions,
+    recallRun,
     recallSession,
     knownSessions,
     isKnownSession,
@@ -199,5 +200,58 @@ describe('forgetSession', () => {
         } finally {
             chmodSync(turnRingDir(), 0o700);
         }
+    });
+});
+
+/**
+ * A tmux name is a slot, not a session. The wrapper hands `zeph-api` to
+ * whichever agent asks for that project next, so one row per name meant the
+ * newcomer erased what the last agent did there — the past list then answered
+ * with the wrong agent, and the ended run was neither resumable nor readable.
+ */
+describe('one row per run, not per name', () => {
+    it('keeps the pi run when claude takes the same tmux name', () => {
+        rememberSessions([live({ agentKind: 'pi' })], T0);
+        rememberSessions([live({ agentKind: 'claude' })], T0 + 1000);
+
+        expect(knownSessions(T0 + 1000).map((e) => e.agentKind).sort()).toEqual(['claude', 'pi']);
+    });
+
+    it('still replaces the run when the same agent is seen again', () => {
+        rememberSessions([live({ agentKind: 'pi' })], T0);
+        rememberSessions([live({ agentKind: 'pi', cwd: '/Users/tak/work/api-v2' })], T0 + 1000);
+
+        const rows = knownSessions(T0 + 1000);
+        expect(rows).toHaveLength(1);
+        expect(rows[0].cwd).toBe('/Users/tak/work/api-v2');
+    });
+
+    it('recalls the run the caller names, and the newest when it names none', () => {
+        rememberSessions([live({ agentKind: 'pi' })], T0);
+        rememberSessions([live({ agentKind: 'claude' })], T0 + 1000);
+
+        expect(recallRun('zeph-api', 'pi', T0 + 1000)?.agentKind).toBe('pi');
+        expect(recallSession('zeph-api', T0 + 1000)?.agentKind).toBe('claude');
+        expect(recallRun('zeph-api', 'codex', T0 + 1000)).toBeNull();
+    });
+
+    it('deletes only the run named, and keeps the chat scrollback the other one shares', () => {
+        rememberSessions([live({ agentKind: 'pi' })], T0);
+        rememberSessions([live({ agentKind: 'claude' })], T0 + 1000);
+        appendTurnRing('zeph-api', [{ kind: 'text', text: 'a week of prompts' }]);
+
+        expect(forgetSession('zeph-api', 'pi')).toBe('forgotten');
+        expect(knownSessions(T0 + 1000).map((e) => e.agentKind)).toEqual(['claude']);
+        // The ring is per NAME: dropping the pi row must not take claude's
+        // history with it.
+        expect(readTurnRing('zeph-api')).toHaveLength(1);
+    });
+
+    it('deletes every run of the name when the caller names no agent', () => {
+        rememberSessions([live({ agentKind: 'pi' })], T0);
+        rememberSessions([live({ agentKind: 'claude' })], T0 + 1000);
+
+        expect(forgetSession('zeph-api')).toBe('forgotten');
+        expect(knownSessions(T0 + 1000)).toEqual([]);
     });
 });
