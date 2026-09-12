@@ -128,6 +128,12 @@ export const findAvailableSession = (
      * machine never swept (no listener, or one that started after it), and
      * refusing those would break the ordinary reattach for anyone not running
      * the daemon.
+     *
+     * A STALE record is the other way to be wrong: the daemon recorded claude
+     * in this slot, the user has since started pi there by hand, and the sweep
+     * has not run. Then a `zeph pi` skips the user's own detached session and
+     * opens `-2`. That costs a reattach, where trusting the record the other way
+     * costs an agent that never starts — so the record wins.
      */
     const sameAgent = (name: string): boolean => {
         if (!agentKind) return true;
@@ -137,7 +143,14 @@ export const findAvailableSession = (
     for (let i = family.length - 1; i >= 0; i--) {
         if (live.get(family[i]) === false && sameAgent(family[i])) return family[i];
     }
-    return family.find((name) => !live.has(name)) ?? base;
+    const free = family.find((name) => !live.has(name));
+    if (free) return free;
+    // Every name in the family is taken. `base` is the historical answer, and
+    // `tmux new -A` on a taken name attaches instead of starting — fine when
+    // whatever is there runs this agent, and the silent wrong-agent attach this
+    // function exists to prevent when it does not. One name past the family is
+    // the only answer left that actually starts the agent that was asked for.
+    return sameAgent(base) ? base : `${base}-${MAX_SUFFIX_ATTEMPTS + 1}`;
 };
 
 interface SpawnTarget {

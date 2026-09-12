@@ -45,6 +45,7 @@ import {
     forgetSession,
     knownSessions,
     recallRun,
+    runKey,
     recallSession,
     rememberSessions,
     sessionDirectoryExists,
@@ -191,9 +192,9 @@ export const knownSessionsToReport = (
     // ended pi run, and that run is a past session — excluding the whole name
     // would drop it from the report exactly the way the registry used to drop
     // it from disk. The live run itself stays out for the reason below.
-    const running = new Set(live.map((s) => `${s.name} ${s.agentKind}`));
+    const running = new Set(live.map((s) => runKey(s.name, s.agentKind)));
     return knownSessions(now)
-        .filter((e) => !running.has(`${e.name} ${e.agentKind}`))
+        .filter((e) => !running.has(runKey(e.name, e.agentKind)))
         .slice(0, KNOWN_SESSIONS_REPORTED)
         .map((e) => ({
             name: e.name,
@@ -1367,9 +1368,14 @@ export const handleSessionResumeRequest = (
     // through whichever path is cheaper.
     if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return reply({ error: 'rate_limited' });
 
+    // A named agent is answered with that run or not at all. Falling back to the
+    // newest run would start claude for a phone that asked for pi — silently,
+    // which is the exact failure this path exists to remove. A phone that names
+    // nothing still means the newest run.
     const known =
-        (typeof req.agentKind === 'string' ? recallRun(sessionName, req.agentKind) : null) ??
-        recallSession(sessionName);
+        typeof req.agentKind === 'string'
+            ? recallRun(sessionName, req.agentKind)
+            : recallSession(sessionName);
     if (!known) {
         log(`✗ resume ${sessionName}: never seen on this machine`);
         return reply({ error: 'unknown_session' });

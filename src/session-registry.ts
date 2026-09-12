@@ -93,7 +93,7 @@ const writeAll = (entries: KnownSession[]): void => {
  * almost anything, and a name holding the separator must not be able to forge
  * another run's key.
  */
-const runKey = (name: string, agentKind: string): string => `${name}\u0000${agentKind}`;
+export const runKey = (name: string, agentKind: string): string => `${name}\u0000${agentKind}`;
 
 /** Sessions this machine has seen, newest first, expired ones dropped. */
 export const knownSessions = (now: number = Date.now()): KnownSession[] =>

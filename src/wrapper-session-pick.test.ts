@@ -192,3 +192,28 @@ describe('findAvailableSession — agent of the detached slot', () => {
             .toBe('zeph-api');
     });
 });
+
+describe('findAvailableSession — the family is full', () => {
+    const recorded = (spec: Record<string, string>) => (name: string) =>
+        spec[name] ? { agentKind: spec[name] } : null;
+
+    const fullFamily = (kind: string) => {
+        const all: Record<string, 'attached' | 'detached'> = { 'zeph-api': 'attached' };
+        for (let i = 2; i <= 20; i++) all[`zeph-api-${i}`] = 'attached';
+        sessions(all);
+        return recorded(
+            Object.fromEntries(Object.keys(all).map((n) => [n, kind])),
+        );
+    };
+
+    it('starts a name past the family rather than attaching to another agent', () => {
+        // `tmux new -A` on a taken name attaches and drops the command, so the
+        // historical `base` answer would put the user in claude with pi never
+        // started — the failure this whole path exists to prevent.
+        expect(findAvailableSession('zeph-api', 'pi', fullFamily('claude'))).toBe('zeph-api-21');
+    });
+
+    it('still falls back to the base name when it runs this agent', () => {
+        expect(findAvailableSession('zeph-api', 'pi', fullFamily('pi'))).toBe('zeph-api');
+    });
+});
