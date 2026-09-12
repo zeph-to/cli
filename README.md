@@ -308,6 +308,12 @@ block here.
    detached session is never killed for you — nothing here can tell
    "done with this" from "closed the laptop".
 
+   **Only a slot running the same agent is reattached.** `zeph pi` will
+   not reattach a detached `zeph cc` session: tmux attaches to a session
+   that already exists and drops the command it was given, so you would
+   land in claude with pi never started. A slot running another agent is
+   skipped and the next suffix is used instead.
+
    If you're already inside a tmux session (`$TMUX` set) the wrapper
    skips the outer tmux and runs the agent in the current pane — the
    listener can't target an unnamed session that way, but you keep your

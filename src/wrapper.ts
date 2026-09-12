@@ -23,6 +23,7 @@ import {
 } from './listener-process.js';
 import { restartService, serviceInstalled } from './listener-service.js';
 import type { RemoteAgent } from './remote-agents.js';
+import { recallSession } from './session-registry.js';
 
 const FALLBACK_NAME = 'project';
 
@@ -103,13 +104,53 @@ const familyNames = (base: string): string[] =>
  * take a live agent with it, and nothing here can tell "the user is done with
  * this" from "the user closed the terminal and will come back".
  */
-export const findAvailableSession = (base: string): string => {
+export const findAvailableSession = (
+    base: string,
+    /** The agent about to be started. A detached session that is running a
+     *  different one is not a slot for it — see `sameAgent` below. Omitted by
+     *  callers that have no kind to match, which keeps the old behaviour. */
+    agentKind?: string,
+    /** Test seam: what this machine recorded about a session name. */
+    recall: (name: string) => { agentKind: string } | null = recallSession,
+): string => {
     const live = liveSessions();
     const family = familyNames(base);
+    /**
+     * Whether a detached session can host this agent.
+     *
+     * `tmux new -A` attaches to an existing session and DROPS the command it
+     * was given, so reusing a detached session that is running claude for a
+     * `zeph pi` puts the user in front of claude — silently, with pi never
+     * started. The registry is the only thing on this machine that knows which
+     * agent a name is running, so it decides.
+     *
+     * A name the registry has no record of is reusable: that is a session this
+     * machine never swept (no listener, or one that started after it), and
+     * refusing those would break the ordinary reattach for anyone not running
+     * the daemon.
+     *
+     * A STALE record is the other way to be wrong: the daemon recorded claude
+     * in this slot, the user has since started pi there by hand, and the sweep
+     * has not run. Then a `zeph pi` skips the user's own detached session and
+     * opens `-2`. That costs a reattach, where trusting the record the other way
+     * costs an agent that never starts — so the record wins.
+     */
+    const sameAgent = (name: string): boolean => {
+        if (!agentKind) return true;
+        const known = recall(name);
+        return !known || known.agentKind === agentKind;
+    };
     for (let i = family.length - 1; i >= 0; i--) {
-        if (live.get(family[i]) === false) return family[i];
+        if (live.get(family[i]) === false && sameAgent(family[i])) return family[i];
     }
-    return family.find((name) => !live.has(name)) ?? base;
+    const free = family.find((name) => !live.has(name));
+    if (free) return free;
+    // Every name in the family is taken. `base` is the historical answer, and
+    // `tmux new -A` on a taken name attaches instead of starting — fine when
+    // whatever is there runs this agent, and the silent wrong-agent attach this
+    // function exists to prevent when it does not. One name past the family is
+    // the only answer left that actually starts the agent that was asked for.
+    return sameAgent(base) ? base : `${base}-${MAX_SUFFIX_ATTEMPTS + 1}`;
 };
 
 interface SpawnTarget {
@@ -130,7 +171,7 @@ const SHELL_SAFE = /^[\w\-./=:@%+,]+$/;
 const shellQuote = (s: string): string =>
     s.length > 0 && SHELL_SAFE.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
 
-export const targetForAgent = (agent: string, extra: string[]): SpawnTarget => {
+export const targetForAgent = (agent: string, extra: string[], agentKind?: string): SpawnTarget => {
     // Already inside tmux → no nested session, just run the agent in the
     // current pane. Nested tmux prefix collisions are confusing and the
     // listener can't reach a session it didn't name anyway.
@@ -142,7 +183,7 @@ export const targetForAgent = (agent: string, extra: string[]): SpawnTarget => {
     // else auto-suffix — lets the user keep `zeph cc` workflow simple and
     // still get independent sessions when opening multiple terminals in
     // the same project.
-    const session = findAvailableSession(base);
+    const session = findAvailableSession(base, agentKind);
     // `tmux new -A`: attach if the named session exists, else create it.
     // tmux joins trailing argv into a single shell-command, so flags like
     // `--resume` would be eaten by tmux's own parser. Build one quoted
@@ -256,7 +297,7 @@ export const handleAgentSession = async (agent: RemoteAgent, extra: string[] = [
     // the build we were launched from. The user shouldn't need to remember a
     // second command for the picker on their phone to work.
     await ensureListenerRunning();
-    const { kind, cmd, args } = targetForAgent(agent.binary, extra);
+    const { kind, cmd, args } = targetForAgent(agent.binary, extra, agent.kind);
 
     // Hand the terminal over and stop existing. Waiting on the child is all
     // this process does for the rest of the session, and it holds a whole node

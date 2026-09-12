@@ -136,3 +136,84 @@ describe('findAvailableSession', () => {
         expect(calls[0][0]).toBe('list-sessions');
     });
 });
+
+/**
+ * Which AGENT the slot is running.
+ *
+ * `tmux new -A` attaches to an existing session and drops the command it was
+ * handed, so reusing a detached claude session for `zeph pi` put the user in
+ * front of claude with pi never started — and the registry row for the slot
+ * then said claude, which is how an ended pi run stopped being findable at all.
+ */
+describe('findAvailableSession — agent of the detached slot', () => {
+    /** The registry as this machine wrote it: session name → agent kind. */
+    const recorded = (spec: Record<string, string>) => (name: string) =>
+        spec[name] ? { agentKind: spec[name] } : null;
+
+    it('skips a detached session running a different agent', () => {
+        sessions({ 'zeph-api': 'detached' });
+
+        expect(findAvailableSession('zeph-api', 'pi', recorded({ 'zeph-api': 'claude' })))
+            .toBe('zeph-api-2');
+    });
+
+    it('reuses a detached session running the same agent', () => {
+        sessions({ 'zeph-api': 'detached' });
+
+        expect(findAvailableSession('zeph-api', 'pi', recorded({ 'zeph-api': 'pi' })))
+            .toBe('zeph-api');
+    });
+
+    it('takes the highest detached slot that runs this agent', () => {
+        sessions({ 'zeph-api': 'detached', 'zeph-api-2': 'detached', 'zeph-api-3': 'detached' });
+
+        expect(
+            findAvailableSession(
+                'zeph-api',
+                'pi',
+                recorded({ 'zeph-api': 'pi', 'zeph-api-2': 'pi', 'zeph-api-3': 'claude' }),
+            ),
+        ).toBe('zeph-api-2');
+    });
+
+    it('reuses a slot this machine has no record of', () => {
+        // No listener ever swept it, so nothing knows what runs there. Refusing
+        // these would break the ordinary reattach for anyone not running the
+        // daemon — the pre-existing behaviour is the safe answer.
+        sessions({ 'zeph-api': 'detached' });
+
+        expect(findAvailableSession('zeph-api', 'pi', recorded({}))).toBe('zeph-api');
+    });
+
+    it('reuses any detached slot when the caller names no agent', () => {
+        sessions({ 'zeph-api': 'detached' });
+
+        expect(findAvailableSession('zeph-api', undefined, recorded({ 'zeph-api': 'claude' })))
+            .toBe('zeph-api');
+    });
+});
+
+describe('findAvailableSession — the family is full', () => {
+    const recorded = (spec: Record<string, string>) => (name: string) =>
+        spec[name] ? { agentKind: spec[name] } : null;
+
+    const fullFamily = (kind: string) => {
+        const all: Record<string, 'attached' | 'detached'> = { 'zeph-api': 'attached' };
+        for (let i = 2; i <= 20; i++) all[`zeph-api-${i}`] = 'attached';
+        sessions(all);
+        return recorded(
+            Object.fromEntries(Object.keys(all).map((n) => [n, kind])),
+        );
+    };
+
+    it('starts a name past the family rather than attaching to another agent', () => {
+        // `tmux new -A` on a taken name attaches and drops the command, so the
+        // historical `base` answer would put the user in claude with pi never
+        // started — the failure this whole path exists to prevent.
+        expect(findAvailableSession('zeph-api', 'pi', fullFamily('claude'))).toBe('zeph-api-21');
+    });
+
+    it('still falls back to the base name when it runs this agent', () => {
+        expect(findAvailableSession('zeph-api', 'pi', fullFamily('pi'))).toBe('zeph-api');
+    });
+});

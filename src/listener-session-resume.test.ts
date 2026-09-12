@@ -208,3 +208,62 @@ describe('agent.session.resume.request — starting a session that ended', () =>
         expect(newSessions()).toEqual([]);
     });
 });
+
+/**
+ * Which run of the slot to start. A tmux name can hold a run per agent, so the
+ * phone names the row it tapped — and a name it cannot match is refused rather
+ * than answered with something else.
+ */
+describe('agent.session.resume.request — naming the run', () => {
+    const device = computeListenerDeviceId();
+    let sent: Array<Record<string, unknown>>;
+    const send = (data: Record<string, unknown>) => { sent.push(data); };
+    const ask = (over: Record<string, unknown> = {}) => {
+        handleSessionResumeRequest(
+            { subtype: 'agent.session.resume.request', targetDeviceId: device,
+              sessionName: 'zeph-run', requestId: 'r1', ...over },
+            send,
+        );
+        return sent.at(-1);
+    };
+    const newSessions = () => tmuxCalls.filter((c) => c[0] === 'new-session');
+
+    beforeEach(() => {
+        vi.spyOn(console, 'log').mockImplementation(() => {});
+        tmuxCalls = [];
+        sent = [];
+        liveSessions = [];
+        newSessionFails = false;
+        rmSync(join(TMP, 'state'), { recursive: true, force: true });
+        // A name of its own: the per-session rate bucket lives for the module,
+        // and an earlier test in this file spends `zeph-api`'s.
+        rememberSessions([{ name: 'zeph-run', cwd: PROJECT_DIR, agentKind: 'pi', project: 'api' }], Date.now() - 2_000);
+        rememberSessions([{ name: 'zeph-run', cwd: PROJECT_DIR, agentKind: 'claude', project: 'api' }], Date.now() - 1_000);
+    });
+    afterEach(() => vi.restoreAllMocks());
+
+    it('starts the run the request names, not the newest one', () => {
+        const reply = ask({ agentKind: 'pi' });
+
+        expect(reply).toMatchObject({ resumed: true });
+        expect(newSessions()[0]?.at(-1)).toBe('pi');
+    });
+
+    it('refuses a named agent this machine has no record of', () => {
+        // Falling back to the newest run here would start claude for a phone
+        // that asked for pi — the silent wrong-agent start this path exists to
+        // remove. The record can go (TTL, deletion, the row cap) while the
+        // phone still shows the row.
+        const reply = ask({ agentKind: 'codex' });
+
+        expect(reply?.error).toBe('unknown_session');
+        expect(newSessions()).toEqual([]);
+    });
+
+    it('starts the newest run when the request names no agent', () => {
+        const reply = ask();
+
+        expect(reply).toMatchObject({ resumed: true });
+        expect(newSessions()[0]?.at(-1)).toBe('claude');
+    });
+});
