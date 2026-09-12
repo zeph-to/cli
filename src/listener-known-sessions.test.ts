@@ -126,3 +126,31 @@ describe('known sessions in the inventory report', () => {
         expect(knownSessionsToReport([])).toEqual([]);
     });
 });
+
+/**
+ * A tmux name outlives the agent that held it. Excluding a live session by
+ * NAME alone also hid the ended run of the previous occupant — which is the
+ * report-side half of the bug the registry's run key fixes.
+ */
+describe('a slot that has held two agents', () => {
+    beforeEach(() => {
+        rmSync(join(TMP, 'state'), { recursive: true, force: true });
+    });
+
+    it('still reports the ended pi run while claude holds the name', () => {
+        rememberSessions(
+            [{ name: 'zeph-api', cwd: '/work/proj', agentKind: 'pi', project: 'proj' }],
+            1_000,
+        );
+        rememberSessions(
+            [{ name: 'zeph-api', cwd: '/work/proj', agentKind: 'claude', project: 'proj' }],
+            2_000,
+        );
+
+        const reported = knownSessionsToReport([live('zeph-api')], 3_000);
+
+        // The live claude run is out (its lastSeenAt moves every sweep); the pi
+        // run that ended in that same slot is a past session and stays in.
+        expect(reported.map((k) => [k.name, k.agentKind])).toEqual([['zeph-api', 'pi']]);
+    });
+});

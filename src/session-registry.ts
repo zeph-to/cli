@@ -4,7 +4,9 @@
  * tmux is the only record of a live session, and it forgets one the moment it
  * ends — which is exactly when the phone wants it back. So the listener writes
  * down what it saw while the session was alive: where it ran and which agent it
- * ran, keyed by the tmux name the phone already addresses it by.
+ * ran, keyed by the tmux name the phone already addresses it by **and** the
+ * agent that ran under it — tmux hands the same name out again, and one row per
+ * name meant the next occupant erased the last one's record (`runKey`).
  *
  * This file is the whitelist that makes remote resume safe. A resume request
  * carries a session NAME and nothing else; the directory and the binary come
@@ -78,15 +80,47 @@ const writeAll = (entries: KnownSession[]): void => {
     }
 };
 
+/**
+ * What makes two sightings the same remembered run: the tmux name AND the
+ * agent that was running under it.
+ *
+ * Keyed by name alone, a `zeph cc` in a project erased whatever pi had done in
+ * the same slot — the ended run left no row to resume and no row to read, and
+ * the past list silently answered with the newest occupant instead. tmux hands
+ * a name back out; the record of what ran under it is not the name's to lose.
+ *
+ * NUL rather than a printable separator: a project directory can be called
+ * almost anything, and a name holding the separator must not be able to forge
+ * another run's key.
+ */
+const runKey = (name: string, agentKind: string): string => `${name}\u0000${agentKind}`;
+
 /** Sessions this machine has seen, newest first, expired ones dropped. */
 export const knownSessions = (now: number = Date.now()): KnownSession[] =>
     readAll()
         .filter((e) => now - Date.parse(e.lastSeenAt) < KNOWN_SESSION_TTL_MS)
         .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
 
-/** One remembered session, or null when this machine never saw that name. */
+/** One remembered session, or null when this machine never saw that name.
+ *  The newest run under that name — which is the one a bare resume means. */
 export const recallSession = (name: string, now: number = Date.now()): KnownSession | null =>
     knownSessions(now).find((e) => e.name === name) ?? null;
+
+/**
+ * One specific run: the newest under this name that ran THIS agent.
+ *
+ * A tmux name is a slot several agents pass through, so "resume zeph-web" is
+ * ambiguous the moment the slot has held both pi and claude. The phone knows
+ * which row was tapped and says so; this is how that answer is honoured.
+ * Null when this machine never saw that agent under that name — the caller
+ * decides whether to fall back to the newest run or refuse.
+ */
+export const recallRun = (
+    name: string,
+    agentKind: string,
+    now: number = Date.now(),
+): KnownSession | null =>
+    knownSessions(now).find((e) => e.name === name && e.agentKind === agentKind) ?? null;
 
 /**
  * Write down the sessions running right now, replacing what was known about
@@ -110,9 +144,9 @@ export const rememberSessions = (
     const usable = live.filter((s) => !!s.name && !!s.cwd);
     if (usable.length === 0) return;
     const seenAt = new Date(now).toISOString();
-    const byName = new Map(knownSessions(now).map((e) => [e.name, e]));
+    const byRun = new Map(knownSessions(now).map((e) => [runKey(e.name, e.agentKind), e]));
     for (const s of usable) {
-        byName.set(s.name, {
+        byRun.set(runKey(s.name, s.agentKind), {
             name: s.name,
             cwd: s.cwd as string,
             agentKind: s.agentKind,
@@ -121,7 +155,7 @@ export const rememberSessions = (
             lastSeenAt: seenAt,
         });
     }
-    const entries = [...byName.values()]
+    const entries = [...byRun.values()]
         .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt))
         .slice(0, MAX_KNOWN_SESSIONS);
     writeAll(entries);
@@ -147,15 +181,25 @@ export type ForgetOutcome =
     /** Registry entry gone, but the scrollback file would not delete. */
     | 'scrollback_kept';
 
-export const forgetSession = (name: string): ForgetOutcome => {
+export const forgetSession = (name: string, agentKind?: string): ForgetOutcome => {
     const entries = readAll();
-    const kept = entries.filter((e) => e.name !== name);
+    // With a kind, only that run goes — the phone deletes the row it is looking
+    // at, and a name that held both pi and claude shows two rows. Without one
+    // (an older phone, which sends no kind), the name goes entirely: that is
+    // what the request meant when a name could only mean one run.
+    const kept = entries.filter((e) => e.name !== name || (agentKind ? e.agentKind !== agentKind : false));
     if (kept.length === entries.length) return 'unknown';
-    writeAll(kept);
     // The chat's scrollback for that session goes with it. Forgetting a session
     // everywhere except the one file that holds a week of its prompts and tool
     // targets is not forgetting it — and a failure to delete that file has to
     // reach the person who asked, not stay in a swallowed catch.
+    //
+    // Except while another run still answers to the name: the scrollback is per
+    // NAME, so deleting the pi row would take the claude row's history with it.
+    // The record is gone either way; the file waits for the last run to go.
+    const nameStillHeld = kept.some((e) => e.name === name);
+    writeAll(kept);
+    if (nameStillHeld) return 'forgotten';
     return removeTurnRing(name) ? 'forgotten' : 'scrollback_kept';
 };
 
