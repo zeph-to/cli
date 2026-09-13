@@ -125,6 +125,28 @@ describe('in-process subagents in the inventory sweep', () => {
         expect(first).not.toContain(`${SESSION_ID}.jsonl`);
     });
 
+    it('refuses every write aimed at an in-process subagent', async () => {
+        writeTranscripts({ withSubagent: true });
+        const { sessions, targets } = listener.collectSessionsVerbose();
+        listener.recordTargets(targets);
+        const name = sessions.find((s) => s.parentName === 'zeph-a')!.name;
+        const sent: Array<Record<string, unknown>> = [];
+
+        // The name is what every refusal keys on, so the row generated here has
+        // to satisfy the same predicate a pane subagent's name does.
+        expect(listener.isSubagentSessionName(name)).toBe(true);
+        expect(listener.tmuxTargetFor(name)).toBeNull();
+        await expect(listener.handlePush(
+            { pushId: 'p1', type: 'agent.command', agentSessionName: name, body: 'hi' },
+            {},
+        )).resolves.toBe(false);
+        expect(listener.handleSessionExitRequest(
+            { subtype: 'agent.session.exit.request', requestId: 'e1', sessionName: name, targetDeviceId: listener.computeListenerDeviceId() },
+            (d) => sent.push(d),
+        )).toBe(true);
+        expect(sent[0]!.error).toBe('subagent_view_only');
+    });
+
     it('forgets a subagent that left the last sweep', () => {
         writeTranscripts({ withSubagent: true });
         listener.recordSubagentTranscripts(listener.collectSessionsVerbose().subagentTranscripts);
