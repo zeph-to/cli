@@ -19,9 +19,10 @@
 
 import {
     initialTailState,
-    projectTranscriptEntries,
     readTranscriptDelta,
     type TailState,
+    type TranscriptProjector,
+    type TranscriptSource,
     type TurnEvent,
 } from './transcript-tail.js';
 import { isSubagentTranscriptPath } from './subagent-transcripts.js';
@@ -140,8 +141,21 @@ export type SendTurnFrame = (data: Record<string, unknown>) => void;
 export interface TurnWatchDeps {
     /** This machine's listener device id — control messages that name another are not ours. */
     deviceId: () => string;
-    /** tmux session name → transcript file, or null when this session has none (a non-Claude agent). */
-    resolveTranscript: (sessionName: string) => string | null;
+    /**
+     * tmux session name → that session's transcript and the projector that reads
+     * it, or null when this agent has no transcript this daemon knows how to
+     * follow. Path and projector arrive together because they are one answer;
+     * see `TranscriptSource`.
+     *
+     * `onMiss` is the reason channel for the null. The resolver is the only side
+     * that knows *why* — whether the row carries no resolver at all, or carries
+     * one whose path rule came back empty-handed — and those two look identical
+     * from here and identical on the phone. The caller decides how often to ask
+     * for a reason: `handle` passes one because a viewer is waiting on the
+     * answer, the recheck does not because it runs every TRANSCRIPT_RECHECK_MS
+     * and would turn one unsupported agent into a line every ten seconds.
+     */
+    resolveTranscript: (sessionName: string, onMiss?: (reason: string) => void) => TranscriptSource | null;
     /** Whether tmux still holds this session. A watch outlives its pane otherwise. */
     sessionExists: (sessionName: string) => boolean;
     /**
@@ -161,6 +175,8 @@ export interface TurnWatchDeps {
 interface Watcher {
     sessionName: string;
     transcriptPath: string;
+    /** The projector for `transcriptPath`. Re-seeded with it, because a rotation can land on another agent's file. */
+    project: TranscriptProjector;
     subscriberPublicKey?: string;
     tail: TailState | null;
     timer: NodeJS.Timeout | undefined;
@@ -310,7 +326,7 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
         if (now() - watcher.checkedAt >= TRANSCRIPT_RECHECK_MS) {
             watcher.checkedAt = now();
             const current = deps.resolveTranscript(sessionName);
-            if (current && current !== watcher.transcriptPath) {
+            if (current && current.path !== watcher.transcriptPath) {
                 deps.log(`⧉ turn-watch ${sessionName}: transcript rotated — following the new session file`);
                 reseed(watcher, current, watcher.subscriberPublicKey, watcher.send);
             }
@@ -324,7 +340,7 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
                 deps.log(`⧉ turn-watch ${sessionName}: dropped ${read.droppedLines} oversized line(s)`);
             }
             if (read.lines.length) {
-                const projected = projectTranscriptEntries(read.lines, {
+                const projected = watcher.project(read.lines, {
                     sinceLastPrompt: watcher.backfilling,
                     // A subagent's transcript is nothing but sidechain entries.
                     includeSidechain: isSubagentTranscriptPath(watcher.transcriptPath),
@@ -493,15 +509,17 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
             // lease exists for (swipe away, come back inside 60s): the old
             // watcher's offset is already at EOF, so nothing backfills and
             // nothing has been appended yet.
-            const transcriptPath = deps.resolveTranscript(req.sessionName);
-            if (!transcriptPath) {
-                // The session died and a new one took its name, or it was never
-                // Claude Code. Either way the old file is not this session's.
+            const { source, reason } = resolveForViewer(req.sessionName);
+            if (!source) {
+                // The session died and a new one took its name, or its agent has
+                // no transcript we follow. Either way the old file is not this
+                // session's — and this watch *was* reading one a moment ago, so
+                // it is a loss, not an agent that never had a timeline.
                 stop(req.sessionName, 'transcript gone');
-                send({ subtype: 'agent.turn.watch.error', sessionName: req.sessionName, error: 'no_transcript' });
+                refuse(req.sessionName, 'the transcript this watch was following is gone', reason, send);
                 return true;
             }
-            beginWatch(existing, transcriptPath, req.subscriberPublicKey, send);
+            beginWatch(existing, source, req.subscriberPublicKey, send);
             return true;
         }
         if (req.subtype === 'agent.turn.watch.renew') {
@@ -516,18 +534,16 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
             return true;
         }
 
-        const transcriptPath = deps.resolveTranscript(req.sessionName);
-        if (!transcriptPath) {
-            // Not an error: a Codex or Gemini session has no Claude transcript.
-            // The viewer needs to say "no live timeline here" rather than show an
-            // empty screen that reads as a hang.
-            send({ subtype: 'agent.turn.watch.error', sessionName: req.sessionName, error: 'no_transcript' });
+        const { source, reason } = resolveForViewer(req.sessionName);
+        if (!source) {
+            refuse(req.sessionName, 'no transcript to watch', reason, send);
             return true;
         }
 
         const watcher: Watcher = {
             sessionName: req.sessionName,
-            transcriptPath,
+            transcriptPath: source.path,
+            project: source.project,
             subscriberPublicKey: req.subscriberPublicKey,
             tail: initialTailState(),
             timer: undefined,
@@ -545,8 +561,38 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
         // Once per new watch, not per tick: the sweep is a directory read, and a
         // machine that has run agents for months is the only one it matters for.
         deps.ring.sweep();
-        beginWatch(watcher, transcriptPath, req.subscriberPublicKey, send);
+        beginWatch(watcher, source, req.subscriberPublicKey, send);
         return true;
+    };
+
+    /**
+     * Turn a viewer away, and say so in the log.
+     *
+     * Not an error on the wire: an agent with no resolver genuinely has no
+     * timeline, and every case sends the same `no_transcript` so the viewer can
+     * say "no live timeline here" rather than show an empty screen that reads as
+     * a hang. The log is where the cases are told apart — `what` says which
+     * branch refused (a watch that never started vs. one whose file disappeared)
+     * and `reason` is the resolver's own account of the null. Without both, a
+     * broken resolver and an unsupported agent produce identical evidence, and
+     * the only symptom of the bug is a message that is also correct behaviour.
+     *
+     * Called only from `handle`, so it is once per watch attempt. The recheck in
+     * `readAndEmit` resolves on its own cadence and stays silent — a rotation
+     * that finds nothing keeps the watcher on the file it has.
+     */
+    const refuse = (sessionName: string, what: string, reason: string, send: SendTurnFrame): void => {
+        deps.log(`⧉ turn-watch ${sessionName}: ${what} — ${reason || 'no reason reported'}`);
+        send({ subtype: 'agent.turn.watch.error', sessionName, error: 'no_transcript' });
+    };
+
+    /** Resolve for a viewer that is waiting, collecting the reason for a miss. */
+    const resolveForViewer = (sessionName: string): { source: TranscriptSource | null; reason: string } => {
+        let reason = '';
+        const source = deps.resolveTranscript(sessionName, (r) => {
+            reason = r;
+        });
+        return { source, reason };
     };
 
     /**
@@ -559,11 +605,11 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
      */
     const beginWatch = (
         watcher: Watcher,
-        transcriptPath: string,
+        source: TranscriptSource,
         subscriberPublicKey: string | undefined,
         send: SendTurnFrame,
     ): void => {
-        reseed(watcher, transcriptPath, subscriberPublicKey, send);
+        reseed(watcher, source, subscriberPublicKey, send);
         send({ subtype: 'agent.turn.watch.ok', sessionName: watcher.sessionName });
         void sealThenRead(watcher, subscriberPublicKey);
     };
@@ -577,7 +623,7 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
      */
     const reseed = (
         watcher: Watcher,
-        transcriptPath: string,
+        source: TranscriptSource,
         subscriberPublicKey: string | undefined,
         send: SendTurnFrame,
     ): void => {
@@ -588,7 +634,12 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
         // re-start, with only the newest handle reachable by `stop`.
         clearTimeout(watcher.timer);
         watcher.timer = undefined;
-        watcher.transcriptPath = transcriptPath;
+        watcher.transcriptPath = source.path;
+        // The projector moves with the path. A rotation can land on a file this
+        // agent writes in another format — or, when a tmux name is reused, on a
+        // different agent's file entirely — and a projector left behind would
+        // parse the new bytes with the old format's rules.
+        watcher.project = source.project;
         // Backfill again: the point of a start is that someone is looking now.
         watcher.tail = initialTailState();
         watcher.backfilling = true;

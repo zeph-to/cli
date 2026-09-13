@@ -314,6 +314,45 @@ export type TurnEvent = { at?: string } & (
  * on the watcher instead would grow with the session.
  */
 
+/**
+ * What a projector is told about the read it is projecting.
+ *
+ * Both flags are about the *read*, not about any one format, but only
+ * `sinceLastPrompt` means something to every agent: it is "this is a backfill,
+ * keep the turn still in flight". `includeSidechain` is Claude Code's word for
+ * its in-process subagents, and an agent with no such concept ignores it. A
+ * projector ignoring an option its format has no notion of is the contract, not
+ * an oversight — do not read an unused field here as a missed case.
+ */
+export interface ProjectorOptions {
+    sinceLastPrompt?: boolean;
+    includeSidechain?: boolean;
+}
+
+/**
+ * One agent's transcript format, reduced to the events the timeline draws.
+ *
+ * Pure by contract: lines in, events out, no filesystem and no clock. That is
+ * what lets `readTranscriptDelta` above stay the single tailer for every agent
+ * whose transcript is an append-only text log — the bytes are the same problem
+ * for all of them, and only the shape of a line differs.
+ */
+export type TranscriptProjector = (lines: readonly string[], opts?: ProjectorOptions) => TurnEvent[];
+
+/**
+ * A transcript and the projector that can read it, resolved together.
+ *
+ * They travel as one because they are one answer: a path with no projector is a
+ * file nothing can parse, which reaches a viewer as an empty timeline — strictly
+ * worse than the honest `no_transcript` it would replace. Resolving them apart
+ * would also mean two `detectRemoteAgent` lookups per recheck, on a path that is
+ * uncached and blocking (see `TurnWatchDeps.resolveTranscript`).
+ */
+export interface TranscriptSource {
+    readonly path: string;
+    readonly project: TranscriptProjector;
+}
+
 /** Edits larger than this are counted, not diffed: splitting them into lines
  *  is the one allocation here that scales with what the agent wrote. */
 export const EDIT_DIFF_MAX_CHARS = 64 * 1024;
@@ -430,18 +469,32 @@ const messageMetaOf = (entry: Record<string, unknown>, at: string | undefined): 
  */
 const TARGET_KEYS = ['description', 'file_path', 'path', 'pattern', 'query', 'url', 'skill'] as const;
 
-const clamp = (value: string, max = MAX_EVENT_FIELD_CHARS): string =>
+/**
+ * Cut one field to the wire's budget. Exported because every projector shares
+ * the same 12KB frame ceiling (`MAX_TURN_FRAME_BYTES` in `turn-watch`), so a
+ * second projector with its own idea of "long enough" would be a second way to
+ * overflow the one transport.
+ */
+export const clamp = (value: string, max = MAX_EVENT_FIELD_CHARS): string =>
     value.length > max ? value.slice(0, max) : value;
 
-const targetOf = (input: unknown): string | undefined => {
+/**
+ * First of `keys` that holds a non-blank string, clamped — the loop every
+ * projector needs, without the key list every projector has to choose for
+ * itself. The keys stay the caller's: they are that agent's vocabulary, and
+ * merging them into one list is exactly what the `TARGET_KEYS` note forbids.
+ */
+export const targetFrom = (input: unknown, keys: readonly string[]): string | undefined => {
     if (!input || typeof input !== 'object') return undefined;
     const record = input as Record<string, unknown>;
-    for (const key of TARGET_KEYS) {
+    for (const key of keys) {
         const value = record[key];
         if (typeof value === 'string' && value.trim()) return clamp(value.trim());
     }
     return undefined;
 };
+
+const targetOf = (input: unknown): string | undefined => targetFrom(input, TARGET_KEYS);
 
 const contentBlocks = (entry: Record<string, unknown>): Record<string, unknown>[] => {
     const message = entry.message;
@@ -555,14 +608,13 @@ const nonEmpty = (text: string): string | null => {
  *
  * Everything here — the block shapes, the entry types, `TARGET_KEYS` — is Claude
  * Code's transcript format. Supporting another agent (pi, Codex) means a
- * projector of its own alongside this one, reached the way `REMOTE_AGENTS`
- * already reaches per-agent session resolvers; `turn-watch` takes the reader as
- * a dependency and needs no change for it.
+ * projector of its own alongside this one, satisfying `TranscriptProjector` and
+ * reached the way `REMOTE_AGENTS` already reaches per-agent session resolvers:
+ * `RemoteAgent.projectTranscript`, resolved together with the path as a
+ * `TranscriptSource`. `turn-watch` calls whichever projector it is handed and
+ * knows about none of them by name.
  */
-export const projectTranscriptEntries = (
-    lines: readonly string[],
-    opts: { sinceLastPrompt?: boolean; includeSidechain?: boolean } = {},
-): TurnEvent[] => {
+export const projectTranscriptEntries: TranscriptProjector = (lines, opts = {}): TurnEvent[] => {
     const events: TurnEvent[] = [];
     // One `msg` per API message in this batch, kept where it first appeared.
     const messages = new Map<string, Extract<TurnEvent, { kind: 'msg' }>>();

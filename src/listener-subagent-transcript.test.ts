@@ -3,6 +3,8 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { describe, expect, it, beforeEach, vi } from 'vitest';
 
+import { projectTranscriptEntries } from './transcript-tail.js';
+
 /**
  * Claude Code subagents in the sweep — the ones with no pane (slice 01).
  *
@@ -52,6 +54,19 @@ const fakeTmux = (args: readonly string[]) => {
         return { status: 0, stdout: `${row}\n`, stderr: '' };
     }
     if (a[0] === 'capture-pane') return { status: 0, stdout: 'pane text\n', stderr: '' };
+    // What `readPaneInfo` asks: current command, start command, cwd, pid — the
+    // four fields the transcript resolver reads the running agent out of.
+    if (a[0] === 'display-message') {
+        // Only for this fixture's pane. Answering for any target would make a
+        // session tmux has never heard of resolve like a live one.
+        // `tmuxTargetFor` answers the recorded pane id once the sweep has run,
+        // and the bare session name before it — accept either, and nothing else.
+        const target = a[a.indexOf('-t') + 1] ?? '';
+        const knownPane = target === PANE.paneId || target.startsWith(PANE.session);
+        if (!knownPane) return { status: 1, stdout: '', stderr: '' };
+        const row = [PANE.current, PANE.start, PANE_CWD, String(PANE.pid)].join(FIELD_SEP);
+        return { status: 0, stdout: `${row}\n`, stderr: '' };
+    }
     return { status: 0, stdout: '', stderr: '' };
 };
 
@@ -109,7 +124,12 @@ describe('in-process subagents in the inventory sweep', () => {
         // Both are what turn-watch asks every tick. tmux cannot answer either
         // for `zeph-a.1` — it reads the `.1` as a pane index of `zeph-a`.
         expect(listener.hasSession('zeph-a.1')).toBe(true);
-        expect(listener.resolveWatchTranscript('zeph-a.1')).toContain('subagents/agent-a90c3941.jsonl');
+        const source = listener.resolveWatchTranscript('zeph-a.1');
+        expect(source?.path).toContain('subagents/agent-a90c3941.jsonl');
+        // A subagent transcript is Claude Code's own format, so the pair has to
+        // name Claude's projector — a source with a path and no reader is the
+        // empty timeline the pair exists to prevent.
+        expect(source?.project).toBe(projectTranscriptEntries);
         expect(listener.hasSession('zeph-a.9')).toBe(false);
     });
 
@@ -120,9 +140,79 @@ describe('in-process subagents in the inventory sweep', () => {
         // The re-resolve that follows a parent's `/clear` runs through the same
         // call: if it ever answered with the parent file, a viewer would be
         // reading the main session's work under the subagent's name.
-        const first = listener.resolveWatchTranscript('zeph-a.1');
-        expect(listener.resolveWatchTranscript('zeph-a.1')).toBe(first);
+        const first = listener.resolveWatchTranscript('zeph-a.1')?.path;
+        expect(listener.resolveWatchTranscript('zeph-a.1')?.path).toBe(first);
         expect(first).not.toContain(`${SESSION_ID}.jsonl`);
+    });
+
+    // Every null this function can answer with has to say why: the reason is
+    // what tells a broken resolver from an agent that legitimately has no
+    // timeline, and on the phone the two are the same sentence. So each branch
+    // that can return null is driven here and asserted on its own words.
+    //
+    // One branch is deliberately absent: `!agent.projectTranscript` after a
+    // resolver produced a path. `remote-agents.test.ts` ("a row resolves a
+    // transcript and reads it, or does neither") makes that state unreachable
+    // for every row in the table, so the only way to execute it is to build a
+    // row the invariant forbids. The guard stays as fail-closed defence against
+    // that invariant drifting, and the invariant test is what proves it cannot.
+    describe('reports why it found no transcript', () => {
+        const reasonFor = (session: string): string => {
+            let reason = '';
+            listener.resolveWatchTranscript(session, (r) => {
+                reason = r;
+            });
+            return reason;
+        };
+
+        /** Register the pane the way the sweep does, so `readPaneInfo` can answer for it. */
+        const armPane = (): void => {
+            listener.recordTargets(listener.collectSessionsVerbose().targets);
+        };
+
+        const withPane = (over: Partial<typeof PANE>, run: () => void): void => {
+            const before = { ...PANE };
+            Object.assign(PANE, over);
+            try {
+                run();
+            } finally {
+                Object.assign(PANE, before);
+            }
+        };
+
+        it('when tmux does not know the session', () => {
+            writeTranscripts({ withSubagent: true });
+            expect(reasonFor('no-such-session')).toContain('no working directory');
+        });
+
+        it('when the pane is running something that is not an agent we drive', () => {
+            writeTranscripts({ withSubagent: true });
+            armPane();
+            withPane({ current: 'vim', start: 'vim' }, () => {
+                expect(reasonFor('zeph-a')).toContain('no known agent');
+            });
+        });
+
+        // Codex is in the table with a session-name resolver and no transcript
+        // resolver — the EXTENSION POINT state most rows are in today, and the
+        // one a user hits as "This agent has no live timeline".
+        it('when the agent is known but carries no transcript resolver', () => {
+            writeTranscripts({ withSubagent: true });
+            armPane();
+            withPane({ current: 'codex', start: 'codex' }, () => {
+                expect(reasonFor('zeph-a')).toBe('codex has no transcript resolver');
+            });
+        });
+
+        it('when the resolver runs and finds nothing under this directory', () => {
+            writeTranscripts({ withSubagent: true });
+            armPane();
+            // No project tree, so Claude's resolver has nothing to match.
+            rmSync(PROJECT_DIR, { recursive: true, force: true });
+            const reason = reasonFor('zeph-a');
+            expect(reason).toContain('claude resolver found no transcript');
+            expect(reason).toContain(PANE_CWD);
+        });
     });
 
     it('refuses every write aimed at an in-process subagent', async () => {

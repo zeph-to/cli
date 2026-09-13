@@ -56,6 +56,7 @@ import {
     scanSubagents,
     type SubagentScanState,
 } from './subagent-transcripts.js';
+import { projectTranscriptEntries, type TranscriptSource } from './transcript-tail.js';
 import {
     installService,
     restartService,
@@ -2288,23 +2289,50 @@ const activeStreams = new Map<string, ActiveStream>();
  * dies, and a test that only reached the module's maps would pass while this
  * asked tmux about a name tmux cannot parse.
  */
-export const resolveWatchTranscript = (sessionName: string): string | null => {
+export const resolveWatchTranscript = (
+    sessionName: string,
+    onMiss?: (reason: string) => void,
+): TranscriptSource | null => {
+    // Why this returned nothing, for the caller that has a viewer waiting. Only
+    // this function can tell "the row has no resolver" from "the resolver ran
+    // and found nothing", and on the phone those two are the same sentence.
+    const miss = (reason: string): null => {
+        onMiss?.(reason);
+        return null;
+    };
     // In-process subagents first: they have no pane, and asking tmux about
     // `zeph-x.3` makes it read the `.3` as a pane index and answer for some
     // other pane entirely — the parent's, whose transcript is NOT this one.
+    // Claude Code is the only agent with in-process subagents, so the format is
+    // known without asking the table.
     const subagentTranscript = subagentTranscriptFor(sessionName);
-    if (subagentTranscript) return subagentTranscript;
+    if (subagentTranscript) return { path: subagentTranscript, project: projectTranscriptEntries };
     const info = readPaneInfo(sessionName);
-    if (!info.currentPath) return null;
+    if (!info.currentPath) return miss('tmux reported no working directory for this session');
     // Ask the agent actually running in the pane, through the same detector the
     // session sweep uses — start_command first, because the foreground process
     // is usually the interpreter, and quote-stripped, because a leading `"`
-    // once made this exact check miss every wrapped session. A Codex or Gemini
-    // pane carries no resolver yet and answers null, which the watcher reports
-    // as `no_transcript` — the EXTENSION POINT rule the session-id and
+    // once made this exact check miss every wrapped session. An agent whose row
+    // carries no resolver answers null, which the watcher reports as
+    // `no_transcript` — the EXTENSION POINT rule the session-id and
     // session-name resolvers already follow.
+    //
+    // One lookup answers both halves: `readPaneInfo` above is an uncached tmux
+    // spawn, and resolving path and projector separately would pay for it twice
+    // on a path that runs every TRANSCRIPT_RECHECK_MS per watcher.
     const agent = detectRemoteAgent(info);
-    return agent?.resolveTranscript?.(info.currentPath, info.panePid ?? undefined) ?? null;
+    if (!agent) return miss('no known agent running in the pane');
+    if (!agent.resolveTranscript) return miss(`${agent.kind} has no transcript resolver`);
+    const path = agent.resolveTranscript(info.currentPath, info.panePid ?? undefined);
+    if (!path) return miss(`${agent.kind} resolver found no transcript under ${info.currentPath}`);
+    // Unreachable for every row in the table as it stands: `remote-agents.test.ts`
+    // ("a row resolves a transcript and reads it, or does neither") rejects a
+    // row that sets one without the other, which is why this branch has no test
+    // of its own. It stays as the fail-closed answer if that invariant ever
+    // drifts — handing the watcher a path nothing can parse would reach the
+    // phone as an empty timeline, which reads as a hung agent.
+    if (!agent.projectTranscript) return miss(`${agent.kind} resolves a transcript but has no projector`);
+    return { path, project: agent.projectTranscript };
 };
 
 /** Whether this machine holds a session by this name — exported for the same

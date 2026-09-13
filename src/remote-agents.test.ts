@@ -24,6 +24,20 @@ describe('remote-agents.ts: table invariants', () => {
         expect(new Set(all).size).toBe(all.length);
     });
 
+    // A row that can find a transcript but not read one is the worst of the
+    // three states: the watcher accepts the watch, tails a file nothing parses,
+    // and the phone shows an empty timeline that reads as a hung agent. The
+    // honest `no_transcript` a resolver-less row produces is strictly better,
+    // so half a pair must fail here rather than on someone's phone.
+    it('a row resolves a transcript and reads it, or does neither', () => {
+        for (const a of REMOTE_AGENTS) {
+            expect(
+                Boolean(a.resolveTranscript),
+                `${a.kind}: resolveTranscript and projectTranscript must be set together`,
+            ).toBe(Boolean(a.projectTranscript));
+        }
+    });
+
     it('no subcommand collides with a built-in CLI command', () => {
         const all = REMOTE_AGENTS.flatMap((a) => [...a.subcommands]);
         for (const sub of all) expect(RESERVED_COMMANDS).not.toContain(sub);

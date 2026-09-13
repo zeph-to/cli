@@ -13,7 +13,12 @@ import {
     MAX_TURN_FRAME_BYTES,
     type TurnWatchDeps,
 } from './turn-watch.js';
-import type { TurnEvent } from './transcript-tail.js';
+import {
+    projectTranscriptEntries,
+    type TranscriptProjector,
+    type TranscriptSource,
+    type TurnEvent,
+} from './transcript-tail.js';
 import type { TurnRing } from './turn-ring.js';
 
 const DEVICE = 'dev_listener_abc123';
@@ -48,9 +53,15 @@ const makeRing = (): TurnRing => ({
 
 const transcriptFor = (session: string) => join(dir, `${session}.jsonl`);
 
+/** The pair `resolveTranscript` answers with. Claude's projector unless a test says otherwise. */
+const sourceFor = (session: string, project: TranscriptProjector = projectTranscriptEntries): TranscriptSource => ({
+    path: transcriptFor(session),
+    project,
+});
+
 const makeDeps = (over: Partial<TurnWatchDeps> = {}): TurnWatchDeps => ({
     deviceId: () => DEVICE,
-    resolveTranscript: (session) => transcriptFor(session),
+    resolveTranscript: (session) => sourceFor(session),
     sessionExists: () => true,
     initCrypto: async () => {},
     seal: async (plaintext) => ({ ciphertext: `sealed:${plaintext.length}` }),
@@ -109,6 +120,88 @@ describe('turn watch control', () => {
             { subtype: 'agent.turn.watch.error', sessionName: 'codex-session', error: 'no_transcript' },
         ]);
         expect(watchers.size()).toBe(0);
+    });
+
+    // On the phone a resolver that is broken and an agent that has no timeline
+    // produce the same sentence. The log is the only place the two are told
+    // apart, so the resolver's own account of the null has to reach it — this is
+    // the case the reason channel exists for: a row that HAS a resolver, whose
+    // path rule came back empty-handed.
+    it('logs the resolver\'s reason when a path rule finds nothing', () => {
+        const watchers = createTurnWatchers(
+            makeDeps({
+                resolveTranscript: (_session, onMiss) => {
+                    onMiss?.('pi resolver found no transcript under /tmp/proj');
+                    return null;
+                },
+            }),
+        );
+
+        watchers.handle(start('pi-session'), send);
+
+        expect(logs.filter((l) => l.includes('pi resolver found no transcript under /tmp/proj'))).toHaveLength(1);
+    });
+
+    // The other half of the same distinction: a row with no resolver at all is
+    // working as designed, and must not read like the broken case above.
+    it('says which branch refused when the agent has no resolver at all', () => {
+        const watchers = createTurnWatchers(
+            makeDeps({
+                resolveTranscript: (_session, onMiss) => {
+                    onMiss?.('gemini has no transcript resolver');
+                    return null;
+                },
+            }),
+        );
+
+        watchers.handle(start('gemini-session'), send);
+
+        const line = logs.find((l) => l.includes('gemini has no transcript resolver'));
+        expect(line).toContain('no transcript to watch');
+    });
+
+    // A watch that was reading a file a tick ago and now cannot is a loss, not
+    // an agent that never had a timeline. Reporting it with the same sentence
+    // as the never-had-one case is a false statement in the log.
+    it('distinguishes a transcript that disappeared from one that never existed', async () => {
+        let source: TranscriptSource | null = null;
+        const watchers = createTurnWatchers(makeDeps({ resolveTranscript: () => source }));
+        writeFileSync(transcriptFor('s1'), userPrompt('go'));
+        source = sourceFor('s1');
+        watchers.handle(start('s1'), send);
+        await watchers.tick('s1');
+
+        source = null;
+        watchers.handle(start('s1'), send);
+
+        expect(logs.some((l) => l.includes('the transcript this watch was following is gone'))).toBe(true);
+        expect(logs.some((l) => l.includes('no transcript to watch'))).toBe(false);
+    });
+
+    // Every tick re-resolves on its own cadence; logging there would turn one
+    // unsupported agent into a line every ten seconds for as long as the viewer
+    // keeps the tab open.
+    it('does not repeat the refusal log once a watch is running', async () => {
+        let path: string | null = transcriptFor('s1');
+        const watchers = createTurnWatchers(
+            makeDeps({
+                resolveTranscript: (_session, onMiss) => {
+                    if (path !== null) return { path, project: projectTranscriptEntries };
+                    onMiss?.('resolver found nothing');
+                    return null;
+                },
+            }),
+        );
+        writeFileSync(transcriptFor('s1'), userPrompt('go'));
+        watchers.handle(start('s1'), send);
+
+        path = null;
+        for (let i = 0; i < 3; i++) {
+            clock += TRANSCRIPT_RECHECK_MS;
+            await watchers.tick('s1');
+        }
+
+        expect(logs.filter((l) => l.includes('resolver found nothing'))).toHaveLength(0);
     });
 
     it('refuses past MAX_TURN_WATCHERS', () => {
@@ -603,7 +696,7 @@ describe('turn watch follows the session', () => {
         // `/clear` writes a file under a new name; the old one just stops growing,
         // so a watcher pinned to it goes quiet and looks like an idle agent.
         let target = 'before-clear';
-        const watchers = createTurnWatchers(makeDeps({ resolveTranscript: () => transcriptFor(target) }));
+        const watchers = createTurnWatchers(makeDeps({ resolveTranscript: () => sourceFor(target) }));
         writeFileSync(transcriptFor('before-clear'), userPrompt('old session'));
         writeFileSync(transcriptFor('after-clear'), userPrompt('new session') + toolUse('t9', 'Read', { file_path: '/after.ts' }));
 
@@ -620,13 +713,57 @@ describe('turn watch follows the session', () => {
         expect(logs.some((l) => l.includes('transcript rotated'))).toBe(true);
     });
 
+    // The watcher must know nothing about any one transcript format. Whatever
+    // projector the resolver names is the one that reads the bytes — that is
+    // the whole seam another agent hangs off.
+    it('reads the file with the projector its resolver named, not Claude\'s', async () => {
+        const seen: string[] = [];
+        const shouty: TranscriptProjector = (lines) => {
+            seen.push(...lines);
+            return [{ kind: 'text', text: 'from the other projector' }];
+        };
+        const watchers = createTurnWatchers(makeDeps({ resolveTranscript: (s) => sourceFor(s, shouty) }));
+        // Deliberately Claude-shaped, so a watcher that ignored the projector
+        // would still produce plausible events and this test would still catch it.
+        writeFileSync(transcriptFor('s1'), userPrompt('go') + toolUse('t1', 'Read', { file_path: '/x.ts' }));
+
+        watchers.handle(start('s1'), send);
+        await watchers.tick('s1');
+
+        expect(seen.length).toBeGreaterThan(0);
+        expect(deltas().flatMap((f) => f.events as TurnEvent[])).toEqual([
+            { kind: 'text', text: 'from the other projector' },
+        ]);
+    });
+
+    // A rotation can land on a file another agent wrote — a reused tmux name is
+    // enough. A watcher that followed the path but kept the old projector would
+    // read the new bytes with the wrong format's rules.
+    it('adopts the new projector when the transcript rotates, not just the new path', async () => {
+        let target = 'before';
+        let project: TranscriptProjector = projectTranscriptEntries;
+        const watchers = createTurnWatchers(makeDeps({ resolveTranscript: () => sourceFor(target, project) }));
+        writeFileSync(transcriptFor('before'), userPrompt('old'));
+        writeFileSync(transcriptFor('after'), userPrompt('new'));
+
+        watchers.handle(start('s1'), send);
+        await watchers.tick('s1');
+
+        target = 'after';
+        project = () => [{ kind: 'text', text: 'read by the rotated-in projector' }];
+        clock += TRANSCRIPT_RECHECK_MS;
+        await watchers.tick('s1');
+
+        expect(deltas().at(-1)!.events).toEqual([{ kind: 'text', text: 'read by the rotated-in projector' }]);
+    });
+
     it('does not re-resolve on every tick — the session registry is not free', async () => {
         let calls = 0;
         const watchers = createTurnWatchers(
             makeDeps({
                 resolveTranscript: (session) => {
                     calls += 1;
-                    return transcriptFor(session);
+                    return sourceFor(session);
                 },
             }),
         );
@@ -732,7 +869,7 @@ describe('turn watch — the scrollback the ring keeps', () => {
 
     it('replays nothing when the session starts writing a different transcript', async () => {
         let target = 'before-clear';
-        const watchers = createTurnWatchers(makeDeps({ resolveTranscript: () => transcriptFor(target) }));
+        const watchers = createTurnWatchers(makeDeps({ resolveTranscript: () => sourceFor(target) }));
         writeFileSync(transcriptFor('before-clear'), userPrompt('go') + toolUse('t1', 'Read', { file_path: '/old.ts' }));
         writeFileSync(transcriptFor('after-clear'), userPrompt('after clear') + toolUse('t2', 'Read', { file_path: '/new.ts' }));
         watchers.handle(start('s1'), send);

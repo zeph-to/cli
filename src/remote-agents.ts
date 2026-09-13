@@ -17,6 +17,7 @@ import { readdirSync, readFileSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { join, basename } from 'path';
 import { spawnSync } from 'child_process';
+import { projectTranscriptEntries, type TranscriptProjector } from './transcript-tail.js';
 
 export interface RemoteAgent {
     /** Wire value for AgentSession.agentKind (server/phone contract). */
@@ -67,9 +68,19 @@ export interface RemoteAgent {
      * carries this only once that agent's transcript format is confirmed, and a
      * pane whose agent omits it answers `no_transcript` rather than guessing.
      * That is the seam a second agent hangs off — the reader that parses the
-     * file is the other half, and lives beside this one.
+     * file is `projectTranscript` below.
      */
     resolveTranscript?: (paneCwd: string, panePid?: number) => string | null;
+    /**
+     * Read this agent's transcript lines into the events the timeline draws.
+     *
+     * Set with `resolveTranscript` or not at all — `remote-agents.test.ts`
+     * enforces the pair over the whole table. Half a pair is the one failure
+     * mode worth a test here: a path nothing can parse reaches the phone as an
+     * empty timeline, which reads as a hung agent, where the missing row would
+     * have said "no live timeline" and been true.
+     */
+    projectTranscript?: TranscriptProjector;
 }
 
 /**
@@ -715,6 +726,7 @@ const REMOTE_AGENT_TABLE = [
         resolveSessionName: (paneCwd, panePid) =>
             panePid !== undefined ? detectClaudeSessionNameByPid(panePid, paneCwd) : null,
         resolveTranscript: (paneCwd, panePid) => claudeTranscriptPath(paneCwd, panePid),
+        projectTranscript: projectTranscriptEntries,
     },
     {
         kind: 'codex',
