@@ -978,10 +978,10 @@ export const deriveSessionState = (
     };
 };
 
-/** Drop trackers for sessions gone from the inventory. */
-const pruneSessionStates = (liveNames: Set<string>): void => {
-    for (const name of sessionStates.keys()) {
-        if (!liveNames.has(name)) sessionStates.delete(name);
+/** Drop per-session entries for sessions gone from the inventory. */
+const pruneToLive = (bySession: Map<string, unknown>, liveNames: Set<string>): void => {
+    for (const name of bySession.keys()) {
+        if (!liveNames.has(name)) bySession.delete(name);
     }
 };
 
@@ -3238,12 +3238,6 @@ export interface CollectResult {
  */
 const subagentScans = new Map<string, SubagentScanState>();
 
-const pruneSubagentScans = (liveSessions: Set<string>): void => {
-    for (const name of subagentScans.keys()) {
-        if (!liveSessions.has(name)) subagentScans.delete(name);
-    }
-};
-
 /**
  * Inventory pass that also records *why* each `zeph-*` session was
  * skipped. The verbose log uses the rejection notes to explain empty
@@ -3446,8 +3440,8 @@ export const collectSessionsVerbose = (): CollectResult => {
             }
         }
     }
-    pruneSubagentScans(new Set(groups.keys()));
-    pruneSessionStates(new Set(sessions.map((s) => s.name)));
+    pruneToLive(subagentScans, new Set(groups.keys()));
+    pruneToLive(sessionStates, new Set(sessions.map((s) => s.name)));
     // Write down what each live session IS, while it still exists to be read.
     // tmux forgets a session the moment it ends, which is exactly when the
     // phone wants it back — and a resume must take its directory and its binary
