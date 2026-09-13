@@ -11,14 +11,20 @@ import { AGENT_SKILL_DIRS } from './agents.js';
  * An entry is the slash command itself, so it carries whatever prefix the agent
  * registers the skill under (`AGENT_SKILL_PREFIX`, plugin names for Claude Code).
  *
- * Names come from the directory, not from the file. Every skill on this machine
- * (132/132, measured 2026-09-13 across `~/.claude/skills` and every installed
- * plugin) declares a frontmatter `name` equal to its directory name, and the
- * agents themselves address a skill by that directory. Reading the file bought
- * a second copy of the same string — and cost a YAML parser this scanner is not
- * equipped to be: 42 of 43 user skills quote their description and one uses a
- * folded scalar, so a regex shipped the quotes and truncated to an unbalanced
- * one. The file is now opened for nothing but its own existence.
+ * Names come from the directory, not from the file — an ASSUMPTION, not a rule
+ * the agents enforce: pi resolves a skill's name as `frontmatter.name` and only
+ * falls back to the directory (`dist/core/skills.js:244`, pi 0.85.1), and its
+ * docs say so outright ("Pi allows skill names to differ from their parent
+ * directory"). It holds on every skill measured here — 132/132 under
+ * `~/.claude/skills` and the installed plugins (2026-09-13), 12/12 under
+ * `~/.agents/skills` (2026-09-13) — and a skill that breaks it shows the user a
+ * command that does not run, which is the same as not listing it.
+ *
+ * Reading the file would buy the real name, and cost a YAML parser this scanner
+ * is not equipped to be: 42 of 43 user skills quote their description and one
+ * uses a folded scalar, so the regex this replaced shipped the quotes and
+ * truncated to an unbalanced one. The file is opened for nothing but its own
+ * existence until a divergent skill is actually measured.
  */
 
 export interface AgentCommandEntry {
@@ -30,14 +36,18 @@ export interface AgentCommandEntry {
  * What each agent registers its skills as. The catalog exists to be typed into
  * the agent, so it carries the invocation token, not the bare directory name.
  *
- * pi registers `skill:<name>` (`docs/skills.md § Slash Commands`, and
- * `` `skill:${skill.name}` `` in its bundle, pi 0.85.1) — `/01-plan` aborts.
+ * pi registers `skill:<name>` (`docs/skills.md § Skill Commands`, and
+ * `` `skill:${skill.name}` `` in its bundle, pi 0.85.1); typing `/01-plan` in a
+ * pi session was observed to abort rather than run the skill (2026-09-13).
  * Claude Code's user skills are `/<name>`; its PLUGIN skills are
  * `/<plugin>:<name>`, so those get their prefix from the install entry instead.
  */
 const AGENT_SKILL_PREFIX: Record<string, string> = {
     pi: 'skill:',
 };
+
+/** Agents that register skills filed under grouping folders — see `scanSkillDir`. */
+const AGENT_SKILL_RECURSIVE = new Set(['pi']);
 
 /** agentKind -> skill entries; agents with no skills are omitted. */
 export type AgentCommandCatalog = Record<string, AgentCommandEntry[]>;
@@ -54,7 +64,7 @@ export interface ScanResult {
 /**
  * True when `<dir>/SKILL.md` is a readable file. This is the whole membership
  * test: it rejects non-skill directories, and it rejects dangling symlinks
- * (`~/.pi/skills` had three) because the stat resolves through the link.
+ * (`~/.agents/skills` had three) because the stat resolves through the link.
  */
 const isSkillDir = (dir: string): boolean => {
     try {
@@ -64,14 +74,58 @@ const isSkillDir = (dir: string): boolean => {
     }
 };
 
-const scanSkillDir = (dir: string): string[] => {
-    let names: string[];
+/** A directory that is simply not there is not an error — every other one is. */
+const isMissing = (err: unknown): boolean => {
+    const code = (err as { code?: string })?.code;
+    return code === 'ENOENT' || code === 'ENOTDIR';
+};
+
+/**
+ * Directory entries, or none when the directory does not exist.
+ *
+ * Anything else — EACCES on a mode-000 skills dir, EIO on a stale network mount
+ * — is rethrown rather than read as "no skills". Swallowing it would report an
+ * empty catalog and blank the phone's menu, which is precisely the outcome the
+ * listener's try/catch keeps the previous catalog to avoid.
+ */
+const entriesOf = (dir: string): string[] => {
     try {
-        names = readdirSync(dir);
-    } catch {
-        return [];
+        return readdirSync(dir);
+    } catch (err) {
+        if (isMissing(err)) return [];
+        throw err;
     }
-    return names.filter((name) => isSkillDir(join(dir, name)));
+};
+
+/**
+ * How deep below a skills root a `SKILL.md` is still found. pi walks the tree
+ * (`loadSkillsFromDirInternal`, `dist/core/skills.js:160`), so a skill filed
+ * under a grouping folder is real to it; two levels covers the grouping folders
+ * its docs describe without turning a stray checkout into a scan of the disk.
+ */
+const MAX_SKILL_DEPTH = 3;
+
+/**
+ * Skill directory names under `dir`. A directory holding `SKILL.md` IS the
+ * skill and is not descended into — that is pi's own rule, and it keeps a
+ * skill's bundled fixtures from being read as more skills.
+ *
+ * `recursive` mirrors the agent: pi groups skills in folders, while Claude Code
+ * registers exactly `~/.claude/skills/<name>` — descending there would invent
+ * commands out of directories it holds but does not register (`_shared/`).
+ */
+const scanSkillDir = (dir: string, recursive = false, depth = 1): string[] => {
+    const names: string[] = [];
+    for (const entry of entriesOf(dir)) {
+        if (entry.startsWith('.') || entry === 'node_modules') continue;
+        const child = join(dir, entry);
+        if (isSkillDir(child)) {
+            names.push(entry);
+        } else if (recursive && depth < MAX_SKILL_DEPTH) {
+            names.push(...scanSkillDir(child, true, depth + 1));
+        }
+    }
+    return names;
 };
 
 /**
@@ -103,16 +157,20 @@ const scanClaudePlugins = (home: string): string[] => {
 const payloadBytes = (catalog: AgentCommandCatalog): number => Buffer.byteLength(JSON.stringify(catalog), 'utf-8');
 
 /**
- * Scan every agent's skill directories into one catalog. Per-agent failures
- * degrade to no entries; the caller keeps its previous catalog when the scan as
- * a whole throws. Dedup is within each agentKind only — the same skill
- * installed for claude and pi legitimately appears in both.
+ * Scan every agent's skill directories into one catalog. A directory that is
+ * absent contributes nothing; a directory that exists and cannot be read throws,
+ * and the caller keeps its previous catalog rather than publishing an empty one.
+ * Dedup is within each agentKind only — the same skill installed for claude and
+ * pi legitimately appears in both.
  */
 export const scanAgentCommands = (homeDir: string): ScanResult => {
     const catalog: AgentCommandCatalog = {};
     for (const [agentId, dirs] of Object.entries(AGENT_SKILL_DIRS)) {
         const prefix = AGENT_SKILL_PREFIX[agentId] ?? '';
-        const names = dirs.flatMap((dir) => scanSkillDir(join(homeDir, dir)).map((name) => `${prefix}${name}`));
+        const recursive = AGENT_SKILL_RECURSIVE.has(agentId);
+        const names = dirs.flatMap((dir) =>
+            scanSkillDir(join(homeDir, dir), recursive).map((name) => `${prefix}${name}`),
+        );
         if (agentId === 'claude') names.push(...scanClaudePlugins(homeDir));
         const merged = [...new Set(names)].map((name) => ({ name }));
         if (merged.length > 0) catalog[agentId] = merged;

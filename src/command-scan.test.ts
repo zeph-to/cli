@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -60,9 +60,54 @@ describe('scanAgentCommands', () => {
     });
 
     it('drops dangling symlinks', () => {
+        // A real skill sits beside the ghost: asserting an empty pi list alone
+        // would also pass with pi not scanned at all, which is the regression
+        // that put this whole file here.
+        const real = join(home, 'real-skill');
+        mkdirSync(real);
+        writeFileSync(join(real, 'SKILL.md'), 'body');
         mkdirSync(join(home, '.agents', 'skills'), { recursive: true });
+        symlinkSync(real, join(home, '.agents', 'skills', 'alive'));
         symlinkSync(join(home, 'nowhere'), join(home, '.agents', 'skills', 'ghost'));
-        expect(names(scanAgentCommands(home).catalog.pi)).toEqual([]);
+        expect(names(scanAgentCommands(home).catalog.pi)).toEqual(['skill:alive']);
+    });
+
+    it('finds a pi skill filed under a grouping folder', () => {
+        // pi walks the tree (`loadSkillsFromDirInternal`, dist/core/skills.js),
+        // so a skill two levels down is real to it and must be listed.
+        skill(join(home, '.agents', 'skills', 'group'), 'nested');
+        expect(names(scanAgentCommands(home).catalog.pi)).toEqual(['skill:nested']);
+    });
+
+    it('does not descend into a skill dir, or below the depth cap', () => {
+        // A skill's own fixtures are not more skills, and nothing arbitrarily
+        // deep is a skill either.
+        skill(join(home, '.agents', 'skills'), 'outer');
+        skill(join(home, '.agents', 'skills', 'outer', 'examples'), 'inner');
+        skill(join(home, '.agents', 'skills', 'a', 'b', 'c'), 'too-deep');
+        expect(names(scanAgentCommands(home).catalog.pi)).toEqual(['skill:outer']);
+    });
+
+    it('does not descend for claude — only registered skill dirs count', () => {
+        // `~/.claude/skills/_shared` holds directories Claude Code does not
+        // register; recursing there would invent commands that do not run.
+        skill(join(home, '.claude', 'skills', '_shared'), 'helper');
+        skill(join(home, '.claude', 'skills'), 'real');
+        expect(names(scanAgentCommands(home).catalog.claude)).toEqual(['real']);
+    });
+
+    it('throws rather than report an empty catalog when a dir cannot be read', () => {
+        // An unreadable skills dir is not "no skills": reporting empty would
+        // blank the phone's menu. The listener keeps its previous catalog when
+        // this throws.
+        const dir = join(home, '.claude', 'skills');
+        skill(dir, 'present');
+        chmodSync(dir, 0o000);
+        try {
+            expect(() => scanAgentCommands(home)).toThrow();
+        } finally {
+            chmodSync(dir, 0o700);
+        }
     });
 
     it('scans both of pi global skill dirs, not its project dir', () => {
