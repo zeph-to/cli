@@ -8,14 +8,22 @@ import { join } from 'path';
 // they're detected.
 
 /**
- * Per-agent skill directories, keyed by the same `id` used in `detectAgents`.
- * Scan targets for `command-scan.ts` — keep next to the detection table so the
- * two can never disagree about which agents exist.
+ * Per-agent GLOBAL skill directories, keyed by the same `id` used in
+ * `detectAgents`. Scan targets for `command-scan.ts` — keep next to the
+ * detection table so the two can never disagree about which agents exist.
+ *
+ * Global only: project-level dirs depend on a session's cwd, and the catalog is
+ * device-level (one scan per listener, shared by every session on the machine).
+ *
+ * pi's two entries come from its own docs (`docs/skills.md § Locations`,
+ * pi 0.85.1): global is `~/.pi/agent/skills/` and `~/.agents/skills/`, while
+ * `.pi/skills/` is the PROJECT dir — scanning `~/.pi/skills` found only three
+ * dangling symlinks and reported pi as having no skills at all.
  */
 export const AGENT_SKILL_DIRS: Record<string, string[]> = {
     claude: ['.claude/skills'],
     codex: ['.codex/skills'],
-    pi: ['.pi/skills'],
+    pi: ['.pi/agent/skills', '.agents/skills'],
 };
 
 export interface Agent {

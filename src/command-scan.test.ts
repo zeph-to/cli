@@ -7,7 +7,7 @@ import { PAYLOAD_LIMIT_BYTES, scanAgentCommands } from './command-scan.js';
 // Fixture tree mirrors the real skill layouts measured 2026-09-12:
 //   ~/.claude/skills/<name>/SKILL.md
 //   ~/.claude/plugins/installed_plugins.json -> installPath/skills/*/SKILL.md
-//   ~/.pi/skills/<name> -> symlink (some dangling)
+//   ~/.agents/skills/<name> -> symlink (some dangling)
 // Nothing here touches the real home directory; `homeDir` is injected.
 //
 // The catalog carries names only, and a skill's name is its directory name, so
@@ -53,15 +53,26 @@ describe('scanAgentCommands', () => {
         const real = join(home, 'real-skill');
         mkdirSync(real);
         writeFileSync(join(real, 'SKILL.md'), 'body');
-        mkdirSync(join(home, '.pi', 'skills'), { recursive: true });
-        symlinkSync(real, join(home, '.pi', 'skills', 'pi-skill'));
+        mkdirSync(join(home, '.agents', 'skills'), { recursive: true });
+        symlinkSync(real, join(home, '.agents', 'skills', 'pi-skill'));
         expect(names(scanAgentCommands(home).catalog.pi)).toEqual(['pi-skill']);
     });
 
     it('drops dangling symlinks', () => {
-        mkdirSync(join(home, '.pi', 'skills'), { recursive: true });
-        symlinkSync(join(home, 'nowhere'), join(home, '.pi', 'skills', 'ghost'));
+        mkdirSync(join(home, '.agents', 'skills'), { recursive: true });
+        symlinkSync(join(home, 'nowhere'), join(home, '.agents', 'skills', 'ghost'));
         expect(names(scanAgentCommands(home).catalog.pi)).toEqual([]);
+    });
+
+    it('scans both of pi global skill dirs, not its project dir', () => {
+        // pi 0.85.1 `docs/skills.md § Locations`: global = `~/.pi/agent/skills`
+        // + `~/.agents/skills`; `.pi/skills` is the PROJECT dir, and scanning it
+        // as if it were global reported pi as having no skills on this machine.
+        skill(join(home, '.pi', 'agent', 'skills'), 'from-pi-agent');
+        skill(join(home, '.agents', 'skills'), 'from-agents');
+        skill(join(home, '.pi', 'skills'), 'project-only');
+        const found = names(scanAgentCommands(home).catalog.pi).sort();
+        expect(found).toEqual(['from-agents', 'from-pi-agent']);
     });
 
     it('skips directories with no SKILL.md', () => {
@@ -139,8 +150,8 @@ describe('scanAgentCommands', () => {
         const piReal = join(home, 'pi-shared');
         mkdirSync(piReal);
         writeFileSync(join(piReal, 'SKILL.md'), 'body');
-        mkdirSync(join(home, '.pi', 'skills'), { recursive: true });
-        symlinkSync(piReal, join(home, '.pi', 'skills', 'shared'));
+        mkdirSync(join(home, '.agents', 'skills'), { recursive: true });
+        symlinkSync(piReal, join(home, '.agents', 'skills', 'shared'));
         const { catalog } = scanAgentCommands(home);
         expect(names(catalog.claude)).toEqual(['shared']);
         expect(names(catalog.pi)).toEqual(['shared']);
