@@ -415,7 +415,13 @@ const lineChangesOf = (name: string, input: unknown): { add?: number; del?: numb
 };
 
 /** Lines of a result's text — a string, or the text blocks of a block list. Images and the like count as nothing. */
-const resultLinesOf = (content: unknown): number => {
+/**
+ * How long a tool result was, from either shape a result body takes: a bare
+ * string, or blocks with a `text` field. Exported for the same reason as
+ * `clamp` — the shape is not one agent's vocabulary, and `lines` means the same
+ * number on the wire whoever produced it.
+ */
+export const resultLinesOf = (content: unknown): number => {
     if (typeof content === 'string') return countLines(content);
     if (!Array.isArray(content)) return 0;
     let lines = 0;
@@ -427,7 +433,10 @@ const resultLinesOf = (content: unknown): number => {
     return lines;
 };
 
-const num = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0);
+/** A usable number, or 0 — token counts are the one place a missing field must not become `NaN` on the wire. */
+export const finiteNumber = (value: unknown): number =>
+    typeof value === 'number' && Number.isFinite(value) ? value : 0;
+
 
 /** The `msg` for an assistant entry, or null when it carries no usable usage. */
 const messageMetaOf = (entry: Record<string, unknown>, at: string | undefined): Extract<TurnEvent, { kind: 'msg' }> | null => {
@@ -446,8 +455,8 @@ const messageMetaOf = (entry: Record<string, unknown>, at: string | undefined): 
         kind: 'msg',
         mid: clamp(mid),
         ...(model ? { model: clamp(model) } : {}),
-        out: num(u.output_tokens),
-        ctx: num(u.input_tokens) + num(u.cache_read_input_tokens) + num(u.cache_creation_input_tokens),
+        out: finiteNumber(u.output_tokens),
+        ctx: finiteNumber(u.input_tokens) + finiteNumber(u.cache_read_input_tokens) + finiteNumber(u.cache_creation_input_tokens),
         ...(at ? { at } : {}),
     };
 };

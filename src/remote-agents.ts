@@ -15,9 +15,10 @@
  */
 import { readdirSync, readFileSync, statSync } from 'fs';
 import { homedir } from 'os';
-import { join, basename } from 'path';
+import { join, basename, resolve } from 'path';
 import { spawnSync } from 'child_process';
 import { projectTranscriptEntries, type TranscriptProjector } from './transcript-tail.js';
+import { projectPiEntries } from './pi-transcript.js';
 
 export interface RemoteAgent {
     /** Wire value for AgentSession.agentKind (server/phone contract). */
@@ -497,6 +498,110 @@ export const claudeTranscriptPath = (paneCwd: string | null, panePid?: number): 
     }
 };
 
+// ── pi ───────────────────────────────────────────────────────────
+
+/**
+ * Where pi keeps its sessions, honouring the override pi itself honours.
+ *
+ * `getAgentDir()` (`…/pi-coding-agent/dist/config.js:421-426`) reads
+ * `PI_CODING_AGENT_DIR` — named `${APP_NAME.toUpperCase()}_CODING_AGENT_DIR` at
+ * `config.js:406` — and expands a leading `~` before falling back to
+ * `~/.pi/agent`. Hardcoding the fallback would answer `null` for every session
+ * belonging to anyone who sets it, and answer it silently.
+ *
+ * Read per call rather than at module load: the listener is long-lived, and a
+ * constant captured at import time is a constant captured before the service
+ * environment is in place.
+ */
+const piSessionsDir = (): string => {
+    const override = process.env.PI_CODING_AGENT_DIR;
+    const agentDir = override
+        ? override.replace(/^~(?=\/|$)/, homedir())
+        : join(homedir(), '.pi', 'agent');
+    return join(agentDir, 'sessions');
+};
+
+/**
+ * pi's own encoding of a cwd into one directory name, copied from the writer
+ * rather than inferred from the directories it produced.
+ *
+ * Read 2026-09-14 out of `@earendil-works/pi-coding-agent`,
+ * `dist/core/session-manager.js:245` (`getDefaultSessionDirPath`), which
+ * `dist/migrations.js:102` repeats verbatim:
+ *
+ *     `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`
+ *
+ * Worth copying exactly rather than eyeballing, because it differs from Claude's
+ * on the case that matters: Claude maps `.` to `-` as well, pi does not. A
+ * directory with a dot in it resolves under one rule and not the other, and the
+ * failure is silent — a watcher polling a path that never existed.
+ *
+ * The `resolvePath(cwd)` on the line above that regex is part of the rule, not
+ * preamble: `dist/utils/paths.js:82-86` expands a leading `~` and then runs
+ * `path.resolve`. Encoding the raw string instead turns a trailing slash into a
+ * doubled separator (`--a-b---`) and leaves `.`/`..` segments in the directory
+ * name, both of which resolve to a path pi has never written.
+ */
+const piSessionDirName = (cwd: string): string => {
+    const expanded = cwd.replace(/^~(?=\/|$)/, homedir());
+    const resolved = resolve(expanded);
+    return `--${resolved.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
+};
+
+/**
+ * Newest session file pi wrote for this directory.
+ *
+ * Same 60s TTL and the same reason as `claudeSessionCache`: `turn-watch`
+ * re-resolves every 10s per watcher, and a directory a person has run pi in for
+ * months holds one file per run.
+ *
+ * Keyed on the pane's pid as well as its cwd, so a pi that was restarted in the
+ * same directory is not followed on the previous run's file for the rest of the
+ * TTL. Within one pid the answer genuinely cannot change: pi writes one
+ * transcript per process, and `/clear` inside it keeps writing to that file.
+ */
+const piSessionCache = keyedTtlCache<string, string | null>(60_000);
+
+const doDetectPiTranscript = (cwd: string): string | null => {
+    try {
+        const sessionDir = join(piSessionsDir(), piSessionDirName(cwd));
+        let latest: { path: string; mtime: number } | undefined;
+        for (const entry of readdirSync(sessionDir)) {
+            // `<ISO timestamp>_<uuid>.jsonl`, beside a `.jsonl.loadout.json`
+            // sidecar per session that is not a transcript.
+            if (!entry.endsWith('.jsonl')) continue;
+            const path = join(sessionDir, entry);
+            const stat = statSync(path);
+            if (!stat.isFile()) continue;
+            if (!latest || stat.mtimeMs > latest.mtime) latest = { path, mtime: stat.mtimeMs };
+        }
+        return latest?.path ?? null;
+    } catch {
+        return null;
+    }
+};
+
+/**
+ * The transcript a pi pane is writing, or null when there is none to follow.
+ *
+ * Newest-by-mtime within the directory. pi keeps no pid→session record the way
+ * Claude Code does, so `panePid` cannot pick between two pi panes sharing a
+ * directory — both resolve to the newer session's file. That is the known limit
+ * of this resolver, and it is the same shape as Claude's mtime fallback.
+ *
+ * `panePid` still matters, as the cache key: a restart in the same directory
+ * writes a new file, and a cwd-only key would keep answering with the old one
+ * until the TTL ran out.
+ */
+export const piTranscriptPath = (paneCwd: string | null, panePid?: number): string | null => {
+    if (!paneCwd) return null;
+    // `|` is safe as the separator because the left half is always numeric.
+    const key = `${panePid ?? 0}|${paneCwd}`;
+    const cached = piSessionCache.get(key);
+    if (cached) return cached.value;
+    return piSessionCache.set(key, doDetectPiTranscript(paneCwd));
+};
+
 // ── Agents whose session store keeps no pid ──────────────────────
 //
 // Hermes and Codex both record a session per cwd with a creation timestamp and
@@ -773,6 +878,8 @@ const REMOTE_AGENT_TABLE = [
         displayName: 'Pi',
         binary: 'pi',
         subcommands: ['pi'],
+        resolveTranscript: (paneCwd, panePid) => piTranscriptPath(paneCwd, panePid),
+        projectTranscript: projectPiEntries,
     },
     {
         kind: 'opencode',

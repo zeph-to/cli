@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -390,5 +390,138 @@ describe('detectClaudeSessionNameByPid', () => {
         expect(detectClaudeSessionNameByPid(90, '/proj', {
             records: blank, descendants: new Set([90, 100]),
         })).toBeNull();
+    });
+});
+
+// ── piTranscriptPath ─────────────────────────────────────────────
+
+/**
+ * The encoding here is not ours and was not guessed. It is copied from pi's own
+ * writer, `@earendil-works/pi-coding-agent/dist/core/session-manager.js:245`
+ * (`getDefaultSessionDirPath`), read 2026-09-14:
+ *
+ *     `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`
+ *
+ * The dot case is why that matters. Claude Code maps `.` to `-` as well; pi does
+ * not. Inferring pi's rule from Claude's would resolve every dotted directory to
+ * a path that has never existed, and the watcher would poll it forever without
+ * ever saying why.
+ */
+describe('remote-agents.ts: piTranscriptPath', () => {
+    const piDirFor = (encoded: string) => join(TMP, '.pi', 'agent', 'sessions', encoded);
+
+    const writeSession = (encoded: string, file: string, at?: Date) => {
+        const dir = piDirFor(encoded);
+        mkdirSync(dir, { recursive: true });
+        const path = join(dir, file);
+        writeFileSync(path, '{"type":"session","version":3}\n');
+        if (at) utimesSync(path, at, at);
+        return path;
+    };
+
+    it.each([
+        ['/Users/tak/projects/app', '--Users-tak-projects-app--'],
+        // The case Claude's encoder would get wrong: pi keeps the dot.
+        ['/Users/tak/.config/thing', '--Users-tak-.config-thing--'],
+        ['/Users/tak/repo.git/sub', '--Users-tak-repo.git-sub--'],
+        // A path segment that already starts with a dash — the encoding is not
+        // reversible, and does not need to be.
+        ['/private/tmp/x/-Users-y/scratch', '--private-tmp-x--Users-y-scratch--'],
+    ])('encodes %s the way pi encodes it', async (cwd, encoded) => {
+        const { piTranscriptPath } = await import('./remote-agents.js');
+        const expected = writeSession(encoded, '2026-09-14T00-00-00-000Z_01a079a7.jsonl');
+
+        expect(piTranscriptPath(cwd)).toBe(expected);
+    });
+
+    it('takes the most recently written session in the directory', async () => {
+        const { piTranscriptPath } = await import('./remote-agents.js');
+        const encoded = '--Users-tak-projects-app--';
+        const past = new Date(Date.now() - 60_000);
+        writeSession(encoded, '2026-09-01T00-00-00-000Z_old.jsonl', past);
+        const newest = writeSession(encoded, '2026-09-14T00-00-00-000Z_new.jsonl');
+
+        expect(piTranscriptPath('/Users/tak/projects/app')).toBe(newest);
+    });
+
+    it('ignores the loadout sidecar pi writes beside every session', async () => {
+        const { piTranscriptPath } = await import('./remote-agents.js');
+        const encoded = '--Users-tak-projects-app--';
+        const transcript = writeSession(encoded, '2026-09-14T00-00-00-000Z_s.jsonl', new Date(Date.now() - 60_000));
+        writeSession(encoded, '2026-09-14T00-00-00-000Z_s.jsonl.loadout.json');
+
+        expect(piTranscriptPath('/Users/tak/projects/app')).toBe(transcript);
+    });
+
+    // pi encodes `resolvePath(cwd)`, not the raw string
+    // (`…/pi-coding-agent/dist/core/session-manager.js:243-245` + `utils/paths.js:82-86`).
+    // Encoding the raw string turns a trailing slash into `--a-b---` and leaves
+    // `..` in the directory name, both of which are paths pi never wrote.
+    it.each([
+        ['/Users/tak/projects/app/', 'a trailing slash'],
+        ['/Users/tak/projects/./app', 'a dot segment'],
+        ['/Users/tak/projects/other/../app', 'a parent segment'],
+        ['/Users/tak//projects/app', 'a doubled separator'],
+    ])('normalizes %s (%s) the way pi does before encoding', async (cwd) => {
+        const { piTranscriptPath } = await import('./remote-agents.js');
+        const expected = writeSession('--Users-tak-projects-app--', '2026-09-14T00-00-00-000Z_s.jsonl');
+
+        expect(piTranscriptPath(cwd)).toBe(expected);
+    });
+
+    // `turn-watch` re-resolves every TRANSCRIPT_RECHECK_MS per watcher, and a
+    // directory someone has run pi in for months holds one file per run.
+    it('does not re-scan the directory for the same pane', async () => {
+        const { piTranscriptPath } = await import('./remote-agents.js');
+        const dir = piDirFor('--Users-tak-projects-app--');
+        const path = writeSession('--Users-tak-projects-app--', '2026-09-14T00-00-00-000Z_s.jsonl');
+
+        expect(piTranscriptPath('/Users/tak/projects/app', 4242)).toBe(path);
+
+        // The directory is gone; only a cached answer can still name the file.
+        // Proving it this way rather than by spying on `readdirSync`, which the
+        // module binds at import and a namespace spy never reaches.
+        rmSync(dir, { recursive: true, force: true });
+        expect(piTranscriptPath('/Users/tak/projects/app', 4242)).toBe(path);
+    });
+
+    // A pi that was restarted in the same directory writes a new file. Keyed on
+    // cwd alone, the watch would follow the dead session's transcript for the
+    // rest of the TTL — far longer than the 10s recheck that should have caught it.
+    it('resolves again when the pane is a different process', async () => {
+        const { piTranscriptPath } = await import('./remote-agents.js');
+        const encoded = '--Users-tak-projects-app--';
+        const first = writeSession(encoded, '2026-09-14T00-00-00-000Z_old.jsonl', new Date(Date.now() - 60_000));
+
+        expect(piTranscriptPath('/Users/tak/projects/app', 1111)).toBe(first);
+
+        const restarted = writeSession(encoded, '2026-09-14T01-00-00-000Z_new.jsonl');
+        expect(piTranscriptPath('/Users/tak/projects/app', 1111)).toBe(first);
+        expect(piTranscriptPath('/Users/tak/projects/app', 2222)).toBe(restarted);
+    });
+
+    // pi reads PI_CODING_AGENT_DIR before falling back to ~/.pi/agent
+    // (`…/pi-coding-agent/dist/config.js:406,421-426`).
+    it('follows PI_CODING_AGENT_DIR, the override pi itself honours', async () => {
+        const { piTranscriptPath } = await import('./remote-agents.js');
+        const elsewhere = join(TMP, 'custom-agent-dir');
+        process.env.PI_CODING_AGENT_DIR = elsewhere;
+        try {
+            const dir = join(elsewhere, 'sessions', '--Users-tak-projects-app--');
+            mkdirSync(dir, { recursive: true });
+            const path = join(dir, '2026-09-14T00-00-00-000Z_s.jsonl');
+            writeFileSync(path, '{"type":"session","version":3}\n');
+
+            expect(piTranscriptPath('/Users/tak/projects/app')).toBe(path);
+        } finally {
+            delete process.env.PI_CODING_AGENT_DIR;
+        }
+    });
+
+    it('answers null for a directory pi has never run in, and for no cwd at all', async () => {
+        const { piTranscriptPath } = await import('./remote-agents.js');
+
+        expect(piTranscriptPath('/nowhere/pi/has/been')).toBeNull();
+        expect(piTranscriptPath(null)).toBeNull();
     });
 });
