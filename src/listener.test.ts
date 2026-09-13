@@ -12,6 +12,10 @@ import {
     resolveKeys,
     sessionsFingerprint,
     sessionsReportDue,
+    COMMAND_SCAN_INTERVAL_MS,
+    SESSION_REPORT_INTERVAL_MS,
+    commandsFingerprint,
+    commandsReportDue,
     SESSION_REPORT_HEARTBEAT_MS,
     gcAttachments,
     computeBackoff,
@@ -1210,5 +1214,29 @@ describe('sessions report gate (idle-cost throttle)', () => {
 
     it('first report of a connection (no fingerprint yet) always sends', () => {
         expect(sessionsReportDue('fp', null, 0, 1)).toBe(true);
+    });
+});
+
+describe('commandsReportDue', () => {
+    it('first catalog of a connection always sends', () => {
+        expect(commandsReportDue('fp', null)).toBe(true);
+    });
+    it('unchanged catalog is not re-sent', () => {
+        expect(commandsReportDue('fp', 'fp')).toBe(false);
+    });
+    it('changed catalog sends', () => {
+        expect(commandsReportDue('fp-new', 'fp-old')).toBe(true);
+    });
+    it('catalog fingerprint reflects skill changes', () => {
+        const before = commandsFingerprint({ claude: [{ name: 'a', description: 'x' }] });
+        const after = commandsFingerprint({ claude: [{ name: 'a', description: 'y' }] });
+        expect(before).not.toBe(after);
+        expect(commandsFingerprint({ claude: [{ name: 'a', description: 'x' }] })).toBe(before);
+    });
+});
+
+describe('command scan cadence', () => {
+    it('does not share the 5 s session-poll cycle (filesystem reads stay out of it)', () => {
+        expect(COMMAND_SCAN_INTERVAL_MS).toBeGreaterThan(SESSION_REPORT_INTERVAL_MS);
     });
 });

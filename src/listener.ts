@@ -68,6 +68,7 @@ import { createTurnWatchers, type TurnWatchControl } from './turn-watch.js';
 import { diskTurnRing } from './turn-ring.js';
 import { createInputSequencer, type InputSequencer, type SequencedInput } from './input-sequencer.js';
 import { startKeepAwake } from './keep-awake.js';
+import { scanAgentCommands, type AgentCommandCatalog } from './command-scan.js';
 
 const PING_INTERVAL_MS = 25_000;
 const PONG_TIMEOUT_MS = 10_000;
@@ -90,7 +91,7 @@ const WS_STALL_TIMEOUT_MS = 90_000;
 // How often the listener POLLS its local tmux session inventory (and
 // immediately on $connect). Cheap — tmux runs locally, so a change is
 // still detected (and sent) within a few seconds.
-const SESSION_REPORT_INTERVAL_MS = 5_000;
+export const SESSION_REPORT_INTERVAL_MS = 5_000;
 
 // How often an UNCHANGED inventory is re-sent. Every send costs the
 // backend a Lambda invocation + several DynamoDB reads + a WS round
@@ -229,6 +230,21 @@ export const sessionsReportDue = (
 ): boolean =>
     fingerprint !== lastSentFingerprint ||
     nowMs - lastSentAtMs >= SESSION_REPORT_HEARTBEAT_MS;
+
+/** How often the skill catalog is rescanned for changes. Deliberately far
+ *  slower than the session poll: this cycle reads the filesystem, and the
+ *  5 s session loop must never do that. */
+export const COMMAND_SCAN_INTERVAL_MS = 60_000;
+
+export const commandsFingerprint = (catalog: AgentCommandCatalog): string =>
+    JSON.stringify(catalog);
+
+/** Skill catalogs have no idle heartbeat — the server persists them, so an
+ *  unchanged machine has nothing to say until a skill is installed or removed. */
+export const commandsReportDue = (
+    fingerprint: string,
+    lastSentFingerprint: string | null,
+): boolean => fingerprint !== lastSentFingerprint;
 
 // Per-session token bucket — caps a runaway/compromised sender.
 //
@@ -3936,6 +3952,7 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
             if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; }
             if (sessionsTimer) { clearInterval(sessionsTimer); sessionsTimer = null; }
+            if (commandsTimer) { clearInterval(commandsTimer); commandsTimer = null; }
             if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
             if (stallTimer) { clearInterval(stallTimer); stallTimer = null; }
         };
@@ -3955,6 +3972,29 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
         // nothing, or another listener's stale data, for this device).
         let lastSentFingerprint: string | null = null;
         let lastSentAtMs = 0;
+
+        // Skill catalog (listener.commands): sent on connect, then only when a
+        // rescan changes it. The rescan has its own slow timer — it reads the
+        // filesystem, so it must never ride the 5 s session loop.
+        let lastCommandsFingerprint: string | null = null;
+        let commandsTimer: ReturnType<typeof setInterval> | null = null;
+        const reportCommands = (): void => {
+            if (sock.readyState !== WebSocket.OPEN) return;
+            let catalog: AgentCommandCatalog;
+            try {
+                catalog = scanAgentCommands(homedir());
+            } catch (err) {
+                // A failed scan keeps the previous catalog — an empty one sent
+                // quietly would wipe the phone's menu until the next success.
+                log(`! skill scan failed, keeping previous catalog: ${err instanceof Error ? err.message : String(err)}`);
+                return;
+            }
+            const fingerprint = commandsFingerprint(catalog);
+            if (!commandsReportDue(fingerprint, lastCommandsFingerprint)) return;
+            sock.send(JSON.stringify({ type: 'listener.commands', data: { commands: catalog } }));
+            lastCommandsFingerprint = fingerprint;
+            log(`reported skill catalog: ${Object.entries(catalog).map(([k, v]) => `${k}:${v.length}`).join(', ') || '∅'}`);
+        };
 
         let sweepInFlight = false;
         const reportSessions = async (): Promise<void> => {
@@ -4047,6 +4087,8 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             // show as soon as the listener comes online.
             void reportSessions();
             sessionsTimer = setInterval(() => void reportSessions(), SESSION_REPORT_INTERVAL_MS);
+            void reportCommands();
+            commandsTimer = setInterval(reportCommands, COMMAND_SCAN_INTERVAL_MS);
 
             pingTimer = setInterval(() => {
                 if (sock.readyState !== WebSocket.OPEN) return;
