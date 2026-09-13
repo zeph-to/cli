@@ -10,6 +10,7 @@ import {
     SUBAGENT_WORKING_MS,
     initialSubagentScanState,
     scanSubagents,
+    subagentDirFor,
 } from './subagent-transcripts.js';
 
 const NOW = Date.UTC(2026, 8, 13, 12, 0, 0);
@@ -23,7 +24,9 @@ const projectFixture = (): { parentPath: string; subagentDir: string } => {
     const sessionId = '962a64bb-b1bd-4a4c-9ce5-d4bab12e1567';
     const parentPath = join(root, `${sessionId}.jsonl`);
     writeFileSync(parentPath, '');
-    return { parentPath, subagentDir: join(root, sessionId, 'subagents') };
+    // Through the module's own resolver: a fixture that spells the layout out
+    // again would keep passing after the scanner started looking elsewhere.
+    return { parentPath, subagentDir: subagentDirFor(parentPath) };
 };
 
 /** One `agent-<id>.jsonl` aged `ageMs` before NOW, plus the sidecar that names it. */
