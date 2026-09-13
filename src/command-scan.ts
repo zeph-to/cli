@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync, statSync } from 'fs';
+import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { AGENT_SKILL_DIRS } from './agents.js';
 
@@ -30,13 +30,21 @@ const PAYLOAD_LIMIT_BYTES = 64 * 1024;
  * parseable frontmatter.
  */
 export const parseSkillFrontmatter = (skillMdPath: string): AgentCommandEntry | null => {
-    let fd: ReturnType<typeof readFileSync>;
+    // Bounded read — 4KB is all the parser needs and skill bodies run large;
+    // reading whole files × every skill × every scan cycle is pure waste.
+    let head: string;
     try {
-        fd = readFileSync(skillMdPath, { encoding: 'utf-8', flag: 'r' });
+        const fd = openSync(skillMdPath, 'r');
+        try {
+            const buf = Buffer.alloc(4096);
+            const read = readSync(fd, buf, 0, buf.length, 0);
+            head = buf.toString('utf-8', 0, read);
+        } finally {
+            closeSync(fd);
+        }
     } catch {
         return null;
     }
-    const head = fd.slice(0, 4096);
     const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(head);
     if (!match) return null;
     const name = /^name:\s*(.+)$/m.exec(match[1])?.[1]?.trim();
@@ -48,8 +56,7 @@ export const parseSkillFrontmatter = (skillMdPath: string): AgentCommandEntry | 
 /** True when the path exists through symlinks — false for dangling links. */
 const resolvesOnDisk = (path: string): boolean => {
     try {
-        statSync(path);
-        return true;
+        return statSync(path).isDirectory();
     } catch {
         return false;
     }
@@ -67,11 +74,6 @@ const scanSkillDir = (dir: string): AgentCommandEntry[] => {
     for (const name of names) {
         const path = join(dir, name);
         if (!resolvesOnDisk(path)) continue; // dangling symlink or vanished dir
-        try {
-            if (!statSync(path).isDirectory()) continue;
-        } catch {
-            continue;
-        }
         const entry = parseSkillFrontmatter(join(path, 'SKILL.md'));
         if (entry && !seen.has(entry.name)) {
             seen.add(entry.name);
@@ -151,12 +153,20 @@ export const scanAgentCommands = (homeDir: string): AgentCommandCatalog => {
 
     // Enforce the serialized budget by dropping whole skills from the tail.
     // Count what was cut so the caller can log it — never shrink silently.
-    while (payloadBytes(catalog) > PAYLOAD_LIMIT_BYTES) {
+    // Byte accounting: each dropped entry subtracts its own serialized size
+    // instead of re-stringifying the whole catalog per drop; recompute only
+    // when an agent bucket empties (its JSON wrapper changes shape).
+    let bytes = payloadBytes(catalog);
+    while (bytes > PAYLOAD_LIMIT_BYTES) {
         const lastAgent = Object.keys(catalog).pop();
         if (!lastAgent) break;
         const dropped = catalog[lastAgent].pop();
-        if (dropped && catalog[lastAgent].length === 0) delete catalog[lastAgent];
         if (!dropped) break;
+        bytes -= Buffer.byteLength(JSON.stringify(dropped), 'utf-8') + 1; // ',' or ']'
+        if (catalog[lastAgent].length === 0) {
+            delete catalog[lastAgent];
+            bytes = payloadBytes(catalog); // wrapper shape changed — resync
+        }
         console.warn(`[command-scan] payload over ${PAYLOAD_LIMIT_BYTES}B — dropped skill '${dropped.name}' (${lastAgent})`);
     }
     return catalog;
