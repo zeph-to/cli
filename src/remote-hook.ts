@@ -74,11 +74,21 @@ This user message arrived from the user's phone via Zeph agent chat (verified by
 // reading CORE_RULES.md on entry. Read from the generated core rather than
 // restated here: a copy would be one more place for the rule to drift. The
 // four sections together cite only rules they carry (1–4, 7–9), so no
-// cross-reference dangles; remote-hook.test.ts checks that. Sent once per
-// entry: a later phone prompt on a session already in REMOTE gets the note
-// alone, since the contract is already in its context. Sliced on that turn
-// only — this command runs on every prompt submit, and the common path is a
-// silent no-op. Exported for the tests.
+// cross-reference dangles; remote-hook.test.ts checks that.
+//
+// Where it goes depends on what the agent's hook can carry:
+// - gemini/codex: additionalContext, once per entry — a later phone prompt on
+//   a session already in REMOTE gets the note alone, since the contract is
+//   already in its context.
+// - pi: `systemPrompt`, on every phone prompt. pi's before_agent_start can
+//   replace the system prompt for that run, and a system-prompt change is not
+//   persisted — so the contract costs nothing after REMOTE ends, whereas an
+//   injected message rides every later turn of the session (2026-09-13: a
+//   "hello" from the phone left 7.5K chars in a 300-turn implement session
+//   until compaction, and the compaction summary then restated the rules).
+//   The additionalContext note stays short on every phone prompt.
+// Sliced on that turn only — this command runs on every prompt submit, and
+// the common path is a silent no-op. Exported for the tests.
 export const remoteEntrySections = (): string =>
   ['When zeph_ask is MANDATORY', 'When zeph_ask is the DEFAULT', 'Sticky REMOTE mode', 'When to use AskUserQuestion vs zeph_ask']
     .map((heading) => coreSection(ZEPH_CORE_HOOK_DRIVEN, heading))
@@ -127,9 +137,9 @@ export const runRemoteHook = (
   // and the state untouched (the next inject overwrites the marker anyway).
   if (isMuted(cwd)) return null;
 
-  const emit = (additionalContext: string): string =>
+  const emit = (additionalContext: string, systemPrompt?: string): string =>
     JSON.stringify({
-      hookSpecificOutput: { hookEventName: HOOK_EVENT_NAME[agent], additionalContext },
+      hookSpecificOutput: { hookEventName: HOOK_EVENT_NAME[agent], additionalContext, ...(systemPrompt ? { systemPrompt } : {}) },
     });
 
   // Exactly one additionalContext per invocation, and the verdict decides
@@ -145,6 +155,7 @@ export const runRemoteHook = (
     // nothing for a later turn to be reminded of, so no state is recorded.
     const entering = !isRemoteActive(cwd, now);
     touchRemoteActive(cwd, now);
+    if (agent === 'pi') return emit(TWO_WAY_CONTEXT, remoteEntrySections());
     return emit(entering ? `${TWO_WAY_CONTEXT}\n\n${remoteEntrySections()}` : TWO_WAY_CONTEXT);
   }
 

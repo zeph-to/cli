@@ -160,7 +160,7 @@ describe('runRemoteHook (ADR-0002, gemini/codex)', () => {
     it('entering REMOTE from NORMAL injects the REMOTE contract in full', () => {
         const cwd = '/proj/entry-contract';
         writeRemoteMarker(cwd, 'from the phone', () => NOW);
-        const ctx = contextOf(runRemoteHook('pi', stdin('from the phone', cwd), TWO_WAY, () => NOW));
+        const ctx = contextOf(runRemoteHook('gemini', stdin('from the phone', cwd), TWO_WAY, () => NOW));
         for (const heading of ['When zeph_ask is MANDATORY', 'Sticky REMOTE mode', 'When to use AskUserQuestion vs zeph_ask']) {
             expect(ctx).toContain(`### ${heading}`);
         }
@@ -175,9 +175,31 @@ describe('runRemoteHook (ADR-0002, gemini/codex)', () => {
         const cwd = '/proj/entry-repeat';
         seedState(cwd);
         writeRemoteMarker(cwd, 'again from the phone', () => NOW);
-        const ctx = contextOf(runRemoteHook('pi', stdin('again from the phone', cwd), TWO_WAY, () => NOW));
+        const ctx = contextOf(runRemoteHook('gemini', stdin('again from the phone', cwd), TWO_WAY, () => NOW));
         expect(ctx).toContain('REMOTE mode');
         expect(ctx).not.toContain('### Sticky REMOTE mode');
+    });
+
+    // pi's before_agent_start can replace the system prompt for the run, and that
+    // change is not persisted — the contract vanishes with REMOTE instead of
+    // riding every later turn of the session as an injected message would.
+    it('pi carries the contract in systemPrompt on every phone prompt, never in the note', () => {
+        const systemPromptOf = (out: string | null): string | undefined =>
+            (JSON.parse(out!) as { hookSpecificOutput: { systemPrompt?: string } }).hookSpecificOutput.systemPrompt;
+        const cwd = '/proj/pi-system-prompt';
+        writeRemoteMarker(cwd, 'from the phone', () => NOW);
+        const entry = runRemoteHook('pi', stdin('from the phone', cwd), TWO_WAY, () => NOW);
+        expect(contextOf(entry)).toContain('REMOTE mode');
+        expect(contextOf(entry)).not.toContain('### Sticky REMOTE mode');
+        expect(systemPromptOf(entry)).toBe(remoteEntrySections());
+        writeRemoteMarker(cwd, 'again from the phone', () => NOW);
+        const again = runRemoteHook('pi', stdin('again from the phone', cwd), TWO_WAY, () => NOW);
+        expect(systemPromptOf(again)).toBe(remoteEntrySections()); // every run, not only entry
+        expect(contextOf(again)).not.toContain('### Sticky REMOTE mode');
+        // gemini gets no systemPrompt field: its hook cannot carry one.
+        const cwd2 = '/proj/gemini-no-system-prompt';
+        writeRemoteMarker(cwd2, 'from the phone', () => NOW);
+        expect(systemPromptOf(runRemoteHook('gemini', stdin('from the phone', cwd2), TWO_WAY, () => NOW))).toBeUndefined();
     });
 
     it('one-way entry never carries the two-way contract', () => {

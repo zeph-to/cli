@@ -164,13 +164,10 @@ mode takes over.`;
 // Tool-access preamble — pi only.
 const PI_TOOL_ACCESS = `## Zeph tools via the CLI (no MCP)
 
-Pi has no MCP support, so the zeph_* tools these rules name are not in your
-tool list. Wherever a rule says to call one, run the zeph CLI with your bash
-tool instead — same semantics:
+Pi has no MCP, so where these rules name a zeph_* tool, run the zeph CLI with your bash tool instead:
 
 - zeph_ask    → \`zeph ask --title "…" --body "…" --actions "id:Label,id2:Label2" --timeout 300\`
-  Blocks until answered; prints one JSON line. \`answered: false\` (timeout /
-  unreachable) is a Done-like outcome — treat it as NORMAL.
+  Blocks until answered; prints one JSON line. \`answered: false\` (timeout / unreachable) is a Done-like outcome — treat it as NORMAL.
 - zeph_notify → \`zeph notify --title "…" --body "…" [--priority high]\`
 - AskUserQuestion → pi's own terminal prompt.`;
 
@@ -180,20 +177,7 @@ tool instead — same semantics:
 // rules carry a dial-independent version here.
 const PI_PUSH_SIGNAL = `## Push Signal — steer the end-of-turn push
 
-When a turn ends, the zeph extension decides whether to push by tool volume
-and the user's push dial. Put ONE marker anywhere in your final response to
-override that for this turn. The extension removes it before the message is
-shown or kept:
-
-- \`<!-- zeph: high -->\` — push at high priority. The only marker that gets
-  through the quiet dial, so use it whenever the user must act: you ended the
-  turn with a question for them, or you are blocked on a decision only they
-  can make. Never on routine completions.
-- \`<!-- zeph: push -->\` — push a turn the heuristic would skip.
-- \`<!-- zeph: skip -->\` — no push for a turn not worth a ping.
-
-No marker → the heuristic: fewer than 2 tool calls, or only read-only ones,
-stays silent. Markers are lowercase and exact.`;
+The extension pushes by tool volume and the user's dial; ONE marker anywhere in your final response overrides that for the turn (removed before the message is shown or kept): \`<!-- zeph: high -->\` — the user must act (you ended with a question for them, or are blocked on their decision); the only marker the quiet dial lets through, never on routine completions. \`<!-- zeph: push -->\` forces a push the heuristic (fewer than 2 tool calls, or only read-only ones, stays silent) would skip; \`<!-- zeph: skip -->\` suppresses one. Lowercase, exact.`;
 
 // NORMAL-only core — agents WITH a prompt-submit hook (Gemini, Codex, Pi).
 // Mirrors plugin/hooks/zeph-setup.js `normal()`: the NORMAL branch owes no
@@ -208,7 +192,7 @@ stays silent. Markers are lowercase and exact.`;
 // settled per audience; the plugin's NORMAL branch has the same gaps).
 const REMOTE_STUB = `### What starts REMOTE
 
-The user sending a message from their phone starts sticky REMOTE — the prompt-submit hook says so on that turn and injects the contract in full. A \`zeph_ask\` result reporting \`zephState: "REMOTE"\` starts it mid-turn.
+The user sending a message from their phone starts sticky REMOTE — the prompt-submit hook says so on that turn and supplies the contract in full. A \`zeph_ask\` result reporting \`zephState: "REMOTE"\` starts it mid-turn.
 
 From that response on: end EVERY response with \`zeph_ask\` (2–4 \`actions\` plus a Done-like \`fallback\`, \`timeout\` 300–600s), route button-friendly questions through it instead of \`AskUserQuestion\`, and never end on a plain-text question — until the user exits with a Done-like button, a free-text wrap-up you read as one (emit \`<!-- zeph: exit -->\` once), or a prompt they type at the terminal.`;
 
@@ -555,8 +539,11 @@ export default function (pi: ExtensionAPI) {
     child.on("error", () => {});
     child.unref();
   });
-  // Prompt-submit: remote-origin detection (ADR-0002) — additionalContext comes
-  // back as a persistent injected message (this extension is the consumer).
+  // Prompt-submit: remote-origin detection (ADR-0002). additionalContext comes
+  // back as a persistent injected message (this extension is the consumer);
+  // systemPrompt — the REMOTE contract while the phone drives — is appended to
+  // this run's system prompt only, so it is gone the run after REMOTE ends and
+  // never lands in the session or a compaction summary.
   // Doubles as the turn boundary: this is where the counters start over.
   pi.on("before_agent_start", async (event, ctx) => {
     tools = 0;
@@ -566,10 +553,15 @@ export default function (pi: ExtensionAPI) {
     const out = await sh(${JSON.stringify(remoteHookCmd('pi'))}, ctx.cwd,
       JSON.stringify({ prompt: event.prompt, cwd: ctx.cwd }));
     try {
-      const context = JSON.parse(out)?.hookSpecificOutput?.additionalContext;
-      if (typeof context === "string" && context) {
-        return { message: { customType: "zeph-remote", content: context, display: false } };
+      const hook = JSON.parse(out)?.hookSpecificOutput ?? {};
+      const result: { message?: { customType: string; content: string; display: boolean }; systemPrompt?: string } = {};
+      if (typeof hook.additionalContext === "string" && hook.additionalContext) {
+        result.message = { customType: "zeph-remote", content: hook.additionalContext, display: false };
       }
+      if (typeof hook.systemPrompt === "string" && hook.systemPrompt) {
+        result.systemPrompt = event.systemPrompt + "\\n\\n" + hook.systemPrompt;
+      }
+      if (result.message || result.systemPrompt) return result;
     } catch { /* silent no-op — the hook only ever adds context */ }
   });
 }
