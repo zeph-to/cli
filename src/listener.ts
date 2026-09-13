@@ -3359,6 +3359,11 @@ export const recordInventory = (sessions: ReadonlyArray<{ name: string }> | null
  *  outside the daemon (tests, one-shot commands) — sweeps then run in-thread. */
 let inventoryOffload: InventoryOffload | null = null;
 
+/** Last skill catalog we reported, serialized. Module scope on purpose: an
+ *  unchanged machine must not rescan + resend on every reconnect — the server
+ *  persists the catalog in the device record, so silence is lossless. */
+let lastCommandsFingerprint: string | null = null;
+
 /**
  * Mirror each session's provider name onto the tmux session itself, as the
  * user option `@zeph_agent_name`.
@@ -3976,9 +3981,12 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
         // Skill catalog (listener.commands): sent on connect, then only when a
         // rescan changes it. The rescan has its own slow timer — it reads the
         // filesystem, so it must never ride the 5 s session loop.
-        let lastCommandsFingerprint: string | null = null;
         let commandsTimer: ReturnType<typeof setInterval> | null = null;
         const reportCommands = (): void => {
+            // Defer the sync filesystem scan off this callback: both call sites
+            // (socket open, timer tick) sit on the main thread next to pong
+            // handling, and a stalled scan delays frames.
+            setImmediate(() => {
             if (sock.readyState !== WebSocket.OPEN) return;
             let catalog: AgentCommandCatalog;
             try {
@@ -3991,9 +3999,12 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             }
             const fingerprint = commandsFingerprint(catalog);
             if (!commandsReportDue(fingerprint, lastCommandsFingerprint)) return;
-            sock.send(JSON.stringify({ type: 'listener.commands', data: { commands: catalog } }));
+            // The frame embeds the exact serialized catalog — reuse the
+            // fingerprint string instead of serializing a second time.
+            sock.send(`{"type":"listener.commands","data":{"commands":${fingerprint}}}`);
             lastCommandsFingerprint = fingerprint;
             log(`reported skill catalog: ${Object.entries(catalog).map(([k, v]) => `${k}:${v.length}`).join(', ') || '∅'}`);
+            });
         };
 
         let sweepInFlight = false;
