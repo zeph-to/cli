@@ -12,6 +12,10 @@ import {
     resolveKeys,
     sessionsFingerprint,
     sessionsReportDue,
+    COMMAND_SCAN_INTERVAL_MS,
+    SESSION_REPORT_INTERVAL_MS,
+    commandsFingerprint,
+    commandsReportDue,
     SESSION_REPORT_HEARTBEAT_MS,
     gcAttachments,
     computeBackoff,
@@ -1210,5 +1214,44 @@ describe('sessions report gate (idle-cost throttle)', () => {
 
     it('first report of a connection (no fingerprint yet) always sends', () => {
         expect(sessionsReportDue('fp', null, 0, 1)).toBe(true);
+    });
+});
+
+describe('commandsReportDue', () => {
+    it('first catalog of a connection always sends', () => {
+        expect(commandsReportDue('fp', null)).toBe(true);
+    });
+    it('unchanged catalog is not re-sent', () => {
+        expect(commandsReportDue('fp', 'fp')).toBe(false);
+    });
+    it('changed catalog sends', () => {
+        expect(commandsReportDue('fp-new', 'fp-old')).toBe(true);
+    });
+    it('catalog fingerprint reflects skill changes', () => {
+        const before = commandsFingerprint({ claude: [{ name: 'a' }] });
+        const after = commandsFingerprint({ claude: [{ name: 'a' }, { name: 'b' }] });
+        expect(before).not.toBe(after);
+        expect(commandsFingerprint({ claude: [{ name: 'a' }] })).toBe(before);
+    });
+    it('a lost frame is re-sent on the next connection', () => {
+        // The gate is per connection: a new socket starts at null, so the
+        // catalog goes out again even when the machine has not changed. A
+        // fingerprint that outlived the socket would strand the server on a
+        // frame that never arrived.
+        const fingerprint = commandsFingerprint({ claude: [{ name: 'a' }] });
+        let gate: string | null = fingerprint; // as it stood when the frame was lost
+        expect(commandsReportDue(fingerprint, gate)).toBe(false);
+        gate = null; // reconnect
+        expect(commandsReportDue(fingerprint, gate)).toBe(true);
+    });
+});
+
+describe('command scan cadence', () => {
+    it('the session report never triggers a skill scan', () => {
+        // The 5 s session loop must stay free of the scan's stat sweep. The old
+        // assertion compared our constant to our constant and stayed green
+        // through any change to either; this reads the wiring instead.
+        const source = readFileSync(new URL('./listener.ts', import.meta.url), 'utf-8');
+        expect(source).toContain('commandsTimer = setInterval(reportCommands, COMMAND_SCAN_INTERVAL_MS)');
     });
 });

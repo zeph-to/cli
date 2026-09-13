@@ -68,6 +68,7 @@ import { createTurnWatchers, type TurnWatchControl } from './turn-watch.js';
 import { diskTurnRing } from './turn-ring.js';
 import { createInputSequencer, type InputSequencer, type SequencedInput } from './input-sequencer.js';
 import { startKeepAwake } from './keep-awake.js';
+import { PAYLOAD_LIMIT_BYTES, scanAgentCommands, type AgentCommandCatalog, type ScanResult } from './command-scan.js';
 
 const PING_INTERVAL_MS = 25_000;
 const PONG_TIMEOUT_MS = 10_000;
@@ -90,7 +91,7 @@ const WS_STALL_TIMEOUT_MS = 90_000;
 // How often the listener POLLS its local tmux session inventory (and
 // immediately on $connect). Cheap — tmux runs locally, so a change is
 // still detected (and sent) within a few seconds.
-const SESSION_REPORT_INTERVAL_MS = 5_000;
+export const SESSION_REPORT_INTERVAL_MS = 5_000;
 
 // How often an UNCHANGED inventory is re-sent. Every send costs the
 // backend a Lambda invocation + several DynamoDB reads + a WS round
@@ -174,6 +175,42 @@ interface AgentSession {
  * a field that changes every five seconds would defeat the report's
  * unchanged-inventory gate and write to the device record all day.
  */
+/**
+ * Sockets dropped in a row because the server did not know them, reset by the
+ * first report that lands. The cap is what keeps a server-side "reconnect"
+ * that reconnecting cannot fix from turning into a connect loop.
+ */
+export const MAX_STALE_CONNECTION_DROPS = 3;
+let staleConnectionDrops = 0;
+
+/**
+ * Whether a `listener.sessions.error` is the server telling us this connection
+ * is not registered. Keyed on the instruction rather than the wording of the
+ * diagnosis: the server says what it wants the client to DO, and every other
+ * rejection (a malformed report, a payload too large) is not fixed by
+ * reconnecting and must not cause one.
+ */
+export const askedToReconnect = (message: unknown): boolean =>
+    typeof message === 'string' && /reconnect/i.test(message);
+
+/** What to do about one `listener.sessions.error`. */
+export type StaleConnectionAction =
+    /** Drop the socket; the reconnect loop registers a fresh connection. */
+    | 'drop'
+    /** Not a connection problem — reconnecting would not fix it. */
+    | 'ignore'
+    /** Dropped this many times already and the reports still bounce. */
+    | 'exhausted';
+
+/**
+ * The policy, separated from the socket it acts on so it can be read and
+ * tested as what it is: two guards around one lever.
+ */
+export const staleConnectionAction = (message: unknown, drops: number): StaleConnectionAction => {
+    if (!askedToReconnect(message)) return 'ignore';
+    return drops < MAX_STALE_CONNECTION_DROPS ? 'drop' : 'exhausted';
+};
+
 export const KNOWN_SESSIONS_REPORTED = 30;
 
 export interface ReportedKnownSession {
@@ -229,6 +266,21 @@ export const sessionsReportDue = (
 ): boolean =>
     fingerprint !== lastSentFingerprint ||
     nowMs - lastSentAtMs >= SESSION_REPORT_HEARTBEAT_MS;
+
+/** How often the skill catalog is rescanned for changes. Deliberately far
+ *  slower than the session poll: this cycle reads the filesystem, and the
+ *  5 s session loop must never do that. */
+export const COMMAND_SCAN_INTERVAL_MS = 60_000;
+
+export const commandsFingerprint = (catalog: AgentCommandCatalog): string =>
+    JSON.stringify(catalog);
+
+/** Skill catalogs have no idle heartbeat — the server persists them, so an
+ *  unchanged machine has nothing to say until a skill is installed or removed. */
+export const commandsReportDue = (
+    fingerprint: string,
+    lastSentFingerprint: string | null,
+): boolean => fingerprint !== lastSentFingerprint;
 
 // Per-session token bucket — caps a runaway/compromised sender.
 //
@@ -3936,6 +3988,7 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
             if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; }
             if (sessionsTimer) { clearInterval(sessionsTimer); sessionsTimer = null; }
+            if (commandsTimer) { clearInterval(commandsTimer); commandsTimer = null; }
             if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
             if (stallTimer) { clearInterval(stallTimer); stallTimer = null; }
         };
@@ -3955,6 +4008,40 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
         // nothing, or another listener's stale data, for this device).
         let lastSentFingerprint: string | null = null;
         let lastSentAtMs = 0;
+
+        // Skill catalog (listener.commands): sent on connect, then only when a
+        // rescan changes it. The rescan has its own slow timer — it reads the
+        // filesystem, so it must never ride the 5 s session loop.
+        let commandsTimer: ReturnType<typeof setInterval> | null = null;
+        // Per connection, like the inventory gate above: `sock.send` returning
+        // is not delivery, and a fingerprint that outlived the socket would let
+        // one lost frame leave the server's catalog stale until the user next
+        // installs a skill. Resending on reconnect costs the server one read —
+        // its own `sameCommands` guard drops the write and the broadcast.
+        let lastCommandsFingerprint: string | null = null;
+        const reportCommands = (): void => {
+            if (sock.readyState !== WebSocket.OPEN) return;
+            // The scan is synchronous on the main thread. It stats one SKILL.md
+            // per candidate directory and reads no skill files (132 stats here),
+            // which is why it does not need the worker offload the tmux sweeps use.
+            let scan: ScanResult;
+            try {
+                scan = scanAgentCommands(homedir());
+            } catch (err) {
+                // A failed scan keeps the previous catalog — an empty one sent
+                // quietly would wipe the phone's menu until the next success.
+                log(`! skill scan failed, keeping previous catalog: ${err instanceof Error ? err.message : String(err)}`);
+                return;
+            }
+            const fingerprint = commandsFingerprint(scan.catalog);
+            if (!commandsReportDue(fingerprint, lastCommandsFingerprint)) return;
+            // The frame embeds the exact serialized catalog — reuse the
+            // fingerprint string instead of serializing a second time.
+            sock.send(`{"type":"listener.commands","data":{"commands":${fingerprint}}}`);
+            lastCommandsFingerprint = fingerprint;
+            if (scan.dropped > 0) log(`! skill catalog over ${PAYLOAD_LIMIT_BYTES}B — dropped ${scan.dropped} skill(s)`);
+            log(`reported skill catalog: ${Object.entries(scan.catalog).map(([k, v]) => `${k}:${v.length}`).join(', ') || '∅'}`);
+        };
 
         let sweepInFlight = false;
         const reportSessions = async (): Promise<void> => {
@@ -4047,6 +4134,8 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             // show as soon as the listener comes online.
             void reportSessions();
             sessionsTimer = setInterval(() => void reportSessions(), SESSION_REPORT_INTERVAL_MS);
+            void reportCommands();
+            commandsTimer = setInterval(reportCommands, COMMAND_SCAN_INTERVAL_MS);
 
             pingTimer = setInterval(() => {
                 if (sock.readyState !== WebSocket.OPEN) return;
@@ -4148,9 +4237,31 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             // exactly how the picker-empty bug stayed hidden for weeks.
             if (m.type === 'listener.sessions.error') {
                 log(`! server rejected listener.sessions: ${m.message ?? '(no detail)'}`);
+                // A rejection that asks us to reconnect means the server has no
+                // record of THIS socket — it was deleted while the socket stayed
+                // open (a cleanup that fired on a transient error, a TTL sweep,
+                // a redeploy). Nothing the daemon reports on this connection can
+                // ever land again, and the inventory loop would go on reporting
+                // into the void until a human restarted it: measured at eight
+                // minutes of "reported 8 session(s)" with the phone showing no
+                // agents at all. Dropping the socket is the whole recovery —
+                // the reconnect loop registers a fresh connection.
+                const action = staleConnectionAction(m.message, staleConnectionDrops);
+                if (action === 'drop') {
+                    staleConnectionDrops += 1;
+                    log(`  ↻ dropping the socket to re-register (${staleConnectionDrops}/${MAX_STALE_CONNECTION_DROPS})`);
+                    sock.close();
+                } else if (action === 'exhausted') {
+                    // Reconnecting did not help this many times in a row, so it
+                    // is not the answer — and a daemon that reconnects on every
+                    // report is worse than one that keeps logging.
+                    log('  reconnecting did not help — leaving the socket up, reports still rejected');
+                }
             }
             if (m.type === 'listener.sessions.ack') {
                 const d = m.data as { count?: number; updatedAt?: string; watches?: unknown } | undefined;
+                // A report that landed proves this socket is registered.
+                staleConnectionDrops = 0;
                 log(`✓ server persisted ${d?.count ?? '?'} session(s)`);
                 // Pattern watches ride the ack (§S5 v2) — refresh ours.
                 setPatternWatches(d?.watches);

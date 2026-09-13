@@ -7,6 +7,17 @@ import { join } from 'path';
 // so the three commands can never disagree about which agents exist or how
 // they're detected.
 
+/**
+ * Per-agent skill directories, keyed by the same `id` used in `detectAgents`.
+ * Scan targets for `command-scan.ts` — keep next to the detection table so the
+ * two can never disagree about which agents exist.
+ */
+export const AGENT_SKILL_DIRS: Record<string, string[]> = {
+    claude: ['.claude/skills'],
+    codex: ['.codex/skills'],
+    pi: ['.pi/skills'],
+};
+
 export interface Agent {
     name: string;
     id: string;
