@@ -68,7 +68,7 @@ import { createTurnWatchers, type TurnWatchControl } from './turn-watch.js';
 import { diskTurnRing } from './turn-ring.js';
 import { createInputSequencer, type InputSequencer, type SequencedInput } from './input-sequencer.js';
 import { startKeepAwake } from './keep-awake.js';
-import { scanAgentCommands, type AgentCommandCatalog } from './command-scan.js';
+import { PAYLOAD_LIMIT_BYTES, scanAgentCommands, type AgentCommandCatalog, type ScanResult } from './command-scan.js';
 
 const PING_INTERVAL_MS = 25_000;
 const PONG_TIMEOUT_MS = 10_000;
@@ -3359,11 +3359,6 @@ export const recordInventory = (sessions: ReadonlyArray<{ name: string }> | null
  *  outside the daemon (tests, one-shot commands) — sweeps then run in-thread. */
 let inventoryOffload: InventoryOffload | null = null;
 
-/** Last skill catalog we reported, serialized. Module scope on purpose: an
- *  unchanged machine must not rescan + resend on every reconnect — the server
- *  persists the catalog in the device record, so silence is lossless. */
-let lastCommandsFingerprint: string | null = null;
-
 /**
  * Mirror each session's provider name onto the tmux session itself, as the
  * user option `@zeph_agent_name`.
@@ -3982,29 +3977,34 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
         // rescan changes it. The rescan has its own slow timer — it reads the
         // filesystem, so it must never ride the 5 s session loop.
         let commandsTimer: ReturnType<typeof setInterval> | null = null;
+        // Per connection, like the inventory gate above: `sock.send` returning
+        // is not delivery, and a fingerprint that outlived the socket would let
+        // one lost frame leave the server's catalog stale until the user next
+        // installs a skill. Resending on reconnect costs the server one read —
+        // its own `sameCommands` guard drops the write and the broadcast.
+        let lastCommandsFingerprint: string | null = null;
         const reportCommands = (): void => {
-            // Defer the sync filesystem scan off this callback: both call sites
-            // (socket open, timer tick) sit on the main thread next to pong
-            // handling, and a stalled scan delays frames.
-            setImmediate(() => {
             if (sock.readyState !== WebSocket.OPEN) return;
-            let catalog: AgentCommandCatalog;
+            // The scan is synchronous on the main thread. It stats one SKILL.md
+            // per candidate directory and reads no skill files (132 stats here),
+            // which is why it does not need the worker offload the tmux sweeps use.
+            let scan: ScanResult;
             try {
-                catalog = scanAgentCommands(homedir());
+                scan = scanAgentCommands(homedir());
             } catch (err) {
                 // A failed scan keeps the previous catalog — an empty one sent
                 // quietly would wipe the phone's menu until the next success.
                 log(`! skill scan failed, keeping previous catalog: ${err instanceof Error ? err.message : String(err)}`);
                 return;
             }
-            const fingerprint = commandsFingerprint(catalog);
+            const fingerprint = commandsFingerprint(scan.catalog);
             if (!commandsReportDue(fingerprint, lastCommandsFingerprint)) return;
             // The frame embeds the exact serialized catalog — reuse the
             // fingerprint string instead of serializing a second time.
             sock.send(`{"type":"listener.commands","data":{"commands":${fingerprint}}}`);
             lastCommandsFingerprint = fingerprint;
-            log(`reported skill catalog: ${Object.entries(catalog).map(([k, v]) => `${k}:${v.length}`).join(', ') || '∅'}`);
-            });
+            if (scan.dropped > 0) log(`! skill catalog over ${PAYLOAD_LIMIT_BYTES}B — dropped ${scan.dropped} skill(s)`);
+            log(`reported skill catalog: ${Object.entries(scan.catalog).map(([k, v]) => `${k}:${v.length}`).join(', ') || '∅'}`);
         };
 
         let sweepInFlight = false;

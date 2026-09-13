@@ -1,86 +1,60 @@
-import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'fs';
+import { readFileSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { AGENT_SKILL_DIRS } from './agents.js';
 
 /**
- * Scan the machine's installed agent skills into a name+description catalog.
+ * Scan the machine's installed agent skills into a name-only catalog.
  *
  * Payload discipline (plan PLAN-13-16-18): paths never leave this machine, so
- * the output carries names and descriptions only. The result is what the
- * `listener.commands` ws message serializes, so the size cap is on serialized
- * bytes, not entry count.
+ * the output carries skill names and nothing else.
+ *
+ * Names come from the directory, not from the file. Every skill on this machine
+ * (132/132, measured 2026-09-13 across `~/.claude/skills` and every installed
+ * plugin) declares a frontmatter `name` equal to its directory name, and the
+ * agents themselves address a skill by that directory. Reading the file bought
+ * a second copy of the same string — and cost a YAML parser this scanner is not
+ * equipped to be: 42 of 43 user skills quote their description and one uses a
+ * folded scalar, so a regex shipped the quotes and truncated to an unbalanced
+ * one. The file is now opened for nothing but its own existence.
  */
 
 export interface AgentCommandEntry {
     name: string;
-    description: string;
 }
 
 /** agentKind -> skill entries; agents with no skills are omitted. */
 export type AgentCommandCatalog = Record<string, AgentCommandEntry[]>;
 
-const DESCRIPTION_LIMIT = 120;
-/** Serialized-catalog budget. Measured: full install fits in ~12.5KB; ws frames die at 128KB. */
-const PAYLOAD_LIMIT_BYTES = 64 * 1024;
+/** Serialized-catalog budget. Names-only measures ~2KB here; ws frames die at 128KB. */
+export const PAYLOAD_LIMIT_BYTES = 64 * 1024;
+
+export interface ScanResult {
+    catalog: AgentCommandCatalog;
+    /** Skills cut to fit the budget. Non-zero is worth a log line — never shrink silently. */
+    dropped: number;
+}
 
 /**
- * Parse `name` and `description` out of the leading YAML frontmatter of a
- * SKILL.md. Only the first 4KB is read — frontmatter is at the top by
- * convention and skill bodies run large. Returns null when there is no
- * parseable frontmatter.
+ * True when `<dir>/SKILL.md` is a readable file. This is the whole membership
+ * test: it rejects non-skill directories, and it rejects dangling symlinks
+ * (`~/.pi/skills` had three) because the stat resolves through the link.
  */
-export const parseSkillFrontmatter = (skillMdPath: string): AgentCommandEntry | null => {
-    // Bounded read — 4KB is all the parser needs and skill bodies run large;
-    // reading whole files × every skill × every scan cycle is pure waste.
-    let head: string;
+const isSkillDir = (dir: string): boolean => {
     try {
-        const fd = openSync(skillMdPath, 'r');
-        try {
-            const buf = Buffer.alloc(4096);
-            const read = readSync(fd, buf, 0, buf.length, 0);
-            head = buf.toString('utf-8', 0, read);
-        } finally {
-            closeSync(fd);
-        }
-    } catch {
-        return null;
-    }
-    const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(head);
-    if (!match) return null;
-    const name = /^name:\s*(.+)$/m.exec(match[1])?.[1]?.trim();
-    const description = /^description:\s*(.+)$/m.exec(match[1])?.[1]?.trim();
-    if (!name) return null;
-    return { name, description: (description ?? '').slice(0, DESCRIPTION_LIMIT) };
-};
-
-/** True when the path exists through symlinks — false for dangling links. */
-const resolvesOnDisk = (path: string): boolean => {
-    try {
-        return statSync(path).isDirectory();
+        return statSync(join(dir, 'SKILL.md')).isFile();
     } catch {
         return false;
     }
 };
 
-const scanSkillDir = (dir: string): AgentCommandEntry[] => {
+const scanSkillDir = (dir: string): string[] => {
     let names: string[];
     try {
         names = readdirSync(dir);
     } catch {
         return [];
     }
-    const entries: AgentCommandEntry[] = [];
-    const seen = new Set<string>();
-    for (const name of names) {
-        const path = join(dir, name);
-        if (!resolvesOnDisk(path)) continue; // dangling symlink or vanished dir
-        const entry = parseSkillFrontmatter(join(path, 'SKILL.md'));
-        if (entry && !seen.has(entry.name)) {
-            seen.add(entry.name);
-            entries.push(entry);
-        }
-    }
-    return entries;
+    return names.filter((name) => isSkillDir(join(dir, name)));
 };
 
 /**
@@ -89,33 +63,21 @@ const scanSkillDir = (dir: string): AgentCommandEntry[] => {
  * uninstalled marketplace entries (514 of 710 on this machine) that must not
  * appear.
  */
-const scanClaudePlugins = (home: string): AgentCommandEntry[] => {
-    let raw: string;
-    try {
-        raw = readFileSync(join(home, '.claude', 'plugins', 'installed_plugins.json'), 'utf-8');
-    } catch {
-        return [];
-    }
+const scanClaudePlugins = (home: string): string[] => {
     let parsed: { plugins?: Record<string, Array<{ installPath?: string }>> };
     try {
-        parsed = JSON.parse(raw);
+        parsed = JSON.parse(readFileSync(join(home, '.claude', 'plugins', 'installed_plugins.json'), 'utf-8'));
     } catch {
         return [];
     }
-    const entries: AgentCommandEntry[] = [];
-    const seen = new Set<string>();
+    const names: string[] = [];
     for (const installs of Object.values(parsed.plugins ?? {})) {
         for (const install of installs ?? []) {
             if (!install.installPath) continue;
-            for (const entry of scanSkillDir(join(install.installPath, 'skills'))) {
-                if (!seen.has(entry.name)) {
-                    seen.add(entry.name);
-                    entries.push(entry);
-                }
-            }
+            names.push(...scanSkillDir(join(install.installPath, 'skills')));
         }
     }
-    return entries;
+    return names;
 };
 
 /** Byte length of the serialized catalog — the cap the ws frame actually feels. */
@@ -123,51 +85,30 @@ const payloadBytes = (catalog: AgentCommandCatalog): number => Buffer.byteLength
 
 /**
  * Scan every agent's skill directories into one catalog. Per-agent failures
- * degrade to empty entries; the caller keeps its previous catalog when the
- * scan as a whole throws. Dedup is within each agentKind only — the same skill
+ * degrade to no entries; the caller keeps its previous catalog when the scan as
+ * a whole throws. Dedup is within each agentKind only — the same skill
  * installed for claude and pi legitimately appears in both.
  */
-export const scanAgentCommands = (homeDir: string): AgentCommandCatalog => {
+export const scanAgentCommands = (homeDir: string): ScanResult => {
     const catalog: AgentCommandCatalog = {};
     for (const [agentId, dirs] of Object.entries(AGENT_SKILL_DIRS)) {
-        const merged: AgentCommandEntry[] = [];
-        const seen = new Set<string>();
-        for (const dir of dirs) {
-            for (const entry of scanSkillDir(join(homeDir, dir))) {
-                if (!seen.has(entry.name)) {
-                    seen.add(entry.name);
-                    merged.push(entry);
-                }
-            }
-        }
-        if (agentId === 'claude') {
-            for (const entry of scanClaudePlugins(homeDir)) {
-                if (!seen.has(entry.name)) {
-                    seen.add(entry.name);
-                    merged.push(entry);
-                }
-            }
-        }
+        const names = dirs.flatMap((dir) => scanSkillDir(join(homeDir, dir)));
+        if (agentId === 'claude') names.push(...scanClaudePlugins(homeDir));
+        const merged = [...new Set(names)].map((name) => ({ name }));
         if (merged.length > 0) catalog[agentId] = merged;
     }
 
-    // Enforce the serialized budget by dropping whole skills from the tail.
-    // Count what was cut so the caller can log it — never shrink silently.
-    // Byte accounting: each dropped entry subtracts its own serialized size
-    // instead of re-stringifying the whole catalog per drop; recompute only
-    // when an agent bucket empties (its JSON wrapper changes shape).
-    let bytes = payloadBytes(catalog);
-    while (bytes > PAYLOAD_LIMIT_BYTES) {
+    // Enforce the serialized budget by dropping whole skills from the tail. The
+    // catalog is ~2KB in practice, so this loop is a backstop, not a hot path —
+    // it re-measures the real payload each pass rather than keeping a running
+    // subtraction that no realistic input would ever exercise.
+    let dropped = 0;
+    while (payloadBytes(catalog) > PAYLOAD_LIMIT_BYTES) {
         const lastAgent = Object.keys(catalog).pop();
         if (!lastAgent) break;
-        const dropped = catalog[lastAgent].pop();
-        if (!dropped) break;
-        bytes -= Buffer.byteLength(JSON.stringify(dropped), 'utf-8') + 1; // ',' or ']'
-        if (catalog[lastAgent].length === 0) {
-            delete catalog[lastAgent];
-            bytes = payloadBytes(catalog); // wrapper shape changed — resync
-        }
-        console.warn(`[command-scan] payload over ${PAYLOAD_LIMIT_BYTES}B — dropped skill '${dropped.name}' (${lastAgent})`);
+        catalog[lastAgent].pop();
+        dropped += 1;
+        if (catalog[lastAgent].length === 0) delete catalog[lastAgent];
     }
-    return catalog;
+    return { catalog, dropped };
 };
