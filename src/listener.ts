@@ -52,6 +52,11 @@ import {
 } from './session-registry.js';
 import { foregroundAgentFor, matchAgentByPaneCommand, REMOTE_AGENTS, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 import {
+    initialSubagentScanState,
+    scanSubagents,
+    type SubagentScanState,
+} from './subagent-transcripts.js';
+import {
     installService,
     restartService,
     SERVICE_LABEL,
@@ -3181,6 +3186,20 @@ export interface CollectResult {
 }
 
 /**
+ * Per-session subagent scan state, held across sweeps so a chip keeps the
+ * number and label it was first given (`subagent-transcripts.ts`). Lives on
+ * whichever thread runs the sweep; a worker restart renumbers, which costs a
+ * viewer nothing but a re-render.
+ */
+const subagentScans = new Map<string, SubagentScanState>();
+
+const pruneSubagentScans = (liveSessions: Set<string>): void => {
+    for (const name of subagentScans.keys()) {
+        if (!liveSessions.has(name)) subagentScans.delete(name);
+    }
+};
+
+/**
  * Inventory pass that also records *why* each `zeph-*` session was
  * skipped. The verbose log uses the rejection notes to explain empty
  * pickers (most common cause: tmux pane lost its start_command after a
@@ -3345,7 +3364,39 @@ export const collectSessionsVerbose = (): CollectResult => {
                 ...deriveSessionState(subName, subAgent.kind, capturePaneText(subName, extra.paneId)),
             });
         }
+        // In-process subagents: the ones with no pane at all (Claude Code's
+        // `Agent` tool). They are found in the parent's transcript directory
+        // instead — see `subagent-transcripts.ts` — and reported as the same
+        // view-only rows, numbered around the pane ids just taken above.
+        const transcriptPath = info.currentPath
+            ? (main.agent.resolveTranscript?.(info.currentPath, info.panePid ?? undefined) ?? null)
+            : null;
+        if (transcriptPath) {
+            const scan = subagentScans.get(name) ?? initialSubagentScanState();
+            subagentScans.set(name, scan);
+            const reserved = new Set(extras.map(paneNum));
+            for (const row of scanSubagents(name, transcriptPath, scan, { reserved, log })) {
+                sessions.push({
+                    name: row.name,
+                    parentName: name,
+                    attached: group.attached,
+                    agentKind: main.agent.kind,
+                    agentSessionId: null,
+                    project: parsed.project,
+                    label: row.label,
+                    createdAt: epochToIso(group.created),
+                    lastActivityAt: row.lastActivityAt,
+                    // Straight from the transcript's own clock: there is no pane
+                    // to read, so the detection rules that turn a screenful of
+                    // text into a state have nothing to work on here.
+                    state: row.working ? 'working' : 'idle',
+                    stateChangedAt: row.lastActivityAt,
+                    stateRuleId: 'transcript-activity',
+                });
+            }
+        }
     }
+    pruneSubagentScans(new Set(groups.keys()));
     pruneSessionStates(new Set(sessions.map((s) => s.name)));
     // Write down what each live session IS, while it still exists to be read.
     // tmux forgets a session the moment it ends, which is exactly when the
