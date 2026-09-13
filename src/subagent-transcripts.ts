@@ -25,7 +25,12 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
-import { initialTailState, readTranscriptDelta, type TailState } from './transcript-tail.js';
+import {
+    initialTailState,
+    projectTranscriptEntries,
+    readTranscriptDelta,
+    type TailState,
+} from './transcript-tail.js';
 
 /** How recently a subagent transcript must have grown to count as working. */
 export const SUBAGENT_WORKING_MS = 15_000;
@@ -71,6 +76,29 @@ export interface SubagentRow {
     readonly transcriptPath: string;
     readonly lastActivityAt: string;
     readonly working: boolean;
+    /**
+     * Calls counted since this listener started following the transcript — the
+     * phone's only measure of how much is happening inside a session that has
+     * gone quiet.
+     *
+     * Since it started following, not since the subagent began: the first read
+     * of a file opens a window off its end (`TRANSCRIPT_BACKFILL_BYTES`), so a
+     * listener that restarts mid-subagent resumes counting from there. Undoing
+     * that would mean re-reading whole transcripts on every attach, which is
+     * the cost this incremental read exists to avoid.
+     */
+    readonly toolCount: number;
+    /** Its first stamped event as this listener saw it, or null while it has
+     *  written nothing worth timing. Null rather than the file's mtime: a fresh
+     *  file would otherwise claim a duration it never ran for. */
+    readonly startedAt: string | null;
+}
+
+/** What has been read out of one subagent's transcript so far. */
+interface Progress {
+    tail: TailState | null;
+    toolCount: number;
+    startedAt: string | null;
 }
 
 /**
@@ -84,6 +112,10 @@ export interface SubagentRow {
 export interface SubagentScanState {
     readonly order: Map<string, number>;
     readonly labels: Map<string, string>;
+    /** Per subagent, by agentId: where its transcript was last read to, and
+     *  what had been counted by then. Incremental for the same reason the
+     *  parent's scan is — these files reach megabytes and this runs every sweep. */
+    readonly progress: Map<string, Progress>;
     tail: TailState | null;
     nextNumber: number;
     launchSeen: boolean;
@@ -93,6 +125,7 @@ export interface SubagentScanState {
 export const initialSubagentScanState = (): SubagentScanState => ({
     order: new Map(),
     labels: new Map(),
+    progress: new Map(),
     tail: initialTailState(),
     nextNumber: 1,
     launchSeen: false,
@@ -193,6 +226,32 @@ const rememberLabel = (state: SubagentScanState, agentId: string, transcriptPath
     return label;
 };
 
+/**
+ * Read what a subagent has appended since the last sweep, and fold it into the
+ * running count.
+ *
+ * Its own transcript is entirely sidechain entries — that is what makes it a
+ * subagent's file — so the projection is told to keep them, exactly as
+ * `turn-watch` does when it tails one of these for a viewer.
+ */
+const advanceProgress = (state: SubagentScanState, agentId: string, path: string): Progress => {
+    const prev = state.progress.get(agentId) ?? { tail: initialTailState(), toolCount: 0, startedAt: null };
+    const read = readTranscriptDelta(path, prev.tail);
+    if (!read) return prev;
+    // A new inode at the same path is a different file, and everything counted
+    // off the old one describes work this one never did.
+    const restarted = prev.tail !== null && read.state.ino !== prev.tail.ino;
+    const events = projectTranscriptEntries(read.lines, { includeSidechain: true });
+    const firstStamp = events.find((event) => event.at)?.at ?? null;
+    const next: Progress = {
+        tail: read.state,
+        toolCount: (restarted ? 0 : prev.toolCount) + events.filter((event) => event.kind === 'tool').length,
+        startedAt: restarted ? firstStamp : (prev.startedAt ?? firstStamp),
+    };
+    state.progress.set(agentId, next);
+    return next;
+};
+
 interface AgentFile {
     readonly agentId: string;
     readonly path: string;
@@ -277,10 +336,13 @@ export const scanSubagents = (
             number = state.nextNumber++;
             state.order.set(file.agentId, number);
         }
+        const progress = advanceProgress(state, file.agentId, file.path);
         return {
             number,
             name: `${parentName}.${number}`,
             agentId: file.agentId,
+            toolCount: progress.toolCount,
+            startedAt: progress.startedAt,
             label: state.labels.get(file.agentId) ?? rememberLabel(state, file.agentId, file.path, number),
             transcriptPath: file.path,
             lastActivityAt: new Date(file.mtimeMs).toISOString(),

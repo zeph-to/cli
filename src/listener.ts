@@ -119,6 +119,10 @@ interface AgentSession {
      *  sessions are view-only: input, keys, exit, resume and forget are
      *  refused, and the server never pushes agent.state transitions for them. */
     parentName?: string;
+    /** Calls a subagent has made so far, from its own transcript. Only a
+     *  transcript subagent has one: a pane subagent is watched as a screen, and
+     *  nothing counts what happens on it. */
+    toolCount?: number;
     agentSessionId?: string | null;
     project: string;
     label?: string | null;
@@ -3428,8 +3432,18 @@ export const collectSessionsVerbose = (): CollectResult => {
                     agentSessionId: null,
                     project: parsed.project,
                     label: row.label,
-                    createdAt: epochToIso(group.created),
+                    // The subagent's own start when its transcript has one, not
+                    // the tmux session's: this row is as old as the work it
+                    // describes, and the phone times it from here.
+                    //
+                    // So this value CHANGES once — tmux's creation time until
+                    // the transcript carries a stamp, the stamp after. Fine
+                    // while nothing sorts subagents by it (the agents list
+                    // sorts on immutable fields and does not list them); a
+                    // surface that starts to would reorder itself.
+                    createdAt: row.startedAt ?? epochToIso(group.created),
                     lastActivityAt: row.lastActivityAt,
+                    toolCount: row.toolCount,
                     // Straight from the transcript's own clock: there is no pane
                     // to read, so the detection rules that turn a screenful of
                     // text into a state have nothing to work on here.

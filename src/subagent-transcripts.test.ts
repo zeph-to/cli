@@ -45,6 +45,27 @@ const writeSubagentFile = (
     return path;
 };
 
+/** Lines a subagent writes as it works: one `at`-stamped call each. Appending
+ *  moves the file's mtime to the real clock, so it is put back afterwards —
+ *  every other case in this file ages files against the fixed NOW. */
+const writeSubagentWork = (dir: string, agentId: string, calls: number, firstAt: string, ageMs = 1_000): void => {
+    const lines = Array.from({ length: calls }, (_, i) =>
+        JSON.stringify({
+            type: 'assistant',
+            isSidechain: true,
+            timestamp: i === 0 ? firstAt : new Date(Date.parse(firstAt) + i * 1_000).toISOString(),
+            message: {
+                role: 'assistant',
+                content: [{ type: 'tool_use', id: `toolu_${i}`, name: 'Bash', input: { description: 'work' } }],
+            },
+        }),
+    );
+    const path = join(dir, `agent-${agentId}.jsonl`);
+    writeFileSync(path, `${lines.join('\n')}\n`, { flag: 'a' });
+    const seconds = (NOW - ageMs) / 1000;
+    utimesSync(path, seconds, seconds);
+};
+
 /** The parent's `Agent` tool call — the only proof a spawn happened at all. */
 const appendLaunch = (parentPath: string): void => {
     const line = JSON.stringify({
@@ -230,6 +251,48 @@ describe('scanSubagents', () => {
         scanSubagents('zeph-x', parentPath, initialSubagentScanState(), { now: NOW, log: (m) => logged.push(m) });
 
         expect(logged).toEqual([]);
+    });
+
+    // What the phone shows beside a subagent's name: a session that is quiet
+    // because its subagent is thinking looks the same as one that is stuck,
+    // until the count moves.
+    it('counts the calls a subagent has made, and when it started', () => {
+        const { parentPath, subagentDir } = projectFixture();
+        writeSubagentFile(subagentDir, 'busy', 1_000);
+        writeSubagentWork(subagentDir, 'busy', 3, '2026-09-13T12:00:00.000Z');
+
+        const rows = scanSubagents('zeph-x', parentPath, initialSubagentScanState(), { now: NOW });
+
+        expect(rows[0]).toMatchObject({ toolCount: 3, startedAt: '2026-09-13T12:00:00.000Z' });
+    });
+
+    it('keeps counting across sweeps instead of re-reading the file', () => {
+        const { parentPath, subagentDir } = projectFixture();
+        writeSubagentFile(subagentDir, 'busy', 1_000);
+        writeSubagentWork(subagentDir, 'busy', 2, '2026-09-13T12:00:00.000Z');
+        const state = initialSubagentScanState();
+
+        expect(scanSubagents('zeph-x', parentPath, state, { now: NOW })[0]!.toolCount).toBe(2);
+        writeSubagentWork(subagentDir, 'busy', 2, '2026-09-13T12:00:10.000Z');
+
+        // The second sweep reads only what was appended — the count is carried,
+        // not recomputed, which is what keeps a megabyte transcript cheap.
+        expect(scanSubagents('zeph-x', parentPath, state, { now: NOW })[0]!.toolCount).toBe(4);
+        expect(scanSubagents('zeph-x', parentPath, state, { now: NOW })[0]!.startedAt).toBe(
+            '2026-09-13T12:00:00.000Z',
+        );
+    });
+
+    it('says nothing about work it cannot see', () => {
+        const { parentPath, subagentDir } = projectFixture();
+        // A subagent whose transcript holds no stamped call yet: the file is
+        // there, the work is not — a zero would read as "did nothing".
+        writeSubagentFile(subagentDir, 'fresh', 1_000);
+
+        const rows = scanSubagents('zeph-x', parentPath, initialSubagentScanState(), { now: NOW });
+
+        expect(rows[0]!.toolCount).toBe(0);
+        expect(rows[0]!.startedAt).toBeNull();
     });
 
     it('stays quiet for a session that never launched a subagent', () => {
