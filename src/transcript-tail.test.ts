@@ -471,6 +471,18 @@ describe('projectTranscriptEntries', () => {
         expect(events).toEqual([{ kind: 'tool', id: 't8', name: 'Agent', target: 'find callers' }]);
     });
 
+    it('keeps sidechain entries when reading a subagent\'s own transcript — every line there is one', () => {
+        const events = projectTranscriptEntries([
+            line({
+                type: 'assistant',
+                isSidechain: true,
+                message: { role: 'assistant', content: [{ type: 'tool_use', id: 's1', name: 'Grep', input: {} }] },
+            }),
+        ], { includeSidechain: true });
+
+        expect(events).toEqual([{ kind: 'tool', id: 's1', name: 'Grep' }]);
+    });
+
     it('ignores unparseable and non-message lines instead of throwing', () => {
         const events = projectTranscriptEntries(['not json', line({ type: 'ai-title', aiTitle: 'x' }), textLine('ok')]);
 

@@ -90,6 +90,51 @@ describe('in-process subagents in the inventory sweep', () => {
         expect(listener.tmuxTargetFor('zeph-a.1')).toBeNull();
     });
 
+    it('remembers where a subagent writes, so a watcher can follow it without a pane', () => {
+        writeTranscripts({ withSubagent: true });
+
+        const { subagentTranscripts } = listener.collectSessionsVerbose();
+        listener.recordSubagentTranscripts(subagentTranscripts);
+
+        expect(listener.subagentTranscriptFor('zeph-a.1')).toContain('agent-a90c3941.jsonl');
+        expect(listener.subagentTranscriptFor('zeph-a.9')).toBeNull();
+        // A pane subagent resolves through tmux, not through this map.
+        expect(listener.subagentTranscriptFor('zeph-a')).toBeNull();
+    });
+
+    it('answers the watch seams for a subagent that has no pane', () => {
+        writeTranscripts({ withSubagent: true });
+        listener.recordSubagentTranscripts(listener.collectSessionsVerbose().subagentTranscripts);
+
+        // Both are what turn-watch asks every tick. tmux cannot answer either
+        // for `zeph-a.1` — it reads the `.1` as a pane index of `zeph-a`.
+        expect(listener.hasSession('zeph-a.1')).toBe(true);
+        expect(listener.resolveWatchTranscript('zeph-a.1')).toContain('subagents/agent-a90c3941.jsonl');
+        expect(listener.hasSession('zeph-a.9')).toBe(false);
+    });
+
+    it('holds a subagent watch to its own transcript, never the parent it came from', () => {
+        writeTranscripts({ withSubagent: true });
+        listener.recordSubagentTranscripts(listener.collectSessionsVerbose().subagentTranscripts);
+
+        // The re-resolve that follows a parent's `/clear` runs through the same
+        // call: if it ever answered with the parent file, a viewer would be
+        // reading the main session's work under the subagent's name.
+        const first = listener.resolveWatchTranscript('zeph-a.1');
+        expect(listener.resolveWatchTranscript('zeph-a.1')).toBe(first);
+        expect(first).not.toContain(`${SESSION_ID}.jsonl`);
+    });
+
+    it('forgets a subagent that left the last sweep', () => {
+        writeTranscripts({ withSubagent: true });
+        listener.recordSubagentTranscripts(listener.collectSessionsVerbose().subagentTranscripts);
+
+        writeTranscripts({ withSubagent: false });
+        listener.recordSubagentTranscripts(listener.collectSessionsVerbose().subagentTranscripts);
+
+        expect(listener.subagentTranscriptFor('zeph-a.1')).toBeNull();
+    });
+
     it('reports only the parent when the session has launched no subagent', () => {
         writeTranscripts({ withSubagent: false });
 

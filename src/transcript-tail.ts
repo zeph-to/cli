@@ -561,7 +561,7 @@ const nonEmpty = (text: string): string | null => {
  */
 export const projectTranscriptEntries = (
     lines: readonly string[],
-    opts: { sinceLastPrompt?: boolean } = {},
+    opts: { sinceLastPrompt?: boolean; includeSidechain?: boolean } = {},
 ): TurnEvent[] => {
     const events: TurnEvent[] = [];
     // One `msg` per API message in this batch, kept where it first appeared.
@@ -578,8 +578,10 @@ export const projectTranscriptEntries = (
         }
 
         // A subagent's own tool calls belong to the Task/Agent call that spawned
-        // it, which the parent transcript already shows as one row.
-        if (entry.isSidechain) continue;
+        // it, which the parent transcript already shows as one row — unless this
+        // IS the subagent's transcript, where every line is a sidechain and
+        // dropping them leaves a viewer watching an empty file.
+        if (entry.isSidechain && !opts.includeSidechain) continue;
 
         const at = typeof entry.timestamp === 'string' ? entry.timestamp : undefined;
 
