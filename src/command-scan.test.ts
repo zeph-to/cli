@@ -10,9 +10,10 @@ import { PAYLOAD_LIMIT_BYTES, scanAgentCommands } from './command-scan.js';
 //   ~/.agents/skills/<name> -> symlink (some dangling)
 // Nothing here touches the real home directory; `homeDir` is injected.
 //
-// The catalog carries names only, and a skill's name is its directory name, so
-// SKILL.md content is never parsed — these fixtures write a body to prove the
-// scanner ignores it.
+// The catalog carries commands only — a directory name under whatever prefix the
+// agent registers it with (`skill:` for pi, the plugin name for Claude Code
+// plugins). SKILL.md content is never parsed: these fixtures write a body to
+// prove the scanner ignores it.
 
 let home: string;
 
@@ -55,7 +56,7 @@ describe('scanAgentCommands', () => {
         writeFileSync(join(real, 'SKILL.md'), 'body');
         mkdirSync(join(home, '.agents', 'skills'), { recursive: true });
         symlinkSync(real, join(home, '.agents', 'skills', 'pi-skill'));
-        expect(names(scanAgentCommands(home).catalog.pi)).toEqual(['pi-skill']);
+        expect(names(scanAgentCommands(home).catalog.pi)).toEqual(['skill:pi-skill']);
     });
 
     it('drops dangling symlinks', () => {
@@ -72,7 +73,7 @@ describe('scanAgentCommands', () => {
         skill(join(home, '.agents', 'skills'), 'from-agents');
         skill(join(home, '.pi', 'skills'), 'project-only');
         const found = names(scanAgentCommands(home).catalog.pi).sort();
-        expect(found).toEqual(['from-agents', 'from-pi-agent']);
+        expect(found).toEqual(['skill:from-agents', 'skill:from-pi-agent']);
     });
 
     it('skips directories with no SKILL.md', () => {
@@ -81,9 +82,9 @@ describe('scanAgentCommands', () => {
         expect(names(scanAgentCommands(home).catalog.claude)).toEqual(['good']);
     });
 
-    it('dedupes a name that a user skill and an installed plugin both provide', () => {
-        // Two distinct directories, one shared name — the case the previous test
-        // could not reach, because it wrote both fixtures to the same path.
+    it('keeps a user skill and a plugin skill of the same name apart', () => {
+        // Two distinct directories, one shared name. They are two different
+        // commands in Claude Code, and collapsing them would hide one of them.
         skill(join(home, '.claude', 'skills'), 'ship');
         const plugins = join(home, '.claude', 'plugins');
         const install = join(plugins, 'cache', 'official', 'shipper', 'abc');
@@ -93,7 +94,8 @@ describe('scanAgentCommands', () => {
             join(plugins, 'installed_plugins.json'),
             JSON.stringify({ version: 2, plugins: { 'shipper@official': [{ scope: 'user', installPath: install }] } }),
         );
-        expect(names(scanAgentCommands(home).catalog.claude)).toEqual(['ship']);
+        // Different commands: `/ship` is the user skill, `/shipper:ship` the plugin's.
+        expect(names(scanAgentCommands(home).catalog.claude).sort()).toEqual(['ship', 'shipper:ship']);
     });
 
     it('includes installed plugin skills but not marketplace cache', () => {
@@ -109,8 +111,9 @@ describe('scanAgentCommands', () => {
             JSON.stringify({ version: 2, plugins: { 'installed-plugin@official': [{ scope: 'user', installPath: cache }] } }),
         );
         const found = names(scanAgentCommands(home).catalog.claude);
-        expect(found).toContain('plugin-skill');
-        expect(found).not.toContain('orphan-skill');
+        expect(found).toContain('installed-plugin:plugin-skill');
+        expect(found).not.toContain('installed-plugin:orphan-skill');
+        expect(found.some((n) => n.endsWith('orphan-skill'))).toBe(false);
     });
 
     it('caps the serialized catalog at the byte limit, dropping from the tail', () => {
@@ -154,7 +157,7 @@ describe('scanAgentCommands', () => {
         symlinkSync(piReal, join(home, '.agents', 'skills', 'shared'));
         const { catalog } = scanAgentCommands(home);
         expect(names(catalog.claude)).toEqual(['shared']);
-        expect(names(catalog.pi)).toEqual(['shared']);
+        expect(names(catalog.pi)).toEqual(['skill:shared']);
     });
 });
 

@@ -8,6 +8,9 @@ import { AGENT_SKILL_DIRS } from './agents.js';
  * Payload discipline (plan PLAN-13-16-18): paths never leave this machine, so
  * the output carries skill names and nothing else.
  *
+ * An entry is the slash command itself, so it carries whatever prefix the agent
+ * registers the skill under (`AGENT_SKILL_PREFIX`, plugin names for Claude Code).
+ *
  * Names come from the directory, not from the file. Every skill on this machine
  * (132/132, measured 2026-09-13 across `~/.claude/skills` and every installed
  * plugin) declares a frontmatter `name` equal to its directory name, and the
@@ -19,8 +22,22 @@ import { AGENT_SKILL_DIRS } from './agents.js';
  */
 
 export interface AgentCommandEntry {
+    /** What the user types after `/` — see `AGENT_SKILL_PREFIX`. */
     name: string;
 }
+
+/**
+ * What each agent registers its skills as. The catalog exists to be typed into
+ * the agent, so it carries the invocation token, not the bare directory name.
+ *
+ * pi registers `skill:<name>` (`docs/skills.md § Slash Commands`, and
+ * `` `skill:${skill.name}` `` in its bundle, pi 0.85.1) — `/01-plan` aborts.
+ * Claude Code's user skills are `/<name>`; its PLUGIN skills are
+ * `/<plugin>:<name>`, so those get their prefix from the install entry instead.
+ */
+const AGENT_SKILL_PREFIX: Record<string, string> = {
+    pi: 'skill:',
+};
 
 /** agentKind -> skill entries; agents with no skills are omitted. */
 export type AgentCommandCatalog = Record<string, AgentCommandEntry[]>;
@@ -71,10 +88,12 @@ const scanClaudePlugins = (home: string): string[] => {
         return [];
     }
     const names: string[] = [];
-    for (const installs of Object.values(parsed.plugins ?? {})) {
+    for (const [key, installs] of Object.entries(parsed.plugins ?? {})) {
+        // Key is `<plugin>@<marketplace>`; the command prefix is the plugin half.
+        const plugin = key.split('@')[0];
         for (const install of installs ?? []) {
             if (!install.installPath) continue;
-            names.push(...scanSkillDir(join(install.installPath, 'skills')));
+            names.push(...scanSkillDir(join(install.installPath, 'skills')).map((name) => `${plugin}:${name}`));
         }
     }
     return names;
@@ -92,7 +111,8 @@ const payloadBytes = (catalog: AgentCommandCatalog): number => Buffer.byteLength
 export const scanAgentCommands = (homeDir: string): ScanResult => {
     const catalog: AgentCommandCatalog = {};
     for (const [agentId, dirs] of Object.entries(AGENT_SKILL_DIRS)) {
-        const names = dirs.flatMap((dir) => scanSkillDir(join(homeDir, dir)));
+        const prefix = AGENT_SKILL_PREFIX[agentId] ?? '';
+        const names = dirs.flatMap((dir) => scanSkillDir(join(homeDir, dir)).map((name) => `${prefix}${name}`));
         if (agentId === 'claude') names.push(...scanClaudePlugins(homeDir));
         const merged = [...new Set(names)].map((name) => ({ name }));
         if (merged.length > 0) catalog[agentId] = merged;
