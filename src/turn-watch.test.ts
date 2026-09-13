@@ -122,6 +122,26 @@ describe('turn watch control', () => {
         expect(sent.at(-1)).toMatchObject({ error: 'watch_limit' });
     });
 
+    // A Claude Code session and its in-process subagents are separate watches
+    // of separate transcripts, so one session can fill the machine's slots by
+    // itself. The refusal has to name the session that was turned away — the
+    // phone puts the message on that view, and a watch it never asked for is
+    // not the one the reader is staring at.
+    it('refuses a subagent by its own name once the parent filled the slots', () => {
+        const watchers = createTurnWatchers(makeDeps());
+        for (const session of ['zeph-app', 'zeph-app.1', 'zeph-app.2', 'zeph-app.3']) {
+            writeFileSync(transcriptFor(session), userPrompt('hi'));
+            watchers.handle(start(session), send);
+        }
+
+        expect(watchers.size()).toBe(MAX_TURN_WATCHERS);
+        expect(sent.at(-1)).toMatchObject({
+            subtype: 'agent.turn.watch.error',
+            sessionName: 'zeph-app.3',
+            error: 'watch_limit',
+        });
+    });
+
     it('answers a renew for a watch that no longer exists', () => {
         const watchers = createTurnWatchers(makeDeps());
 
