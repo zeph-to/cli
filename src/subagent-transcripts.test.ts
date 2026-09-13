@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
     MAX_SUBAGENT_ROWS,
+    isSubagentTranscriptPath,
+    SUBAGENT_LIVE_MS,
     SUBAGENT_WORKING_MS,
     initialSubagentScanState,
     scanSubagents,
@@ -51,6 +53,15 @@ const appendLaunch = (parentPath: string): void => {
 
 afterEach(() => {
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+describe('isSubagentTranscriptPath', () => {
+    it('tells a subagent transcript from the parent it sits under', () => {
+        const { parentPath, subagentDir } = projectFixture();
+
+        expect(isSubagentTranscriptPath(join(subagentDir, 'agent-x.jsonl'))).toBe(true);
+        expect(isSubagentTranscriptPath(parentPath)).toBe(false);
+    });
 });
 
 describe('scanSubagents', () => {
@@ -132,12 +143,22 @@ describe('scanSubagents', () => {
 
     it('drops subagents whose transcripts went quiet long ago', () => {
         const { parentPath, subagentDir } = projectFixture();
-        writeSubagentFile(subagentDir, 'ancient', 60 * 60_000);
+        writeSubagentFile(subagentDir, 'ancient', 2 * 60 * 60_000);
         writeSubagentFile(subagentDir, 'recent', 1_000);
 
         const rows = scanSubagents('zeph-x', parentPath, initialSubagentScanState(), { now: NOW });
 
         expect(rows.map((r) => r.agentId)).toEqual(['recent']);
+    });
+
+    it('keeps a subagent addressable after it leaves the roster, so its reader is not cut off', () => {
+        const { parentPath, subagentDir } = projectFixture();
+        writeSubagentFile(subagentDir, 'thinking', SUBAGENT_LIVE_MS * 2);
+
+        const rows = scanSubagents('zeph-x', parentPath, initialSubagentScanState(), { now: NOW });
+
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({ agentId: 'thinking', live: false });
     });
 
     it('marks a subagent idle once its transcript stops growing', () => {
@@ -155,8 +176,10 @@ describe('scanSubagents', () => {
 
         const rows = scanSubagents('zeph-x', parentPath, initialSubagentScanState(), { now: NOW });
 
-        expect(rows).toHaveLength(MAX_SUBAGENT_ROWS);
-        expect(rows.map((r) => r.agentId)).not.toContain(`agent${MAX_SUBAGENT_ROWS + 2}`);
+        const roster = rows.filter((r) => r.live);
+
+        expect(roster).toHaveLength(MAX_SUBAGENT_ROWS);
+        expect(roster.map((r) => r.agentId)).not.toContain(`agent${MAX_SUBAGENT_ROWS + 2}`);
     });
 
     it('gives up a number that a pane subagent takes over later', () => {

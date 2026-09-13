@@ -39,14 +39,33 @@ export const SUBAGENT_WORKING_MS = 15_000;
  */
 export const SUBAGENT_LIVE_MS = 5 * 60_000;
 
+/**
+ * How long a subagent stays ADDRESSABLE after it goes quiet — longer than it
+ * stays on the roster, because the two answer different questions.
+ *
+ * A chip is "is this worth showing"; an address is "can a viewer still read
+ * this". Dropping the address on the roster's clock closes the screen of
+ * whoever is reading it: the watcher asks whether the session still exists,
+ * the answer comes from this map, and a subagent thinking for five minutes
+ * (a long Bash, a long tool chain) would take its own reader down with it.
+ */
+export const SUBAGENT_ADDRESSABLE_MS = 60 * 60_000;
+
 /** Rows one session may contribute. The switcher is a strip of chips, not a list. */
 export const MAX_SUBAGENT_ROWS = 5;
+
+/** Quiet-but-addressable subagents kept beyond the live ones, so a viewer
+ *  reading one is not cut off the moment newer subagents crowd the roster. */
+const MAX_ADDRESSABLE_EXTRA = 5;
 
 const AGENT_FILE = /^agent-(.+)\.jsonl$/;
 
 export interface SubagentRow {
     /** Wire name: `<parent>.<n>`, the shape the server reads as view-only. */
     readonly name: string;
+    /** Recent enough to belong on the roster. A row that is not live is still
+     *  addressable — see `SUBAGENT_ADDRESSABLE_MS`. */
+    readonly live: boolean;
     readonly agentId: string;
     readonly label: string;
     readonly transcriptPath: string;
@@ -80,9 +99,22 @@ export const initialSubagentScanState = (): SubagentScanState => ({
     driftLogged: false,
 });
 
+const SUBAGENT_DIR = 'subagents';
+
 /** Where Claude Code keeps this session's subagent transcripts. */
 export const subagentDirFor = (parentTranscriptPath: string): string =>
-    join(dirname(parentTranscriptPath), basename(parentTranscriptPath, '.jsonl'), 'subagents');
+    join(dirname(parentTranscriptPath), basename(parentTranscriptPath, '.jsonl'), SUBAGENT_DIR);
+
+/**
+ * Whether a transcript is a subagent's own — which decides whether its sidechain
+ * entries are internals to hide or the whole content to show.
+ *
+ * Asked of the PATH rather than the session name: a name says what the phone
+ * calls a row, the directory says what Claude Code wrote, and the projection
+ * cares about the second.
+ */
+export const isSubagentTranscriptPath = (transcriptPath: string): boolean =>
+    basename(dirname(transcriptPath)) === SUBAGENT_DIR;
 
 /**
  * Watch the parent for the one thing the transcript directory cannot say: that
@@ -221,15 +253,18 @@ export const scanSubagents = (
         return [];
     }
 
-    const live = files
-        .filter((file) => now - file.mtimeMs <= SUBAGENT_LIVE_MS)
+    const kept = files
         .sort((a, b) => b.mtimeMs - a.mtimeMs)
-        .slice(0, MAX_SUBAGENT_ROWS);
+        .filter((file) => now - file.mtimeMs <= SUBAGENT_ADDRESSABLE_MS)
+        .slice(0, MAX_SUBAGENT_ROWS + MAX_ADDRESSABLE_EXTRA)
+        // The roster is the most recent few; everything else kept here is an
+        // address for a viewer who is already inside one of them.
+        .map((file, index) => ({ ...file, live: index < MAX_SUBAGENT_ROWS && now - file.mtimeMs <= SUBAGENT_LIVE_MS }));
 
     // Numbered in activity order, then handed back in number order: the cut
     // above keeps the subagents worth showing, and this keeps the chips from
     // swapping places under the viewer every time one of them writes a line.
-    const rows = live.map((file) => {
+    const rows = kept.map((file) => {
         // A pane subagent of the same session owns its pane id as a number
         // (`zeph-x.48`), and two rows with one name is a switcher showing the
         // wrong transcript. Checked on every sweep, not only when the number is
@@ -249,6 +284,7 @@ export const scanSubagents = (
             label: state.labels.get(file.agentId) ?? rememberLabel(state, file.agentId, file.path, number),
             transcriptPath: file.path,
             lastActivityAt: new Date(file.mtimeMs).toISOString(),
+            live: file.live,
             working: now - file.mtimeMs <= SUBAGENT_WORKING_MS,
         };
     });

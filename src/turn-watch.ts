@@ -24,6 +24,7 @@ import {
     type TailState,
     type TurnEvent,
 } from './transcript-tail.js';
+import { isSubagentTranscriptPath } from './subagent-transcripts.js';
 import type { TurnRing } from './turn-ring.js';
 
 /**
@@ -323,7 +324,11 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
                 deps.log(`⧉ turn-watch ${sessionName}: dropped ${read.droppedLines} oversized line(s)`);
             }
             if (read.lines.length) {
-                const projected = projectTranscriptEntries(read.lines, { sinceLastPrompt: watcher.backfilling });
+                const projected = projectTranscriptEntries(read.lines, {
+                    sinceLastPrompt: watcher.backfilling,
+                    // A subagent's transcript is nothing but sidechain entries.
+                    includeSidechain: isSubagentTranscriptPath(watcher.transcriptPath),
+                });
                 const backfilling = watcher.backfilling;
                 watcher.backfilling = false;
                 // Cut before the send, not after: the ring records what went out,
