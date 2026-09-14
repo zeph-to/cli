@@ -5,6 +5,7 @@ import { detectAgents, resolveCommand } from './agents.js';
 import { loadConfig, resolvedEnv, resolveHookId, VERSION } from './config.js';
 import { serviceHealthChecks, serviceStatus, type ServiceHealthRow } from './listener-service.js';
 import { ZephHook } from './zeph-hook.js';
+import { readZephMcpArgv } from './codex-config.js';
 import { MCP_LAUNCH_ARGV } from './mcp-command.js';
 import {
     LISTENER_LOG_FILE, runningListenerPid, runningListenerWsUrl as stampedListenerWsUrl,
@@ -50,6 +51,16 @@ const AGENT_RULE_PRESENT: Record<string, () => boolean> = {
     opencode: () => hasManagedBlock(join(HOME, '.config', 'opencode', 'AGENTS.md')),
 };
 
+/** Codex keeps its registry in TOML, so its reader is text-level — the table
+ *  shape lives in codex-config.ts, which install and uninstall share. */
+export const readCodexMcpArgv = (filePath: string): string[] | null => {
+    try {
+        return readZephMcpArgv(readFileSync(filePath, 'utf-8'));
+    } catch {
+        return null;
+    }
+};
+
 /**
  * Where each agent records the MCP launch, and under which container key.
  * `agent` matches the label `detectAgents` uses so one report never names the
@@ -58,13 +69,13 @@ const AGENT_RULE_PRESENT: Record<string, () => boolean> = {
  * `gemini mcp add`, so this path is the gemini CLI's own storage layout,
  * confirmed by reading the file it produced, not something Zeph chose.
  */
-const MCP_REGISTRIES: ReadonlyArray<{ agent: string; path: string; key: string }> = [
-    { agent: 'Cursor', path: join(HOME, '.cursor', 'mcp.json'), key: 'mcpServers' },
-    { agent: 'Windsurf', path: join(HOME, '.codeium', 'windsurf', 'mcp_config.json'), key: 'mcpServers' },
-    { agent: 'Gemini CLI', path: join(HOME, '.gemini', 'settings.json'), key: 'mcpServers' },
-    { agent: 'OpenCode', path: join(HOME, '.config', 'opencode', 'opencode.json'), key: 'mcp' },
+const MCP_REGISTRIES: ReadonlyArray<{ agent: string; path: string; argv: (path: string) => string[] | null }> = [
+    { agent: 'Cursor', path: join(HOME, '.cursor', 'mcp.json'), argv: (p) => registeredMcpArgv(p, 'mcpServers') },
+    { agent: 'Windsurf', path: join(HOME, '.codeium', 'windsurf', 'mcp_config.json'), argv: (p) => registeredMcpArgv(p, 'mcpServers') },
+    { agent: 'Gemini CLI', path: join(HOME, '.gemini', 'settings.json'), argv: (p) => registeredMcpArgv(p, 'mcpServers') },
+    { agent: 'OpenCode', path: join(HOME, '.config', 'opencode', 'opencode.json'), argv: (p) => registeredMcpArgv(p, 'mcp') },
+    { agent: 'Codex CLI', path: join(HOME, '.codex', 'config.toml'), argv: readCodexMcpArgv },
 ];
-
 /**
  * The launch argv a registry file records for zeph, verbatim — null when the
  * file is absent, unparseable, or has no zeph entry. Two schemas in the wild:
@@ -134,7 +145,7 @@ const activeMcpRegistrations = (
     isOnPath: (bin: string) => boolean,
 ): Array<{ agent: string; result: McpRegistration }> =>
     MCP_REGISTRIES.flatMap((registry) => {
-        const result = classifyMcpRegistration(registeredMcpArgv(registry.path, registry.key), isOnPath);
+        const result = classifyMcpRegistration(registry.argv(registry.path), isOnPath);
         return result ? [{ agent: registry.agent, result }] : [];
     });
 

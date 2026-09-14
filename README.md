@@ -872,7 +872,7 @@ try {
 | Cursor | MCP server + stop hook + rules |
 | Windsurf | MCP server + response hook + rules |
 | Gemini CLI | MCP server + AfterAgent hook |
-| Codex CLI | Stop hook + rules |
+| Codex CLI | MCP server + prompt/stop hooks + rules |
 | Copilot CLI | Session end hook + rules |
 | Cline | Rules file (`~/.cline/rules/zeph.md`) |
 | Aider | Conventions file + `read:` directive in `~/.aider.conf.yml` |
