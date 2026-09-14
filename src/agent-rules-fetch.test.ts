@@ -231,3 +231,25 @@ describe('rulesUrl stage derivation', () => {
         expect(m.rulesUrl()).toBe('https://example.test/rules.json');
     });
 });
+
+describe('syncManifestFromCache (worker-thread path)', () => {
+    it('promotes the cache on first call and re-reads only when the file changes', async () => {
+        const mod = await importModule();
+        const dir = join(TMP, '.zeph');
+        mkdirSync(dir, { recursive: true });
+        const write = (version: string) =>
+            writeFileSync(join(dir, 'agent-rules.json'), JSON.stringify({ manifest: { ...VALID_MANIFEST, version } }));
+        // Bundled until a cache exists.
+        expect(mod.syncManifestFromCache()).toBe('bundled');
+        write('2099.01.01.1');
+        expect(mod.syncManifestFromCache()).toBe('cache');
+        expect(mod.getActiveManifest().version).toBe('2099.01.01.1');
+        // Same mtime → no re-read even if the content were different.
+        expect(mod.syncManifestFromCache()).toBe('cache');
+        // A newer file (mtime bumped) is picked up.
+        await new Promise((r) => setTimeout(r, 20));
+        write('2099.01.01.2');
+        expect(mod.syncManifestFromCache()).toBe('cache');
+        expect(mod.getActiveManifest().version).toBe('2099.01.01.2');
+    });
+});
