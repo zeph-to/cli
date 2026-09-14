@@ -95,6 +95,7 @@ describe('in-process subagents in the inventory sweep', () => {
 
         expect(subagent).toMatchObject({
             name: 'zeph-a.1',
+            inProcess: true,
             agentKind: 'claude',
             label: 'Map subagent surfaces',
             state: 'working',
