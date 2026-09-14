@@ -52,6 +52,12 @@ import {
 } from './session-registry.js';
 import { foregroundAgentFor, matchAgentByPaneCommand, REMOTE_AGENTS, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 import {
+    initialSubagentScanState,
+    scanSubagents,
+    type SubagentScanState,
+} from './subagent-transcripts.js';
+import { projectTranscriptEntries, type TranscriptSource } from './transcript-tail.js';
+import {
     installService,
     restartService,
     SERVICE_LABEL,
@@ -114,6 +120,10 @@ interface AgentSession {
      *  sessions are view-only: input, keys, exit, resume and forget are
      *  refused, and the server never pushes agent.state transitions for them. */
     parentName?: string;
+    /** Calls a subagent has made so far, from its own transcript. Only a
+     *  transcript subagent has one: a pane subagent is watched as a screen, and
+     *  nothing counts what happens on it. */
+    toolCount?: number;
     agentSessionId?: string | null;
     project: string;
     label?: string | null;
@@ -754,11 +764,12 @@ const tmuxArgs = (args: string[]): string[] => {
 // ─── Session inventory ──────────────────────────────────────────────
 
 /**
- * Parse a `zeph-*` tmux session name into `{project, label}`. For
- * Phase 1 the wrapper only emits `zeph-<project>` (no labels), so the
- * whole tail becomes the project. When labels land in Phase 2 the
- * wrapper will sidecar `{project, label}` so the listener doesn't need
- * to guess from a name that allows dashes in project names.
+ * Parse a `zeph-*` tmux session name into `{project, label}`. The wrapper
+ * emits `zeph-<project>` and, with `--label <x>`, `zeph-<project>-<x>` — no
+ * sidecar, so the whole tail is the project either way (a labelled session
+ * shows as its own row, which is what a plan-named implementer wants). A
+ * sidecar (`@zeph_session_label`) would let the phone fold it under the
+ * project; nothing writes one yet.
  */
 export const parseSessionName = (name: string): { project: string; label: string | null } | null => {
     if (!name.startsWith('zeph-')) return null;
@@ -805,6 +816,23 @@ export const isSubagentSessionName = (name: string): boolean => /^zeph-.+\.\d+$/
 export const recordTargets = (targets: Record<string, string> | null | undefined): void => {
     targetsBySession = new Map(Object.entries(targets ?? {}));
 };
+
+/**
+ * Subagent name → the transcript it writes, for the ones that have no pane
+ * (`CollectResult.subagentTranscripts`). The addressing map above answers for
+ * pane subagents; this one answers for in-process ones, and it is deliberately
+ * NOT `targets`: a row in there is a pane every write path may address, and
+ * these rows have nothing to address.
+ */
+let subagentTranscriptsBySession = new Map<string, string>();
+
+export const recordSubagentTranscripts = (paths: Record<string, string> | null | undefined): void => {
+    subagentTranscriptsBySession = new Map(Object.entries(paths ?? {}));
+};
+
+/** The transcript of an in-process subagent, or null for anything else. */
+export const subagentTranscriptFor = (name: string): string | null =>
+    subagentTranscriptsBySession.get(name) ?? null;
 
 /**
  * The tmux target for a wire session name: its pinned pane id when the last
@@ -956,10 +984,10 @@ export const deriveSessionState = (
     };
 };
 
-/** Drop trackers for sessions gone from the inventory. */
-const pruneSessionStates = (liveNames: Set<string>): void => {
-    for (const name of sessionStates.keys()) {
-        if (!liveNames.has(name)) sessionStates.delete(name);
+/** Drop per-session entries for sessions gone from the inventory. */
+const pruneToLive = (bySession: Map<string, unknown>, liveNames: Set<string>): void => {
+    for (const name of bySession.keys()) {
+        if (!liveNames.has(name)) bySession.delete(name);
     }
 };
 
@@ -1677,9 +1705,17 @@ export const handleSessionForgetRequest = (
  * session `zeph-x`, pane index 48 and answer for the WRONG thing (or exit 1
  * for a missing index) — so subs are answered from the sweep's target map,
  * which is exactly what "a pane we can address without ambiguity" means.
+ *
+ * An in-process subagent has no pane to address at all, so it is answered from
+ * the transcript map instead. Both maps are the same statement — the last sweep
+ * saw this thing — and the split is which of the two the sweep could record.
  */
-const sessionExists = (name: string): boolean => {
-    if (isSubagentSessionName(name)) return targetsBySession.has(name);
+/** Exported for the same reason as the resolver below: the subagent branch is
+ *  the load-bearing one, and a test has to be able to reach it. */
+export const sessionExists = (name: string): boolean => {
+    if (isSubagentSessionName(name)) {
+        return targetsBySession.has(name) || subagentTranscriptsBySession.has(name);
+    }
     return spawnSync('tmux', tmuxArgs(['has-session', '-t', name]), {
         stdio: ['ignore', 'ignore', 'ignore'],
     }).status === 0;
@@ -2250,6 +2286,59 @@ const leaseFor = (renewing: boolean): number => (renewing ? STREAM_LEASE_MS : ST
 const activeStreams = new Map<string, ActiveStream>();
 
 /**
+ * The transcript a live chat watch should follow for one session name.
+ *
+ * Exported because the two branches here are where a subagent watch lives or
+ * dies, and a test that only reached the module's maps would pass while this
+ * asked tmux about a name tmux cannot parse.
+ */
+export const resolveWatchTranscript = (
+    sessionName: string,
+    onMiss?: (reason: string) => void,
+): TranscriptSource | null => {
+    // Why this returned nothing, for the caller that has a viewer waiting. Only
+    // this function can tell "the row has no resolver" from "the resolver ran
+    // and found nothing", and on the phone those two are the same sentence.
+    const miss = (reason: string): null => {
+        onMiss?.(reason);
+        return null;
+    };
+    // In-process subagents first: they have no pane, and asking tmux about
+    // `zeph-x.3` makes it read the `.3` as a pane index and answer for some
+    // other pane entirely — the parent's, whose transcript is NOT this one.
+    // Claude Code is the only agent with in-process subagents, so the format is
+    // known without asking the table.
+    const subagentTranscript = subagentTranscriptFor(sessionName);
+    if (subagentTranscript) return { path: subagentTranscript, project: projectTranscriptEntries };
+    const info = readPaneInfo(sessionName);
+    if (!info.currentPath) return miss('tmux reported no working directory for this session');
+    // Ask the agent actually running in the pane, through the same detector the
+    // session sweep uses — start_command first, because the foreground process
+    // is usually the interpreter, and quote-stripped, because a leading `"`
+    // once made this exact check miss every wrapped session. An agent whose row
+    // carries no resolver answers null, which the watcher reports as
+    // `no_transcript` — the EXTENSION POINT rule the session-id and
+    // session-name resolvers already follow.
+    //
+    // One lookup answers both halves: `readPaneInfo` above is an uncached tmux
+    // spawn, and resolving path and projector separately would pay for it twice
+    // on a path that runs every TRANSCRIPT_RECHECK_MS per watcher.
+    const agent = detectRemoteAgent(info);
+    if (!agent) return miss('no known agent running in the pane');
+    if (!agent.resolveTranscript) return miss(`${agent.kind} has no transcript resolver`);
+    const path = agent.resolveTranscript(info.currentPath, info.panePid ?? undefined);
+    if (!path) return miss(`${agent.kind} resolver found no transcript under ${info.currentPath}`);
+    // Unreachable for every row in the table as it stands: `remote-agents.test.ts`
+    // ("a row resolves a transcript and reads it, or does neither") rejects a
+    // row that sets one without the other, which is why this branch has no test
+    // of its own. It stays as the fail-closed answer if that invariant ever
+    // drifts — handing the watcher a path nothing can parse would reach the
+    // phone as an empty timeline, which reads as a hung agent.
+    if (!agent.projectTranscript) return miss(`${agent.kind} resolves a transcript but has no projector`);
+    return { path, project: agent.projectTranscript };
+};
+
+/**
  * The live agent-chat timeline (`turn-watch.ts`), kept beside `activeStreams`
  * rather than inside it: both are per-session and both end on socket close, but
  * their lifetimes are driven by different things — a tmux pane for one, a
@@ -2258,19 +2347,7 @@ const activeStreams = new Map<string, ActiveStream>();
  */
 const turnWatchers = createTurnWatchers({
     deviceId: () => computeListenerDeviceId(),
-    resolveTranscript: (sessionName) => {
-        const info = readPaneInfo(sessionName);
-        if (!info.currentPath) return null;
-        // Ask the agent actually running in the pane, through the same detector
-        // the session sweep uses — start_command first, because the foreground
-        // process is usually the interpreter, and quote-stripped, because a
-        // leading `"` once made this exact check miss every wrapped session.
-        // A Codex or Gemini pane carries no resolver yet and answers null, which
-        // the watcher reports as `no_transcript` — the EXTENSION POINT rule the
-        // session-id and session-name resolvers already follow.
-        const agent = detectRemoteAgent(info);
-        return agent?.resolveTranscript?.(info.currentPath, info.panePid ?? undefined) ?? null;
-    },
+    resolveTranscript: resolveWatchTranscript,
     sessionExists: (sessionName) => sessionExists(sessionName),
     initCrypto: async () => { await initDeviceCrypto(); },
     seal: (plaintext, subscriberPublicKey) => encryptEphemeral(plaintext, subscriberPublicKey),
@@ -3178,7 +3255,19 @@ export interface CollectResult {
      *  the pane id every `-t` call for it must use (`tmuxTargetFor`). The main
      *  thread stores it beside the snapshot (`recordTargets`). */
     targets: Record<string, string>;
+    /** Also local: in-process subagent name → its transcript file. The sweep may
+     *  run on a worker, so a map built there has to travel back like `targets`
+     *  rather than live in module state the main thread cannot see. */
+    subagentTranscripts: Record<string, string>;
 }
+
+/**
+ * Per-session subagent scan state, held across sweeps so a chip keeps the
+ * number and label it was first given (`subagent-transcripts.ts`). Lives on
+ * whichever thread runs the sweep; a worker restart renumbers, which costs a
+ * viewer nothing but a re-render.
+ */
+const subagentScans = new Map<string, SubagentScanState>();
 
 /**
  * Inventory pass that also records *why* each `zeph-*` session was
@@ -3205,7 +3294,7 @@ export const collectSessionsVerbose = (): CollectResult => {
         // Invalidate so the next cycle re-runs full discovery instead of
         // wedging the listener at "reported 0 session(s)" forever.
         invalidateTmuxSocketCache();
-        return { sessions: [], rejected: [], targets: {} };
+        return { sessions: [], rejected: [], targets: {}, subagentTranscripts: {} };
     }
 
     const rawLines = (list.stdout ?? '').split('\n').filter(Boolean);
@@ -3266,6 +3355,7 @@ export const collectSessionsVerbose = (): CollectResult => {
     // directory is local knowledge the registry needs, nothing the phone gets.
     const paneCwdOf = new Map<string, string>();
     const targets: Record<string, string> = {};
+    const subagentTranscripts: Record<string, string> = {};
     for (const [name, group] of groups) {
         const parsed = parseSessionName(name);
         if (!parsed) continue; // unreachable — groups only holds parsed names
@@ -3345,8 +3435,63 @@ export const collectSessionsVerbose = (): CollectResult => {
                 ...deriveSessionState(subName, subAgent.kind, capturePaneText(subName, extra.paneId)),
             });
         }
+        // In-process subagents: the ones with no pane at all (Claude Code's
+        // `Agent` tool). They are found in the parent's transcript directory
+        // instead — see `subagent-transcripts.ts` — and reported as the same
+        // view-only rows, numbered around the pane ids just taken above.
+        //
+        // Claude Code only, and the kind is checked here rather than inferred
+        // from `resolveTranscript` existing: that used to mean "Claude", and
+        // stopped meaning it the moment pi and Codex got resolvers of their own.
+        // Without the check every pi and Codex session enters `scanSubagents`,
+        // whose `launchSeen` can never flip for a format that has no launch
+        // line — so it would re-read that session's transcript delta on every
+        // sweep for as long as the session lived, and pay Codex's two-shard
+        // header scan to produce a path it throws away one line later.
+        const transcriptPath = info.currentPath && main.agent.kind === 'claude'
+            ? (main.agent.resolveTranscript?.(info.currentPath, info.panePid ?? undefined) ?? null)
+            : null;
+        if (transcriptPath) {
+            const scan = subagentScans.get(name) ?? initialSubagentScanState();
+            subagentScans.set(name, scan);
+            const reserved = new Set(extras.map(paneNum));
+            for (const row of scanSubagents(name, transcriptPath, scan, { reserved, log })) {
+                // Addressable for longer than it is on the roster: a viewer
+                // already reading a subagent that has gone quiet keeps reading.
+                subagentTranscripts[row.name] = row.transcriptPath;
+                if (!row.live) continue;
+                sessions.push({
+                    name: row.name,
+                    parentName: name,
+                    attached: group.attached,
+                    agentKind: main.agent.kind,
+                    agentSessionId: null,
+                    project: parsed.project,
+                    label: row.label,
+                    // The subagent's own start when its transcript has one, not
+                    // the tmux session's: this row is as old as the work it
+                    // describes, and the phone times it from here.
+                    //
+                    // So this value CHANGES once — tmux's creation time until
+                    // the transcript carries a stamp, the stamp after. Fine
+                    // while nothing sorts subagents by it (the agents list
+                    // sorts on immutable fields and does not list them); a
+                    // surface that starts to would reorder itself.
+                    createdAt: row.startedAt ?? epochToIso(group.created),
+                    lastActivityAt: row.lastActivityAt,
+                    toolCount: row.toolCount,
+                    // Straight from the transcript's own clock: there is no pane
+                    // to read, so the detection rules that turn a screenful of
+                    // text into a state have nothing to work on here.
+                    state: row.working ? 'working' : 'idle',
+                    stateChangedAt: row.lastActivityAt,
+                    stateRuleId: 'transcript-activity',
+                });
+            }
+        }
     }
-    pruneSessionStates(new Set(sessions.map((s) => s.name)));
+    pruneToLive(subagentScans, new Set(groups.keys()));
+    pruneToLive(sessionStates, new Set(sessions.map((s) => s.name)));
     // Write down what each live session IS, while it still exists to be read.
     // tmux forgets a session the moment it ends, which is exactly when the
     // phone wants it back — and a resume must take its directory and its binary
@@ -3363,7 +3508,7 @@ export const collectSessionsVerbose = (): CollectResult => {
             label: s.label,
         })),
     );
-    return { sessions, rejected, targets };
+    return { sessions, rejected, targets, subagentTranscripts };
 };
 
 /**
@@ -3381,6 +3526,7 @@ const collectSessions = (): AgentSession[] => {
     // than one report cycle gets its pane id pinned here rather than falling
     // back to the (focus-following) bare session name.
     recordTargets(result.targets);
+    recordSubagentTranscripts(result.subagentTranscripts);
     return result.sessions;
 };
 
@@ -4058,9 +4204,10 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                 sweepInFlight = false;
             }
         };
-        const publishSessions = ({ sessions, rejected, targets }: CollectResult): void => {
+        const publishSessions = ({ sessions, rejected, targets, subagentTranscripts }: CollectResult): void => {
             recordInventory(sessions);
             recordTargets(targets);
+            recordSubagentTranscripts(subagentTranscripts);
             // Let the user's own status bar say what the phone says. Change-gated
             // internally, so an unchanged sweep spawns nothing.
             syncTmuxAgentNames(sessions);

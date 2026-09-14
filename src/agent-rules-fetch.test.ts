@@ -231,3 +231,42 @@ describe('rulesUrl stage derivation', () => {
         expect(m.rulesUrl()).toBe('https://example.test/rules.json');
     });
 });
+
+describe('syncManifestFromCache (worker-thread path)', () => {
+    it('promotes the cache on first call and re-reads only when the file changes', async () => {
+        const mod = await importModule();
+        const dir = join(TMP, '.zeph');
+        mkdirSync(dir, { recursive: true });
+        const write = (version: string) =>
+            writeFileSync(join(dir, 'agent-rules.json'), JSON.stringify({ manifest: { ...VALID_MANIFEST, version } }));
+        // Bundled until a cache exists.
+        expect(mod.syncManifestFromCache()).toBe('bundled');
+        write('2099.01.01.1');
+        expect(mod.syncManifestFromCache()).toBe('cache');
+        expect(mod.getActiveManifest().version).toBe('2099.01.01.1');
+        // Same mtime → no re-read even if the content were different.
+        expect(mod.syncManifestFromCache()).toBe('cache');
+        // A newer file (mtime bumped) is picked up.
+        await new Promise((r) => setTimeout(r, 20));
+        write('2099.01.01.2');
+        expect(mod.syncManifestFromCache()).toBe('cache');
+        expect(mod.getActiveManifest().version).toBe('2099.01.01.2');
+    });
+
+    it('does not latch a torn read — the next sweep retries the same file', async () => {
+        const mod = await importModule();
+        const dir = join(TMP, '.zeph');
+        mkdirSync(dir, { recursive: true });
+        const file = join(dir, 'agent-rules.json');
+        writeFileSync(file, '{"manifest": {"engineVersion": 1, "version": "2099.0');
+        expect(mod.syncManifestFromCache()).toBe('bundled');
+        // Same mtime is fine: the write completing is what we are waiting for.
+        // Simulate it without touching mtime by writing the full file back with
+        // the times restored.
+        const { utimesSync, statSync } = await import('node:fs');
+        const st = statSync(file);
+        writeFileSync(file, JSON.stringify({ manifest: { ...VALID_MANIFEST, version: '2099.01.01.1' } }));
+        utimesSync(file, st.atime, st.mtime);
+        expect(mod.syncManifestFromCache()).toBe('cache');
+    });
+});

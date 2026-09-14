@@ -13,6 +13,7 @@ import {
     MAX_EVENT_FIELD_CHARS,
     MAX_EVENT_TEXT_CHARS,
     EDIT_DIFF_MAX_CHARS,
+    targetFrom,
 } from './transcript-tail.js';
 
 let dir: string;
@@ -471,6 +472,18 @@ describe('projectTranscriptEntries', () => {
         expect(events).toEqual([{ kind: 'tool', id: 't8', name: 'Agent', target: 'find callers' }]);
     });
 
+    it('keeps sidechain entries when reading a subagent\'s own transcript — every line there is one', () => {
+        const events = projectTranscriptEntries([
+            line({
+                type: 'assistant',
+                isSidechain: true,
+                message: { role: 'assistant', content: [{ type: 'tool_use', id: 's1', name: 'Grep', input: {} }] },
+            }),
+        ], { includeSidechain: true });
+
+        expect(events).toEqual([{ kind: 'tool', id: 's1', name: 'Grep' }]);
+    });
+
     it('ignores unparseable and non-message lines instead of throwing', () => {
         const events = projectTranscriptEntries(['not json', line({ type: 'ai-title', aiTitle: 'x' }), textLine('ok')]);
 
@@ -618,5 +631,30 @@ describe('projectTranscriptEntries', () => {
         ]);
 
         expect(events).toEqual([]);
+    });
+});
+
+/**
+ * The loop every projector shares, with the key list none of them share. It is
+ * exported so pi's and Codex's projectors do not each grow a copy that differs
+ * only in that list — which is how the "second projector, not a longer list"
+ * rule on `TARGET_KEYS` gets broken by accident.
+ */
+describe('targetFrom', () => {
+    it('takes the first key that holds a non-blank string', () => {
+        expect(targetFrom({ b: 'second', a: 'first' }, ['a', 'b'])).toBe('first');
+        expect(targetFrom({ a: '   ', b: 'second' }, ['a', 'b'])).toBe('second');
+    });
+
+    it('answers undefined for a miss, a non-string value, or a non-object input', () => {
+        expect(targetFrom({ a: 'x' }, ['b'])).toBeUndefined();
+        expect(targetFrom({ a: 42 }, ['a'])).toBeUndefined();
+        expect(targetFrom(null, ['a'])).toBeUndefined();
+        expect(targetFrom('not an object', ['a'])).toBeUndefined();
+    });
+
+    it('clamps to the same field budget the wire gives every projector', () => {
+        const long = 'x'.repeat(MAX_EVENT_FIELD_CHARS + 100);
+        expect(targetFrom({ a: long }, ['a'])!.length).toBe(MAX_EVENT_FIELD_CHARS);
     });
 });

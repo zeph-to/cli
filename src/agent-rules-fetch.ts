@@ -18,7 +18,7 @@
  * the server caught up. Server-side rollback still works: the server
  * bumps the version even when reverting rule content.
  */
-import { readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { CONFIG_DIR, loadConfig, resolvedEnv } from './config.js';
 import {
@@ -152,6 +152,40 @@ export const loadManifestFromCache = (): ManifestSource => {
         // Missing/corrupt cache — bundled rules carry the session.
     }
     return activeSource;
+};
+
+/** mtime of the cache file the last time `syncManifestFromCache` looked; null = no file. */
+let cacheSeenMtime: number | null | undefined;
+
+/**
+ * Worker-thread path. A `worker_threads` Worker gets its own module instance,
+ * so `loadManifestFromCache` on the main thread leaves the worker on
+ * `DEFAULT_MANIFEST` — and the bundled manifest carries rules for claude only.
+ * Every agent whose rules arrive OTA (pi, codex, gemini) then classified as
+ * `unknown` for the life of the daemon (2026-09-14: a pi session whose pane the
+ * same rules classified `working` in-thread). Call this before each sweep: it
+ * reloads the cache only when the file changed, so the main thread's refresh
+ * reaches the worker on its next sweep without any message-protocol change.
+ */
+export const syncManifestFromCache = (): ManifestSource => {
+    let mtime: number | null;
+    try {
+        mtime = statSync(RULES_CACHE_FILE).mtimeMs;
+    } catch {
+        mtime = null;
+    }
+    if (mtime === cacheSeenMtime) return activeSource;
+    if (mtime === null) {
+        cacheSeenMtime = null;
+        return activeSource;
+    }
+    const source = loadManifestFromCache();
+    // Latch only a read that landed. The cache is written without tmp+rename,
+    // so a stat/read from this thread can catch it half-written; a 304 refresh
+    // never rewrites the file, so latching that torn read would leave this
+    // thread on bundled rules for the daemon's life.
+    if (source === 'cache') cacheSeenMtime = mtime;
+    return source;
 };
 
 const readCachedEtag = (): string | undefined => {

@@ -128,6 +128,31 @@ a 30-second idle heartbeat. The phone picker stays in sync with no
 manual configuration, and an idle listener costs the backend a fraction
 of what a fixed 5-second report cycle would.
 
+### Live timeline
+
+While a session is working, the phone can draw what the agent is doing right
+now — the prompt that started the turn, each tool call and its outcome, the
+agent's own replies, and per-message token counts. It is read by tailing the
+agent's transcript on disk; nothing a tool read or wrote leaves the machine,
+only names, short labels and numbers.
+
+Each agent stores its transcript differently, so a row in `REMOTE_AGENT_TABLE`
+(`src/remote-agents.ts`) names two things: where the file is, and which
+projector reads it. An agent with neither answers `no_transcript` and the phone
+says it has no live timeline.
+
+| Agent | Transcript | Projector |
+|-------|-----------|-----------|
+| Claude Code | `~/.claude/projects/<encoded cwd>/<uuid>.jsonl` | `src/transcript-tail.ts` |
+| pi | `~/.pi/agent/sessions/<encoded cwd>/<ts>_<id>.jsonl` (`PI_CODING_AGENT_DIR`) | `src/pi-transcript.ts` |
+| Codex CLI | `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl` (`CODEX_HOME`) | `src/codex-transcript.ts` |
+| Cursor, Gemini, Hermes, OpenCode | — none yet | — |
+
+Adding an agent means a projector file of its own, not another branch in an
+existing one: the formats share no vocabulary. Each projector is pinned to the
+vendor layout it was read against, and an entry type it has never seen draws no
+row rather than breaking the watch.
+
 ### Remote-origin detection (sticky REMOTE mode)
 
 A message injected via `send-keys` is indistinguishable from typing — so
@@ -146,13 +171,19 @@ an answerable `zeph_ask`).
 | Pi | `before_agent_start` → `zeph remote-hook pi` (via extension) | `zeph setup` |
 | Cursor CLI | — none yet | — |
 
-**Subagents (view-only).** A pi subagent spawned into an extra pane of the
-same tmux window shows up on your phone as a child of its parent card, named
-`<session>.<pane>` — its terminal mirror streams live, but input, keys, exit,
+**Subagents (view-only).** A subagent shows up on your phone as a child of its
+parent card, named `<session>.<n>` — it streams live, but input, keys, exit,
 resume and forget are all refused: you watch from the phone and answer at the
-terminal, where the parent owns the conversation. The pane is labelled from
-`@zeph_pane_label` (the pi extension sets it from `PI_SUBAGENT_NAME`), and a
-prompt push from a subagent names it and opens its stream directly.
+terminal, where the parent owns the conversation. A prompt push from a subagent
+names it and opens its stream directly.
+
+They reach the roster two ways. A pi subagent spawned into an extra pane of the
+same tmux window is found as a pane, and labelled from `@zeph_pane_label` (the
+pi extension sets it from `PI_SUBAGENT_NAME`). A Claude Code subagent — the
+`Agent` tool — has no pane at all; it is found in the parent's transcript
+directory instead (`src/subagent-transcripts.ts`), labelled from the
+description the parent gave it, and carries the number of tools it has run so
+far. Both kinds are numbered in one sequence, so the names never collide.
 
 Detection is exact-match: a terminal keystroke racing a phone message
 can never false-flag. Muted projects are never flagged.
@@ -251,6 +282,16 @@ block here.
    zeph hermes    # hermes       → tmux session "zeph-<project>"
    zeph pi        # pi           → tmux session "zeph-<project>"
    zeph opencode  # opencode     → tmux session "zeph-<project>"
+   ```
+
+   Two wrapper flags, read off the front of the args: `--detach` creates
+   the session without attaching (no TTY needed — a script or another
+   agent's pane can launch it) and prints its name; `--label <x>` names
+   it `zeph-<project>-<x>` instead of the `-2/-3` family. Example — a
+   Claude Code planner starting a pi implementer for one plan:
+
+   ```bash
+   zeph pi --detach --label 20260914-PLAN-11-32-44-pi -n 20260914-PLAN-11-32-44 '/skill:02-implement .claude/20260914/PLAN-11-32-44.md'
    ```
 
    `zeph cursor` runs **`cursor-agent`**, Cursor's terminal agent — a
@@ -576,7 +617,7 @@ zeph notify --title "Hello" --json
 | `dismiss <id>` | Dismiss a push (or `--all`) |
 | `rename <name>` | Set the current agent session's display name in the app — run inside a `zeph cc` session (`--clear` resets). Auto-detects the tmux session + this machine's listener device id, so the alias lands on the right device |
 | `test` | Verify connection and API key |
-| `cc` · `codex` · `gemini` | Run the agent in a `zeph-<project>` tmux session — reattaches a detached session of that project (newest suffix first) when there is one, else auto-suffixes `-2`, `-3`, …. Auto-spawns the background listener on first invocation so the phone picker just works. Trailing args pass through to the agent (`zeph cc --resume "..."`). On node 22.15+ the wrapper hands its process to tmux rather than waiting on it, so a running session shows no `zeph cc` of its own in `ps` — older runtimes and Windows keep the waiting wrapper |
+| `cc` · `codex` · `gemini` | Run the agent in a `zeph-<project>` tmux session — reattaches a detached session of that project (newest suffix first) when there is one, else auto-suffixes `-2`, `-3`, …. Auto-spawns the background listener on first invocation so the phone picker just works. Trailing args pass through to the agent (`zeph cc --resume "..."`). On node 22.15+ the wrapper hands its process to tmux rather than waiting on it, so a running session shows no `zeph cc` of its own in `ps` — older runtimes and Windows keep the waiting wrapper `--detach` / `--label <x>` (front of the args) create without attaching / pin the name — see "Run agents through the wrapper" above. |
 | `mcp` | Run the MCP server on stdio, in this process. What agent MCP configs launch — `zeph install` registers it and you never type it. Replaces the old `npx -y @zeph-to/mcp-server` registration, which left an `npm exec` launcher resident alongside the server for the life of the session. `@zeph-to/mcp-server` ships as a dependency now, so it updates with the CLI rather than being re-fetched by `npx` on every launch — `zeph check-update` reports the version you actually have |
 | `listener` | (Usually unnecessary — `zeph cc` autospawns it.) Resident daemon: subscribes via WebSocket, reports tmux session inventory every 5 s, injects `agent.command` pushes into the matching session. Run in the foreground for SDK development; otherwise let `zeph cc` manage it |
 

@@ -13,10 +13,13 @@
  * case for keeping them apart: the `cursor` install id there means the
  * IDE, while the drivable binary here is `cursor-agent`, its terminal TUI.
  */
-import { readdirSync, readFileSync, statSync } from 'fs';
+import { closeSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'fs';
 import { homedir } from 'os';
-import { join, basename } from 'path';
+import { join, basename, resolve } from 'path';
 import { spawnSync } from 'child_process';
+import { projectTranscriptEntries, type TranscriptProjector } from './transcript-tail.js';
+import { projectPiEntries } from './pi-transcript.js';
+import { projectCodexEntries } from './codex-transcript.js';
 
 export interface RemoteAgent {
     /** Wire value for AgentSession.agentKind (server/phone contract). */
@@ -67,9 +70,19 @@ export interface RemoteAgent {
      * carries this only once that agent's transcript format is confirmed, and a
      * pane whose agent omits it answers `no_transcript` rather than guessing.
      * That is the seam a second agent hangs off — the reader that parses the
-     * file is the other half, and lives beside this one.
+     * file is `projectTranscript` below.
      */
     resolveTranscript?: (paneCwd: string, panePid?: number) => string | null;
+    /**
+     * Read this agent's transcript lines into the events the timeline draws.
+     *
+     * Set with `resolveTranscript` or not at all — `remote-agents.test.ts`
+     * enforces the pair over the whole table. Half a pair is the one failure
+     * mode worth a test here: a path nothing can parse reaches the phone as an
+     * empty timeline, which reads as a hung agent, where the missing row would
+     * have said "no live timeline" and been true.
+     */
+    projectTranscript?: TranscriptProjector;
 }
 
 /**
@@ -486,6 +499,110 @@ export const claudeTranscriptPath = (paneCwd: string | null, panePid?: number): 
     }
 };
 
+// ── pi ───────────────────────────────────────────────────────────
+
+/**
+ * Where pi keeps its sessions, honouring the override pi itself honours.
+ *
+ * `getAgentDir()` (`…/pi-coding-agent/dist/config.js:421-426`) reads
+ * `PI_CODING_AGENT_DIR` — named `${APP_NAME.toUpperCase()}_CODING_AGENT_DIR` at
+ * `config.js:406` — and expands a leading `~` before falling back to
+ * `~/.pi/agent`. Hardcoding the fallback would answer `null` for every session
+ * belonging to anyone who sets it, and answer it silently.
+ *
+ * Read per call rather than at module load: the listener is long-lived, and a
+ * constant captured at import time is a constant captured before the service
+ * environment is in place.
+ */
+const piSessionsDir = (): string => {
+    const override = process.env.PI_CODING_AGENT_DIR;
+    const agentDir = override
+        ? override.replace(/^~(?=\/|$)/, homedir())
+        : join(homedir(), '.pi', 'agent');
+    return join(agentDir, 'sessions');
+};
+
+/**
+ * pi's own encoding of a cwd into one directory name, copied from the writer
+ * rather than inferred from the directories it produced.
+ *
+ * Read 2026-09-14 out of `@earendil-works/pi-coding-agent`,
+ * `dist/core/session-manager.js:245` (`getDefaultSessionDirPath`), which
+ * `dist/migrations.js:102` repeats verbatim:
+ *
+ *     `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`
+ *
+ * Worth copying exactly rather than eyeballing, because it differs from Claude's
+ * on the case that matters: Claude maps `.` to `-` as well, pi does not. A
+ * directory with a dot in it resolves under one rule and not the other, and the
+ * failure is silent — a watcher polling a path that never existed.
+ *
+ * The `resolvePath(cwd)` on the line above that regex is part of the rule, not
+ * preamble: `dist/utils/paths.js:82-86` expands a leading `~` and then runs
+ * `path.resolve`. Encoding the raw string instead turns a trailing slash into a
+ * doubled separator (`--a-b---`) and leaves `.`/`..` segments in the directory
+ * name, both of which resolve to a path pi has never written.
+ */
+const piSessionDirName = (cwd: string): string => {
+    const expanded = cwd.replace(/^~(?=\/|$)/, homedir());
+    const resolved = resolve(expanded);
+    return `--${resolved.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
+};
+
+/**
+ * Newest session file pi wrote for this directory.
+ *
+ * Same 60s TTL and the same reason as `claudeSessionCache`: `turn-watch`
+ * re-resolves every 10s per watcher, and a directory a person has run pi in for
+ * months holds one file per run.
+ *
+ * Keyed on the pane's pid as well as its cwd, so a pi that was restarted in the
+ * same directory is not followed on the previous run's file for the rest of the
+ * TTL. Within one pid the answer genuinely cannot change: pi writes one
+ * transcript per process, and `/clear` inside it keeps writing to that file.
+ */
+const piSessionCache = keyedTtlCache<string, string | null>(60_000);
+
+const doDetectPiTranscript = (cwd: string): string | null => {
+    try {
+        const sessionDir = join(piSessionsDir(), piSessionDirName(cwd));
+        let latest: { path: string; mtime: number } | undefined;
+        for (const entry of readdirSync(sessionDir)) {
+            // `<ISO timestamp>_<uuid>.jsonl`, beside a `.jsonl.loadout.json`
+            // sidecar per session that is not a transcript.
+            if (!entry.endsWith('.jsonl')) continue;
+            const path = join(sessionDir, entry);
+            const stat = statSync(path);
+            if (!stat.isFile()) continue;
+            if (!latest || stat.mtimeMs > latest.mtime) latest = { path, mtime: stat.mtimeMs };
+        }
+        return latest?.path ?? null;
+    } catch {
+        return null;
+    }
+};
+
+/**
+ * The transcript a pi pane is writing, or null when there is none to follow.
+ *
+ * Newest-by-mtime within the directory. pi keeps no pid→session record the way
+ * Claude Code does, so `panePid` cannot pick between two pi panes sharing a
+ * directory — both resolve to the newer session's file. That is the known limit
+ * of this resolver, and it is the same shape as Claude's mtime fallback.
+ *
+ * `panePid` still matters, as the cache key: a restart in the same directory
+ * writes a new file, and a cwd-only key would keep answering with the old one
+ * until the TTL ran out.
+ */
+export const piTranscriptPath = (paneCwd: string | null, panePid?: number): string | null => {
+    if (!paneCwd) return null;
+    // `|` is safe as the separator because the left half is always numeric.
+    const key = `${panePid ?? 0}|${paneCwd}`;
+    const cached = piSessionCache.get(key);
+    if (cached) return cached.value;
+    return piSessionCache.set(key, doDetectPiTranscript(paneCwd));
+};
+
 // ── Agents whose session store keeps no pid ──────────────────────
 //
 // Hermes and Codex both record a session per cwd with a creation timestamp and
@@ -698,6 +815,178 @@ export const detectCodexSessionName = (
     return nonBlank(row?.name ?? undefined) ?? nonBlank(row?.title ?? undefined);
 };
 
+/**
+ * Where Codex keeps its rollouts.
+ *
+ * `CODEX_HOME` overrides `~/.codex`, and the writer resolves it per run — the
+ * binary carries both `CODEX_HOME: ` (its `doctor` report) and
+ * `failed to resolve CODEX_HOME`. Read per call for the same reason
+ * `piSessionsDir` is: a constant captured at import time is captured before the
+ * service environment is in place.
+ */
+const codexSessionsDir = (): string => {
+    const override = process.env.CODEX_HOME;
+    const home = override ? override.replace(/^~(?=\/|$)/, homedir()) : CODEX_DIR;
+    return join(home, 'sessions');
+};
+
+/**
+ * The two newest `sessions/<YYYY>/<MM>/<DD>` shards.
+ *
+ * Codex shards by date and puts no cwd anywhere in the path, so finding a
+ * session means opening files. Two shards is the bound: the newest holds every
+ * session started today, and the one before it covers a session started before
+ * midnight and still running. Sorting the names rather than computing today's
+ * date is deliberate — the shard is named in the writer's timezone, and a
+ * machine whose UTC date has already turned over would look in a directory that
+ * does not exist yet on a date-arithmetic rule.
+ */
+const newestCodexShards = (root: string, limit = 2): string[] => {
+    const descend = (dir: string): string[] => {
+        try {
+            return readdirSync(dir).filter((e) => /^\d+$/.test(e)).sort().reverse();
+        } catch {
+            return [];
+        }
+    };
+    const shards: string[] = [];
+    for (const year of descend(root)) {
+        for (const month of descend(join(root, year))) {
+            for (const day of descend(join(root, year, month))) {
+                shards.push(join(root, year, month, day));
+                if (shards.length >= limit) return shards;
+            }
+        }
+    }
+    return shards;
+};
+
+/**
+ * How much of a rollout is read at a time to find its `session_meta` header, and
+ * how far that read will go before giving up.
+ *
+ * The first line carries `base_instructions` — measured at 21551 bytes of a
+ * 22049-byte header in the newest session here — and that field grows with the
+ * user's AGENTS.md and skill set, so a single fixed read is a bound someone
+ * eventually crosses. Crossing it would answer null forever and show as "this
+ * agent has no live timeline", with nothing to say why; the chunked read below
+ * costs one extra `readSync` per oversized header instead.
+ *
+ * The outer cap exists because this runs against whatever files are in the
+ * directory, and a file with no newline in it at all must not be read whole.
+ */
+const CODEX_HEADER_CHUNK = 64 * 1024;
+const CODEX_HEADER_MAX = 256 * 1024;
+
+/** The first line of a file, or null when it holds none within {@link CODEX_HEADER_MAX}. */
+const firstLineOf = (path: string): string | null => {
+    let fd: number | undefined;
+    try {
+        fd = openSync(path, 'r');
+        const buffer = Buffer.allocUnsafe(CODEX_HEADER_CHUNK);
+        // Accumulated as bytes, not as a string: a chunk boundary can fall in
+        // the middle of a multi-byte character, and decoding each chunk on its
+        // own would both corrupt that character and desynchronise the read
+        // offset from the byte position it has to be.
+        const chunks: Buffer[] = [];
+        let size = 0;
+        while (size < CODEX_HEADER_MAX) {
+            const read = readSync(fd, buffer, 0, CODEX_HEADER_CHUNK, size);
+            if (read === 0) return null;
+            const filled = buffer.subarray(0, read);
+            const end = filled.indexOf(0x0a);
+            if (end !== -1) {
+                chunks.push(Buffer.from(filled.subarray(0, end)));
+                return Buffer.concat(chunks).toString('utf8');
+            }
+            chunks.push(Buffer.from(filled));
+            size += read;
+        }
+        return null;
+    } catch {
+        return null;
+    } finally {
+        if (fd !== undefined) closeSync(fd);
+    }
+};
+
+interface CodexRollout {
+    readonly path: string;
+    readonly mtime: number;
+    readonly startedAt: number | null;
+}
+
+/** The `session_meta` header of a rollout, when it names this pane's directory. */
+const codexRolloutFor = (path: string, cwd: string, mtime: number): CodexRollout | null => {
+    const line = firstLineOf(path);
+    if (!line) return null;
+    try {
+        const entry = JSON.parse(line) as { type?: unknown; payload?: Record<string, unknown> };
+        if (entry.type !== 'session_meta' || !entry.payload) return null;
+        if (entry.payload.cwd !== cwd) return null;
+        const at = typeof entry.payload.timestamp === 'string' ? Date.parse(entry.payload.timestamp) : NaN;
+        return { path, mtime, startedAt: Number.isFinite(at) ? at : null };
+    } catch {
+        return null;
+    }
+};
+
+const doDetectCodexTranscript = (cwd: string, panePid: number | undefined): string | null => {
+    const resolved = resolve(cwd.replace(/^~(?=\/|$)/, homedir()));
+    const candidates: CodexRollout[] = [];
+    for (const shard of newestCodexShards(codexSessionsDir())) {
+        let entries: string[];
+        try {
+            entries = readdirSync(shard);
+        } catch {
+            continue;
+        }
+        for (const entry of entries) {
+            if (!entry.startsWith('rollout-') || !entry.endsWith('.jsonl')) continue;
+            const path = join(shard, entry);
+            try {
+                const stat = statSync(path);
+                if (!stat.isFile()) continue;
+                const rollout = codexRolloutFor(path, resolved, stat.mtimeMs);
+                if (rollout) candidates.push(rollout);
+            } catch {
+                continue;
+            }
+        }
+    }
+    if (candidates.length === 0) return null;
+
+    // Two Codex panes in one directory are told apart the way Hermes and Codex
+    // session names already are: the rollout stamped when a process in this pane
+    // started is this pane's. A miss falls back to the newest file rather than
+    // answering nothing, because one pane in a directory is the normal case and
+    // it has no process-start match to make when the pane's pid is unknown.
+    const matched = panePid === undefined
+        ? null
+        : pickRowByProcStart(candidates, (c) => c.startedAt, psStartTimes(), collectDescendantPids(panePid));
+    if (matched) return matched.path;
+    return candidates.reduce((best, c) => (c.mtime > best.mtime ? c : best)).path;
+};
+
+/**
+ * Newest session file Codex wrote for this directory.
+ *
+ * Cached harder than pi's, and for a reason pi's does not have: this resolver
+ * opens and parses a 22KB header out of every rollout in two date shards just to
+ * read one `cwd` field, and `turn-watch` re-resolves every 10s per watcher on a
+ * path documented as uncached and blocking.
+ */
+const codexSessionCache = keyedTtlCache<string, string | null>(60_000);
+
+export const codexTranscriptPath = (paneCwd: string | null, panePid?: number): string | null => {
+    if (!paneCwd) return null;
+    // `|` is safe as the separator because the left half is always numeric.
+    const key = `${panePid ?? 0}|${paneCwd}`;
+    const cached = codexSessionCache.get(key);
+    if (cached) return cached.value;
+    return codexSessionCache.set(key, doDetectCodexTranscript(paneCwd, panePid));
+};
+
 // ── The registry ─────────────────────────────────────────────────
 
 const REMOTE_AGENT_TABLE = [
@@ -715,6 +1004,7 @@ const REMOTE_AGENT_TABLE = [
         resolveSessionName: (paneCwd, panePid) =>
             panePid !== undefined ? detectClaudeSessionNameByPid(panePid, paneCwd) : null,
         resolveTranscript: (paneCwd, panePid) => claudeTranscriptPath(paneCwd, panePid),
+        projectTranscript: projectTranscriptEntries,
     },
     {
         kind: 'codex',
@@ -724,6 +1014,8 @@ const REMOTE_AGENT_TABLE = [
         // Name only, like the hermes row: the store's thread id is a UUID this
         // resolver could return, but nothing on the wire consumes it yet.
         resolveSessionName: detectCodexSessionName,
+        resolveTranscript: (paneCwd, panePid) => codexTranscriptPath(paneCwd, panePid),
+        projectTranscript: projectCodexEntries,
     },
     {
         // The pane binary is `cursor-agent`, Cursor's terminal TUI — NOT the
@@ -761,6 +1053,8 @@ const REMOTE_AGENT_TABLE = [
         displayName: 'Pi',
         binary: 'pi',
         subcommands: ['pi'],
+        resolveTranscript: (paneCwd, panePid) => piTranscriptPath(paneCwd, panePid),
+        projectTranscript: projectPiEntries,
     },
     {
         kind: 'opencode',
