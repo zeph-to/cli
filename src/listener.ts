@@ -124,6 +124,10 @@ interface AgentSession {
      *  transcript subagent has one: a pane subagent is watched as a screen, and
      *  nothing counts what happens on it. */
     toolCount?: number;
+    /** Set on a subagent with no pane at all (Claude Code's `Agent` tool): there
+     *  is no screen to stream, only its transcript. Absent on a pane subagent —
+     *  which can run Claude Code too, so the kind cannot stand in for this. */
+    inProcess?: true;
     agentSessionId?: string | null;
     project: string;
     label?: string | null;
@@ -3463,6 +3467,7 @@ export const collectSessionsVerbose = (): CollectResult => {
                 sessions.push({
                     name: row.name,
                     parentName: name,
+                    inProcess: true,
                     attached: group.attached,
                     agentKind: main.agent.kind,
                     agentSessionId: null,

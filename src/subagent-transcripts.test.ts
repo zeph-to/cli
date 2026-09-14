@@ -75,6 +75,34 @@ const appendLaunch = (parentPath: string): void => {
     writeFileSync(parentPath, `${line}\n`, { flag: 'a' });
 };
 
+/** The body Claude Code wraps a background subagent's end in — measured shape,
+ *  trimmed to the fields that identify it. */
+const notificationText = (agentId: string, status: string): string =>
+    `<task-notification>\n<task-id>${agentId}</task-id>\n<tool-use-id>toolu_x</tool-use-id>\n`
+    + `<status>${status}</status>\n<summary>Agent "work" finished</summary>\n</task-notification>`;
+
+/** A background subagent ending: the parent receives the notice as a user turn. */
+const appendTaskNotification = (parentPath: string, agentId: string, status: string, atMs: number): void => {
+    const line = JSON.stringify({
+        type: 'user',
+        timestamp: new Date(atMs).toISOString(),
+        origin: { kind: 'task-notification' },
+        message: { role: 'user', content: notificationText(agentId, status) },
+    });
+    writeFileSync(parentPath, `${line}\n`, { flag: 'a' });
+};
+
+/** A foreground subagent ending: its `Agent` call returns, carrying the agent id. */
+const appendForegroundResult = (parentPath: string, agentId: string, atMs: number): void => {
+    const line = JSON.stringify({
+        type: 'user',
+        timestamp: new Date(atMs).toISOString(),
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'done' }] },
+        toolUseResult: { status: 'completed', agentId, totalToolUseCount: 3 },
+    });
+    writeFileSync(parentPath, `${line}\n`, { flag: 'a' });
+};
+
 afterEach(() => {
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
@@ -293,6 +321,99 @@ describe('scanSubagents', () => {
 
         expect(rows[0]!.toolCount).toBe(0);
         expect(rows[0]!.startedAt).toBeNull();
+    });
+
+    // A finished subagent's transcript simply stops growing, which is also what
+    // a thinking one looks like. The parent is told when it ends, in one of two
+    // shapes, and that is what takes it off the roster — not five quiet minutes.
+    describe('ends a subagent when the parent is told it finished', () => {
+        it('on a background task notification', () => {
+            const { parentPath, subagentDir } = projectFixture();
+            writeSubagentFile(subagentDir, 'bg', 10_000);
+            appendLaunch(parentPath);
+            appendTaskNotification(parentPath, 'bg', 'completed', NOW - 5_000);
+
+            const rows = scanSubagents('zeph-x', parentPath, initialSubagentScanState(), { now: NOW });
+
+            // Off the roster, still addressable: a viewer reading it keeps reading.
+            expect(rows).toHaveLength(1);
+            expect(rows[0]).toMatchObject({ agentId: 'bg', live: false, working: false });
+        });
+
+        it('on every way a background subagent can stop, not only success', () => {
+            const { parentPath, subagentDir } = projectFixture();
+            for (const status of ['failed', 'killed', 'stopped']) {
+                writeSubagentFile(subagentDir, status, 10_000);
+                appendTaskNotification(parentPath, status, status, NOW - 5_000);
+            }
+
+            const rows = scanSubagents('zeph-x', parentPath, initialSubagentScanState(), { now: NOW });
+
+            expect(rows.map((r) => r.live)).toEqual([false, false, false]);
+        });
+
+        it('on a foreground call returning its result', () => {
+            const { parentPath, subagentDir } = projectFixture();
+            writeSubagentFile(subagentDir, 'fg', 10_000);
+            appendForegroundResult(parentPath, 'fg', NOW - 5_000);
+
+            const rows = scanSubagents('zeph-x', parentPath, initialSubagentScanState(), { now: NOW });
+
+            expect(rows[0]).toMatchObject({ agentId: 'fg', live: false });
+        });
+
+        it('finds out on a later sweep, after the parent had already been read', () => {
+            const { parentPath, subagentDir } = projectFixture();
+            writeSubagentFile(subagentDir, 'bg', 10_000);
+            appendLaunch(parentPath);
+            const state = initialSubagentScanState();
+            expect(scanSubagents('zeph-x', parentPath, state, { now: NOW })[0]!.live).toBe(true);
+
+            appendTaskNotification(parentPath, 'bg', 'completed', NOW - 5_000);
+
+            expect(scanSubagents('zeph-x', parentPath, state, { now: NOW })[0]!.live).toBe(false);
+        });
+
+        // SendMessage resumes a finished subagent into the same transcript. A
+        // write after the notice is new work, and the notice no longer describes it.
+        it('brings a subagent back when it writes again after the notice', () => {
+            const { parentPath, subagentDir } = projectFixture();
+            writeSubagentFile(subagentDir, 'bg', 1_000);
+            appendTaskNotification(parentPath, 'bg', 'completed', NOW - 5_000);
+
+            const rows = scanSubagents('zeph-x', parentPath, initialSubagentScanState(), { now: NOW });
+
+            expect(rows[0]).toMatchObject({ agentId: 'bg', live: true, working: true });
+        });
+
+        // The subagent's last write can land a few milliseconds after the parent
+        // records its end — measured on real transcripts, the final flush trails.
+        it('still ends a subagent whose last write trails the notice by a moment', () => {
+            const { parentPath, subagentDir } = projectFixture();
+            writeSubagentFile(subagentDir, 'bg', 10_000);
+            appendTaskNotification(parentPath, 'bg', 'completed', NOW - 10_000 - 40);
+
+            const rows = scanSubagents('zeph-x', parentPath, initialSubagentScanState(), { now: NOW });
+
+            expect(rows[0]!.live).toBe(false);
+        });
+
+        it('does not read a notice that is only quoted as one', () => {
+            const { parentPath, subagentDir } = projectFixture();
+            writeSubagentFile(subagentDir, 'bg', 10_000);
+            // The parent's own reply repeating the notice text, as this very
+            // conversation does when it reports a subagent finishing.
+            const quoted = JSON.stringify({
+                type: 'assistant',
+                timestamp: new Date(NOW - 5_000).toISOString(),
+                message: { role: 'assistant', content: [{ type: 'text', text: notificationText('bg', 'completed') }] },
+            });
+            writeFileSync(parentPath, `${quoted}\n`, { flag: 'a' });
+
+            const rows = scanSubagents('zeph-x', parentPath, initialSubagentScanState(), { now: NOW });
+
+            expect(rows[0]!.live).toBe(true);
+        });
     });
 
     it('stays quiet for a session that never launched a subagent', () => {

@@ -159,6 +159,8 @@ describe('subagent panes — sweep, view-only, addressing', () => {
         expect(subs.map((s) => s.name)).toEqual(['zeph-a.5', 'zeph-a.9']);
         expect(subs.every((s) => s.parentName === 'zeph-a')).toBe(true);
         expect(subs.every((s) => s.agentKind === 'pi')).toBe(true);
+        // A pane is a screen to stream; only a pane-less subagent says otherwise.
+        expect(subs.every((s) => s.inProcess === undefined)).toBe(true);
         expect(subs.every((s) => s.project === 'a')).toBe(true);
         // Fallback label numbers per kind; the labelled pane keeps its own.
         expect(subs.map((s) => s.label)).toEqual(['Pi 1', 'Scout']);
