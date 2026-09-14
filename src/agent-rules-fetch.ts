@@ -175,8 +175,17 @@ export const syncManifestFromCache = (): ManifestSource => {
         mtime = null;
     }
     if (mtime === cacheSeenMtime) return activeSource;
-    cacheSeenMtime = mtime;
-    return mtime === null ? activeSource : loadManifestFromCache();
+    if (mtime === null) {
+        cacheSeenMtime = null;
+        return activeSource;
+    }
+    const source = loadManifestFromCache();
+    // Latch only a read that landed. The cache is written without tmp+rename,
+    // so a stat/read from this thread can catch it half-written; a 304 refresh
+    // never rewrites the file, so latching that torn read would leave this
+    // thread on bundled rules for the daemon's life.
+    if (source === 'cache') cacheSeenMtime = mtime;
+    return source;
 };
 
 const readCachedEtag = (): string | undefined => {

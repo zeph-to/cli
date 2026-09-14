@@ -252,4 +252,21 @@ describe('syncManifestFromCache (worker-thread path)', () => {
         expect(mod.syncManifestFromCache()).toBe('cache');
         expect(mod.getActiveManifest().version).toBe('2099.01.01.2');
     });
+
+    it('does not latch a torn read — the next sweep retries the same file', async () => {
+        const mod = await importModule();
+        const dir = join(TMP, '.zeph');
+        mkdirSync(dir, { recursive: true });
+        const file = join(dir, 'agent-rules.json');
+        writeFileSync(file, '{"manifest": {"engineVersion": 1, "version": "2099.0');
+        expect(mod.syncManifestFromCache()).toBe('bundled');
+        // Same mtime is fine: the write completing is what we are waiting for.
+        // Simulate it without touching mtime by writing the full file back with
+        // the times restored.
+        const { utimesSync, statSync } = await import('node:fs');
+        const st = statSync(file);
+        writeFileSync(file, JSON.stringify({ manifest: { ...VALID_MANIFEST, version: '2099.01.01.1' } }));
+        utimesSync(file, st.atime, st.mtime);
+        expect(mod.syncManifestFromCache()).toBe('cache');
+    });
 });

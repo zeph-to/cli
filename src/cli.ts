@@ -504,7 +504,11 @@ const main = async (): Promise<number> => {
   // command token to collectPassthrough (aliases map to the same agent).
   const remote = findAgentBySubcommand(command);
   if (remote) {
-    const { opts, rest } = splitAgentOptions(collectPassthrough(process.argv, command));
+    const { opts, rest, error } = splitAgentOptions(collectPassthrough(process.argv, command));
+    if (error) {
+      console.error(`zeph: ${error}`);
+      return 2;
+    }
     return handleAgentSession(remote, rest, opts);
   }
 

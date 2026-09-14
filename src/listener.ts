@@ -754,11 +754,12 @@ const tmuxArgs = (args: string[]): string[] => {
 // ─── Session inventory ──────────────────────────────────────────────
 
 /**
- * Parse a `zeph-*` tmux session name into `{project, label}`. For
- * Phase 1 the wrapper only emits `zeph-<project>` (no labels), so the
- * whole tail becomes the project. When labels land in Phase 2 the
- * wrapper will sidecar `{project, label}` so the listener doesn't need
- * to guess from a name that allows dashes in project names.
+ * Parse a `zeph-*` tmux session name into `{project, label}`. The wrapper
+ * emits `zeph-<project>` and, with `--label <x>`, `zeph-<project>-<x>` — no
+ * sidecar, so the whole tail is the project either way (a labelled session
+ * shows as its own row, which is what a plan-named implementer wants). A
+ * sidecar (`@zeph_session_label`) would let the phone fold it under the
+ * project; nothing writes one yet.
  */
 export const parseSessionName = (name: string): { project: string; label: string | null } | null => {
     if (!name.startsWith('zeph-')) return null;

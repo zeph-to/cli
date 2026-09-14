@@ -12,11 +12,12 @@ const port = parentPort;
 if (!port) throw new Error('inventory-worker must be started as a worker thread');
 
 port.on('message', (id: number) => {
-    // Own module instance: pick up the OTA rules the main thread cached, else
-    // every non-claude session reports `unknown` (see syncManifestFromCache).
-    syncManifestFromCache();
     let reply: InventoryReply;
     try {
+        // Own module instance: pick up the OTA rules the main thread cached, else
+        // every non-claude session reports `unknown` (see syncManifestFromCache).
+        // Inside the try: a throw here must become an error reply, not a timeout.
+        syncManifestFromCache();
         reply = { id, result: collectSessionsVerbose() };
     } catch (err) {
         reply = { id, error: err instanceof Error ? err.message : String(err) };

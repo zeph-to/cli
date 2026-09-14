@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { detectProjectName, handOffExec, sanitizeLabel, splitAgentOptions, targetForAgent, tmuxSessionName } from './wrapper.js';
+import { detectProjectDir, detectProjectName, handOffExec, sanitizeLabel, splitAgentOptions, targetForAgent, tmuxSessionName } from './wrapper.js';
 import type { ProcessHandOff } from './wrapper.js';
 
 // TMUX is in here for two reasons: targetForAgent branches on it, and a
@@ -112,7 +112,29 @@ describe('targetForAgent', () => {
         const { kind, cmd, args } = targetForAgent('pi', ['/skill:02-implement a.md'], 'pi', { detach: true, label: 'impl' });
         expect(kind).toBe('tmux-detached');
         expect(cmd).toBe('tmux');
-        expect(args).toEqual(['new', '-d', '-s', 'zeph-pi-config-impl', '-c', process.cwd(), "pi '/skill:02-implement a.md'"]);
+        expect(args).toEqual(['new', '-d', '-s', 'zeph-pi-config-impl', '-c', '/work/pi-config', "pi '/skill:02-implement a.md'"]);
+    });
+
+    // `new -d` only creates, so the reuse candidate `findAvailableSession`
+    // prefers (a detached session) would just fail on the name.
+    it('--detach without a label takes a name no live session holds', () => {
+        process.env.CLAUDE_PROJECT_DIR = '/work/zeph-detach-free-probe';
+        const { kind, session } = targetForAgent('pi', [], 'pi', { detach: true });
+        expect(kind).toBe('tmux-detached');
+        expect(session).toBe('zeph-zeph-detach-free-probe');
+    });
+
+    it('the target carries its session name instead of leaving it to argv position', () => {
+        process.env.CLAUDE_PROJECT_DIR = '/work/pi-config';
+        expect(targetForAgent('pi', [], 'pi', { label: 'impl' }).session).toBe('zeph-pi-config-impl');
+        expect(targetForAgent('pi', [], 'pi').session).toMatch(/^zeph-pi-config/);
+    });
+
+    // A label asks for a named session; the in-pane shortcut would drop it silently.
+    it('--label inside tmux still opens a tmux session', () => {
+        process.env.TMUX = '/private/tmp/tmux-501/default,43544,87';
+        process.env.CLAUDE_PROJECT_DIR = '/work/pi-config';
+        expect(targetForAgent('pi', [], 'pi', { label: 'impl' }).kind).toBe('tmux-new');
     });
 
     // A Claude Code session launching the implementer runs inside tmux itself;
@@ -138,8 +160,27 @@ describe('splitAgentOptions', () => {
         expect(splitAgentOptions([])).toEqual({ opts: {}, rest: [] });
     });
 
-    it('sanitizes a label into something tmux accepts', () => {
+    it('rejects an empty or flag-shaped label instead of naming the session zeph-<project>-', () => {
+        expect(splitAgentOptions(['--label', '', 'x']).error).toMatch(/empty/);
+        expect(splitAgentOptions(['--label=  ']).error).toMatch(/empty/);
+        expect(splitAgentOptions(['--label', '--detach']).error).toMatch(/needs a value/);
+        expect(splitAgentOptions(['--label']).error).toMatch(/needs a value/);
+    });
+});
+
+describe('sanitizeLabel', () => {
+    it('turns what tmux forbids in a session name into dashes', () => {
         expect(sanitizeLabel(' PLAN-11.32:44 ')).toBe('PLAN-11-32-44');
+    });
+});
+
+describe('detectProjectDir', () => {
+    it('is the directory the session name comes from — env first, then cwd outside a repo', () => {
+        process.env.CLAUDE_PROJECT_DIR = '/Users/me/code/my-project/';
+        expect(detectProjectDir()).toBe('/Users/me/code/my-project');
+        delete process.env.CLAUDE_PROJECT_DIR;
+        process.chdir('/tmp');
+        expect(detectProjectDir()).toBe(process.cwd());
     });
 });
 
