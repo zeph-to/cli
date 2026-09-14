@@ -161,34 +161,87 @@ interface SpawnTarget {
      * `targetForAgent` states it rather than letting them re-derive it from
      * `cmd === 'tmux'`.
      */
-    kind: 'direct' | 'tmux-new';
+    kind: 'direct' | 'tmux-new' | 'tmux-detached';
     cmd: string;
     args: string[];
 }
+
+/**
+ * `zeph <agent> --detach --label <x> …` — the two wrapper-owned flags. They
+ * are read off the FRONT of the passthrough only, so an agent's own flags
+ * (`pi -n`, `claude --resume`) and its positional messages pass untouched.
+ */
+export interface AgentLaunchOptions {
+    /** Create the tmux session without attaching, print its name, exit 0. */
+    detach?: boolean;
+    /** Name the session `zeph-<project>-<label>` instead of the `-2/-3` family. */
+    label?: string;
+}
+
+/** tmux forbids `.` and `:` in session names; whitespace would split the target. */
+export const sanitizeLabel = (label: string): string => label.trim().replace(/[.:\s]+/g, '-');
+
+export const splitAgentOptions = (extra: string[]): { opts: AgentLaunchOptions; rest: string[] } => {
+    const opts: AgentLaunchOptions = {};
+    let i = 0;
+    while (i < extra.length) {
+        const arg = extra[i];
+        if (arg === '--detach') {
+            opts.detach = true;
+            i += 1;
+        } else if (arg === '--label' && extra[i + 1] !== undefined) {
+            opts.label = sanitizeLabel(extra[i + 1]);
+            i += 2;
+        } else if (arg.startsWith('--label=')) {
+            opts.label = sanitizeLabel(arg.slice('--label='.length));
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    return { opts, rest: extra.slice(i) };
+};
 
 /** POSIX shell-quote so passthrough args survive being joined into a tmux shell-command string. */
 const SHELL_SAFE = /^[\w\-./=:@%+,]+$/;
 const shellQuote = (s: string): string =>
     s.length > 0 && SHELL_SAFE.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
 
-export const targetForAgent = (agent: string, extra: string[], agentKind?: string): SpawnTarget => {
+export const targetForAgent = (
+    agent: string,
+    extra: string[],
+    agentKind?: string,
+    opts: AgentLaunchOptions = {},
+): SpawnTarget => {
     // Already inside tmux → no nested session, just run the agent in the
     // current pane. Nested tmux prefix collisions are confusing and the
-    // listener can't reach a session it didn't name anyway.
-    if (process.env.TMUX) {
+    // listener can't reach a session it didn't name anyway. A detached
+    // launch is the exception: it never attaches, so nesting cannot happen,
+    // and a Claude Code session driving `zeph pi --detach` from its own pane
+    // is exactly where it runs from.
+    if (process.env.TMUX && !opts.detach) {
         return { kind: 'direct', cmd: agent, args: extra };
     }
     const base = tmuxSessionName(detectProjectName());
-    // Reattach a detached session of this project when there is one,
-    // else auto-suffix — lets the user keep `zeph cc` workflow simple and
-    // still get independent sessions when opening multiple terminals in
+    // A label pins the name — the caller wants THIS session, not a slot in
+    // the family (a plan-named implementer next to the user's own `zeph pi`).
+    // Otherwise reattach a detached session of this project when there is
+    // one, else auto-suffix — lets the user keep `zeph cc` workflow simple
+    // and still get independent sessions when opening multiple terminals in
     // the same project.
-    const session = findAvailableSession(base, agentKind);
-    // `tmux new -A`: attach if the named session exists, else create it.
+    const session = opts.label ? `${base}-${opts.label}` : findAvailableSession(base, agentKind);
     // tmux joins trailing argv into a single shell-command, so flags like
     // `--resume` would be eaten by tmux's own parser. Build one quoted
     // shell string instead, which tmux passes through verbatim.
     const shellCmd = [agent, ...extra].map(shellQuote).join(' ');
+    // `-d`: create without attaching, so no TTY is needed and `new` fails
+    // loudly on a taken name instead of `-A` silently attaching to whatever
+    // runs there. `-c`: the agent's cwd must be the project even though the
+    // tmux server's default-path is wherever it was first started.
+    if (opts.detach) {
+        return { kind: 'tmux-detached', cmd: 'tmux', args: ['new', '-d', '-s', session, '-c', process.cwd(), shellCmd] };
+    }
+    // `tmux new -A`: attach if the named session exists, else create it.
     return { kind: 'tmux-new', cmd: 'tmux', args: ['new', '-A', '-s', session, shellCmd] };
 };
 
@@ -282,6 +335,10 @@ export const handOffExec = (deps: {
     stdinTTY: boolean | undefined;
     stdoutTTY: boolean | undefined;
 }): ProcessHandOff | null => {
+    // A detached launch returns after tmux answers — there is nothing to hand
+    // the terminal to.
+    if (deps.kind === 'tmux-detached')
+        return null;
     if (!deps.execve) return null;
     // execve runs no cleanup handler, and node only writes stdout synchronously
     // to a TTY on POSIX — anything buffered to a pipe would vanish with us.
@@ -292,12 +349,29 @@ export const handOffExec = (deps: {
     return deps.execve;
 };
 
-export const handleAgentSession = async (agent: RemoteAgent, extra: string[] = []): Promise<number> => {
+export const handleAgentSession = async (
+    agent: RemoteAgent,
+    extra: string[] = [],
+    opts: AgentLaunchOptions = {},
+): Promise<number> => {
     // Best-effort: make sure the phone-bridge daemon is running, and running
     // the build we were launched from. The user shouldn't need to remember a
     // second command for the picker on their phone to work.
     await ensureListenerRunning();
-    const { kind, cmd, args } = targetForAgent(agent.binary, extra, agent.kind);
+    const { kind, cmd, args } = targetForAgent(agent.binary, extra, agent.kind, opts);
+
+    if (kind === 'tmux-detached') {
+        const session = args[3];
+        const r = spawnSync(cmd, args, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+        if (r.error || r.status !== 0) {
+            const why = r.error ? r.error.message : (r.stderr ?? '').trim() || `exit ${r.status}`;
+            console.error(`zeph: could not start ${session}: ${why}`);
+            return r.status ?? 1;
+        }
+        // The name is the contract: the caller attaches, kills, or injects by it.
+        console.log(`zeph: ${agent.binary} started in tmux session ${session} (detached) — attach: tmux attach -t ${session}`);
+        return 0;
+    }
 
     // Hand the terminal over and stop existing. Waiting on the child is all
     // this process does for the rest of the session, and it holds a whole node

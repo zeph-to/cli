@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { detectProjectName, handOffExec, targetForAgent, tmuxSessionName } from './wrapper.js';
+import { detectProjectName, handOffExec, sanitizeLabel, splitAgentOptions, targetForAgent, tmuxSessionName } from './wrapper.js';
 import type { ProcessHandOff } from './wrapper.js';
 
 // TMUX is in here for two reasons: targetForAgent branches on it, and a
@@ -95,6 +95,52 @@ describe('targetForAgent', () => {
         const [, , , , shellCmd] = targetForAgent('claude', ['--resume']).args;
         expect(shellCmd).toBe('claude --resume');
     });
+
+    // `--label` pins the name: the caller wants this exact session next to
+    // the user's own `zeph pi`, not a slot in the -2/-3 family.
+    it('--label names the session zeph-<project>-<label> and skips the family scan', () => {
+        process.env.CLAUDE_PROJECT_DIR = '/work/pi-config';
+        const { kind, args } = targetForAgent('pi', ['-n', 'x'], 'pi', { label: '20260914-PLAN-11-32-44-pi' });
+        expect(kind).toBe('tmux-new');
+        expect(args.slice(0, 4)).toEqual(['new', '-A', '-s', 'zeph-pi-config-20260914-PLAN-11-32-44-pi']);
+    });
+
+    // `-d` needs no TTY and fails loudly on a taken name; `-c` pins the cwd
+    // because the tmux server's default-path is wherever it was first started.
+    it('--detach creates the session without attaching, in the current directory', () => {
+        process.env.CLAUDE_PROJECT_DIR = '/work/pi-config';
+        const { kind, cmd, args } = targetForAgent('pi', ['/skill:02-implement a.md'], 'pi', { detach: true, label: 'impl' });
+        expect(kind).toBe('tmux-detached');
+        expect(cmd).toBe('tmux');
+        expect(args).toEqual(['new', '-d', '-s', 'zeph-pi-config-impl', '-c', process.cwd(), "pi '/skill:02-implement a.md'"]);
+    });
+
+    // A Claude Code session launching the implementer runs inside tmux itself;
+    // a detached launch never nests, so the direct-run shortcut must not fire.
+    it('--detach still opens a tmux session when already inside tmux', () => {
+        process.env.TMUX = '/private/tmp/tmux-501/default,43544,87';
+        process.env.CLAUDE_PROJECT_DIR = '/work/pi-config';
+        expect(targetForAgent('pi', [], 'pi', { detach: true, label: 'impl' }).kind).toBe('tmux-detached');
+    });
+});
+
+describe('splitAgentOptions', () => {
+    it('reads --detach and --label off the front and leaves the agent args alone', () => {
+        expect(splitAgentOptions(['--detach', '--label', 'impl', '-n', 'x', '/skill:simplify'])).toEqual({
+            opts: { detach: true, label: 'impl' },
+            rest: ['-n', 'x', '/skill:simplify'],
+        });
+        expect(splitAgentOptions(['--label=impl', '--resume'])).toEqual({ opts: { label: 'impl' }, rest: ['--resume'] });
+    });
+
+    it('stops at the first agent arg — a later --detach belongs to the agent', () => {
+        expect(splitAgentOptions(['--resume', '--detach'])).toEqual({ opts: {}, rest: ['--resume', '--detach'] });
+        expect(splitAgentOptions([])).toEqual({ opts: {}, rest: [] });
+    });
+
+    it('sanitizes a label into something tmux accepts', () => {
+        expect(sanitizeLabel(' PLAN-11.32:44 ')).toBe('PLAN-11-32-44');
+    });
 });
 
 describe('handOffExec', () => {
@@ -105,6 +151,10 @@ describe('handOffExec', () => {
 
     // The wrapper otherwise sits resident for the whole session doing nothing
     // but waiting on tmux. Handing the process over deletes it outright.
+    it('never hands off a detached launch — the wrapper returns after tmux answers', () => {
+        expect(handOffExec({ execve, kind: 'tmux-detached', stdinTTY: true, stdoutTTY: true })).toBeNull();
+    });
+
     it('returns the exec when execve exists and both streams are a terminal', () => {
         expect(handOffExec({ execve, ...tmuxNew })).toBe(execve);
     });

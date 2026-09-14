@@ -9,7 +9,7 @@ import { handleUninstall } from './uninstall.js';
 import { handleVerify } from './verify.js';
 import { handleCheckUpdate } from './check-update.js';
 import { handleAsk } from './ask.js';
-import { handleAgentSession } from './wrapper.js';
+import { handleAgentSession, splitAgentOptions } from './wrapper.js';
 import { handleMcp } from './mcp.js';
 import { handleListener, computeListenerDeviceId } from './listener.js';
 import { detectProjectDir, loadConfig, resolvedEnv, VERSION } from './config.js';
@@ -99,6 +99,11 @@ ${usageAgentLines()}
                    -2/-3/… only when every existing one has a client
                    attached. Any args after the subcommand are forwarded
                    verbatim, e.g. 'zeph cc --resume')
+                  --detach       create the session without attaching, print
+                                 its name, exit — for launching from another
+                                 agent's pane or a script (no TTY needed)
+                  --label <x>    name it 'zeph-<project>-<x>' instead of the
+                                 -2/-3 family. Both must come first.
   mcp             Run the MCP server on stdio. This is what agent MCP
                   configs launch — 'zeph install' registers it, you
                   never type it
@@ -498,7 +503,10 @@ const main = async (): Promise<number> => {
   // registry — one table row per agent, no hardcoded cases. Pass the typed
   // command token to collectPassthrough (aliases map to the same agent).
   const remote = findAgentBySubcommand(command);
-  if (remote) return handleAgentSession(remote, collectPassthrough(process.argv, command));
+  if (remote) {
+    const { opts, rest } = splitAgentOptions(collectPassthrough(process.argv, command));
+    return handleAgentSession(remote, rest, opts);
+  }
 
   switch (command) {
     case 'install':

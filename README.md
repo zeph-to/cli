@@ -253,6 +253,16 @@ block here.
    zeph opencode  # opencode     → tmux session "zeph-<project>"
    ```
 
+   Two wrapper flags, read off the front of the args: `--detach` creates
+   the session without attaching (no TTY needed — a script or another
+   agent's pane can launch it) and prints its name; `--label <x>` names
+   it `zeph-<project>-<x>` instead of the `-2/-3` family. Example — a
+   Claude Code planner starting a pi implementer for one plan:
+
+   ```bash
+   zeph pi --detach --label 20260914-PLAN-11-32-44-pi -n 20260914-PLAN-11-32-44 '/skill:02-implement .claude/20260914/PLAN-11-32-44.md'
+   ```
+
    `zeph cursor` runs **`cursor-agent`**, Cursor's terminal agent — a
    separate install from the Cursor IDE (the bare `cursor` on your PATH
    is the editor launcher, which exits immediately and can't be driven).
