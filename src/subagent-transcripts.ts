@@ -56,6 +56,17 @@ export const SUBAGENT_LIVE_MS = 5 * 60_000;
  */
 export const SUBAGENT_ADDRESSABLE_MS = 60 * 60_000;
 
+/**
+ * How far a subagent's last write may trail the parent's record of its end and
+ * still belong to the run that ended.
+ *
+ * The final flush lands after the notice: measured 2026-09-14 over 572 ended
+ * subagents, 20 wrote after their end record, all within 42 ms. The other three
+ * that did came 153 s or more later — resumed work, which must not read as
+ * ended. A second sits far from both.
+ */
+export const SUBAGENT_END_SLACK_MS = 1_000;
+
 /** Rows one session may contribute. The switcher is a strip of chips, not a list. */
 export const MAX_SUBAGENT_ROWS = 5;
 
@@ -116,6 +127,8 @@ export interface SubagentScanState {
      *  what had been counted by then. Incremental for the same reason the
      *  parent's scan is — these files reach megabytes and this runs every sweep. */
     readonly progress: Map<string, Progress>;
+    /** Per subagent, by agentId: when the parent was last told it ended. */
+    readonly endedAt: Map<string, number>;
     tail: TailState | null;
     nextNumber: number;
     launchSeen: boolean;
@@ -126,6 +139,7 @@ export const initialSubagentScanState = (): SubagentScanState => ({
     order: new Map(),
     labels: new Map(),
     progress: new Map(),
+    endedAt: new Map(),
     tail: initialTailState(),
     nextNumber: 1,
     launchSeen: false,
@@ -183,12 +197,70 @@ const isAgentToolUse = (line: string): boolean => {
         && content.some((block) => block?.type === 'tool_use' && block?.name === 'Agent');
 };
 
+/** The four ways Claude Code reports a background subagent stopping — measured
+ *  2026-09-14 over every parent transcript on this machine (787 completed, 12
+ *  failed, 12 killed, 2 stopped, nothing else). */
+const TASK_END = /<status>(?:completed|failed|killed|stopped)<\/status>/;
+const TASK_ID = /<task-id>([^<]{1,200})<\/task-id>/;
+
+/**
+ * The subagent a parent line says has ended, and when — or null.
+ *
+ * Two shapes, one per spawn kind. A background subagent's end arrives as a user
+ * turn the harness writes (`origin.kind: 'task-notification'`) naming it by
+ * `<task-id>`; a foreground one's is its `Agent` call returning, with the
+ * agent id on `toolUseResult`. The async LAUNCH record carries an agent id too,
+ * which is why the status is part of the match and not only the id.
+ *
+ * Both marks are the harness's own fields, never text: the parent's reply
+ * quoting a notice — which is what a session reporting its subagent's result
+ * does — carries the words but neither `origin` nor `toolUseResult`.
+ */
+const subagentEndOf = (line: string): { agentId: string; at: number } | null => {
+    // Cheap reject, as in `isAgentToolUse`: this reads every line the parent writes.
+    if (!line.includes('<task-notification>') && !line.includes('"status":"completed"')) return null;
+    let entry: {
+        timestamp?: unknown;
+        origin?: { kind?: unknown };
+        message?: { content?: unknown };
+        toolUseResult?: { status?: unknown; agentId?: unknown };
+    };
+    try {
+        entry = JSON.parse(line);
+    } catch {
+        return null;
+    }
+    if (typeof entry.timestamp !== 'string') return null;
+    const at = Date.parse(entry.timestamp);
+    if (Number.isNaN(at)) return null;
+    const result = entry.toolUseResult;
+    if (result?.status === 'completed' && typeof result.agentId === 'string') return { agentId: result.agentId, at };
+    const content = entry.message?.content;
+    if (entry.origin?.kind !== 'task-notification' || typeof content !== 'string' || !TASK_END.test(content)) return null;
+    const agentId = TASK_ID.exec(content)?.[1];
+    return agentId ? { agentId, at } : null;
+};
+
+/**
+ * Fold what the parent appended since the last sweep: whether it launched a
+ * subagent (until it has), and which subagents it was told have ended.
+ *
+ * Read every sweep, not only until the launch is seen, because the end notice
+ * comes later. Still costs a stat on a sweep where the parent has not moved.
+ * The first read opens a window off the end (`TRANSCRIPT_BACKFILL_BYTES`), so an
+ * end older than that window is not seen — that subagent leaves the roster on
+ * `SUBAGENT_LIVE_MS` instead, as every subagent did before this signal.
+ */
 const absorbParentDelta = (parentTranscriptPath: string, state: SubagentScanState): void => {
-    if (state.launchSeen) return;
     const read = readTranscriptDelta(parentTranscriptPath, state.tail);
     if (!read) return;
     state.tail = read.state;
-    state.launchSeen = read.lines.some(isAgentToolUse);
+    if (!state.launchSeen) state.launchSeen = read.lines.some(isAgentToolUse);
+    for (const line of read.lines) {
+        const end = subagentEndOf(line);
+        // The latest notice wins: a resumed subagent ends again.
+        if (end && end.at > (state.endedAt.get(end.agentId) ?? -Infinity)) state.endedAt.set(end.agentId, end.at);
+    }
 };
 
 /**
@@ -318,7 +390,17 @@ export const scanSubagents = (
         .slice(0, MAX_SUBAGENT_ROWS + MAX_ADDRESSABLE_EXTRA)
         // The roster is the most recent few; everything else kept here is an
         // address for a viewer who is already inside one of them.
-        .map((file, index) => ({ ...file, live: index < MAX_SUBAGENT_ROWS && now - file.mtimeMs <= SUBAGENT_LIVE_MS }));
+        .map((file, index) => {
+            const endedAt = state.endedAt.get(file.agentId);
+            // Ended unless it wrote again after the notice — a resumed subagent
+            // is working again, and the notice describes the run before.
+            const ended = endedAt !== undefined && file.mtimeMs <= endedAt + SUBAGENT_END_SLACK_MS;
+            return {
+                ...file,
+                ended,
+                live: !ended && index < MAX_SUBAGENT_ROWS && now - file.mtimeMs <= SUBAGENT_LIVE_MS,
+            };
+        });
 
     // Numbered in activity order, then handed back in number order: the cut
     // above keeps the subagents worth showing, and this keeps the chips from
@@ -347,7 +429,7 @@ export const scanSubagents = (
             transcriptPath: file.path,
             lastActivityAt: new Date(file.mtimeMs).toISOString(),
             live: file.live,
-            working: now - file.mtimeMs <= SUBAGENT_WORKING_MS,
+            working: !file.ended && now - file.mtimeMs <= SUBAGENT_WORKING_MS,
         };
     });
     return rows.sort((a, b) => a.number - b.number).map(({ number: _number, ...row }) => row);
