@@ -193,14 +193,17 @@ describe('in-process subagents in the inventory sweep', () => {
             });
         });
 
-        // Codex is in the table with a session-name resolver and no transcript
-        // resolver — the EXTENSION POINT state most rows are in today, and the
-        // one a user hits as "This agent has no live timeline".
+        // Cursor is in the table with no transcript resolver — the EXTENSION
+        // POINT state the rows without a projector are still in, and the one a
+        // user hits as "This agent has no live timeline". Codex stood here until
+        // it got a resolver of its own; whichever row is picked has to be one
+        // that genuinely lacks the field, since the branch is chosen by its
+        // absence.
         it('when the agent is known but carries no transcript resolver', () => {
             writeTranscripts({ withSubagent: true });
             armPane();
-            withPane({ current: 'codex', start: 'codex' }, () => {
-                expect(reasonFor('zeph-a')).toBe('codex has no transcript resolver');
+            withPane({ current: 'cursor-agent', start: 'cursor-agent' }, () => {
+                expect(reasonFor('zeph-a')).toBe('cursor has no transcript resolver');
             });
         });
 

@@ -433,6 +433,17 @@ export const resultLinesOf = (content: unknown): number => {
     return lines;
 };
 
+/**
+ * One line, always.
+ *
+ * A label is not a paragraph: a tool argument that runs to hundreds of
+ * characters with newlines in it renders as a wall where a row's label belongs.
+ * Applied by the projectors that need it rather than inside `targetFrom`,
+ * because that helper feeds Claude's projector too and the Spec requires a
+ * Claude timeline to stay byte-identical.
+ */
+export const oneLine = (target: string | undefined): string | undefined => target?.replace(/\s+/g, ' ');
+
 /** A usable number, or 0 — token counts are the one place a missing field must not become `NaN` on the wire. */
 export const finiteNumber = (value: unknown): number =>
     typeof value === 'number' && Number.isFinite(value) ? value : 0;

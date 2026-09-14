@@ -525,3 +525,182 @@ describe('remote-agents.ts: piTranscriptPath', () => {
         expect(piTranscriptPath(null)).toBeNull();
     });
 });
+
+// ── codexTranscriptPath ──────────────────────────────────────────
+
+/**
+ * Codex shards its rollouts by date and puts no cwd anywhere in the path — the
+ * cwd is inside the file, on the `session_meta` first line. So unlike pi's and
+ * Claude's resolvers, this one cannot answer from a directory name and has to
+ * open files, which is what every bound and cache below exists to limit.
+ *
+ * Shape measured 2026-09-14 against `~/.codex/sessions/2026/09/14/rollout-…jsonl`
+ * written by codex-cli 0.154.0.
+ */
+describe('remote-agents.ts: codexTranscriptPath', () => {
+    const META = (cwd: string, timestamp = '2026-09-14T00:00:00.000Z') =>
+        JSON.stringify({ timestamp, type: 'session_meta', payload: { cwd, timestamp, id: 'x' } });
+
+    const writeRollout = (shard: string, file: string, header: string, at?: Date): string => {
+        const dir = join(TMP, '.codex', 'sessions', shard);
+        mkdirSync(dir, { recursive: true });
+        const path = join(dir, file);
+        writeFileSync(path, `${header}\n{"type":"event_msg","payload":{"type":"task_started"}}\n`);
+        if (at) utimesSync(path, at, at);
+        return path;
+    };
+
+    it('finds the rollout whose session_meta names this pane directory', async () => {
+        const { codexTranscriptPath } = await import('./remote-agents.js');
+        writeRollout('2026/09/14', 'rollout-a.jsonl', META('/Users/tak/other'));
+        const mine = writeRollout('2026/09/14', 'rollout-b.jsonl', META('/Users/tak/app'));
+
+        expect(codexTranscriptPath('/Users/tak/app')).toBe(mine);
+    });
+
+    // The cwd comparison happens after the same normalization pi's encoder does,
+    // because tmux reports what the shell reports and a trailing slash there
+    // would otherwise miss every rollout Codex ever wrote for that directory.
+    it.each([
+        ['/Users/tak/app/', 'a trailing slash'],
+        ['/Users/tak/./app', 'a dot segment'],
+        ['/Users/tak/other/../app', 'a parent segment'],
+    ])('normalizes %s (%s) before comparing', async (cwd) => {
+        const { codexTranscriptPath } = await import('./remote-agents.js');
+        const mine = writeRollout('2026/09/14', 'rollout-b.jsonl', META('/Users/tak/app'));
+
+        expect(codexTranscriptPath(cwd)).toBe(mine);
+    });
+
+    it('answers null when no rollout names this directory', async () => {
+        const { codexTranscriptPath } = await import('./remote-agents.js');
+        writeRollout('2026/09/14', 'rollout-a.jsonl', META('/Users/tak/other'));
+
+        expect(codexTranscriptPath('/Users/tak/app')).toBeNull();
+        expect(codexTranscriptPath(null)).toBeNull();
+    });
+
+    it('takes the most recently written of several rollouts for the directory', async () => {
+        const { codexTranscriptPath } = await import('./remote-agents.js');
+        writeRollout('2026/09/14', 'rollout-old.jsonl', META('/Users/tak/app'), new Date(Date.now() - 60_000));
+        const newest = writeRollout('2026/09/14', 'rollout-new.jsonl', META('/Users/tak/app'));
+
+        expect(codexTranscriptPath('/Users/tak/app')).toBe(newest);
+    });
+
+    /*
+     * The scan is bounded to the two newest date shards. Unbounded, a machine
+     * someone has run Codex on for a year would open and parse a 22KB header out
+     * of every rollout ever written, every time a watch re-resolved.
+     */
+    it('never opens a shard older than the two newest', async () => {
+        const { codexTranscriptPath } = await import('./remote-agents.js');
+        writeRollout('2026/09/10', 'rollout-ancient.jsonl', META('/Users/tak/app'));
+        writeRollout('2026/09/13', 'rollout-yesterday.jsonl', META('/Users/tak/other'));
+        writeRollout('2026/09/14', 'rollout-today.jsonl', META('/Users/tak/other'));
+
+        expect(codexTranscriptPath('/Users/tak/app')).toBeNull();
+    });
+
+    it('reaches a session started before midnight and still running', async () => {
+        const { codexTranscriptPath } = await import('./remote-agents.js');
+        const yesterday = writeRollout('2026/09/13', 'rollout-y.jsonl', META('/Users/tak/app'));
+        writeRollout('2026/09/14', 'rollout-t.jsonl', META('/Users/tak/other'));
+
+        expect(codexTranscriptPath('/Users/tak/app')).toBe(yesterday);
+    });
+
+    it('skips a file that is not a session_meta header, and one with no line at all', async () => {
+        const { codexTranscriptPath } = await import('./remote-agents.js');
+        writeRollout('2026/09/14', 'rollout-headerless.jsonl', '{"type":"event_msg","payload":{}}');
+        writeRollout('2026/09/14', 'rollout-truncated.jsonl', '{"type":"session_meta","payl');
+        writeRollout('2026/09/14', 'rollout-garbage.jsonl', 'not json at all');
+
+        expect(codexTranscriptPath('/Users/tak/app')).toBeNull();
+    });
+
+    /*
+     * `session_meta` carries `base_instructions` — measured at 21551 bytes of a
+     * 22049-byte header — and that field grows with the user's AGENTS.md and
+     * skill set. A fixed single read is a bound someone eventually crosses, and
+     * crossing it answers null forever: "this agent has no live timeline", with
+     * nothing to say why.
+     */
+    it('reads a header far past one chunk, and one with a multi-byte character across the boundary', async () => {
+        const { codexTranscriptPath } = await import('./remote-agents.js');
+        const header = JSON.stringify({
+            type: 'session_meta',
+            // 3 bytes each, so the 65536 and 131072 chunk boundaries both land
+            // on a continuation byte — decoding per chunk would corrupt them.
+            payload: { cwd: '/Users/tak/app', timestamp: '2026-09-14T00:00:00.000Z', base_instructions: `${'가'.repeat(50_000)}x` },
+        });
+        const path = writeRollout('2026/09/14', 'rollout-huge.jsonl', header);
+
+        expect(codexTranscriptPath('/Users/tak/app')).toBe(path);
+    });
+
+    // The reader's outer cap is a bound on work, not on the answer, so what is
+    // pinned here is the answer: a file with no line ending is not a rollout and
+    // must not become one. That it stops reading at CODEX_HEADER_MAX rather than
+    // consuming the file is stated in the reader and not asserted here — a test
+    // that proved it would have to measure the read itself.
+    it('answers null for a file with no line ending at all', async () => {
+        const { codexTranscriptPath } = await import('./remote-agents.js');
+        const dir = join(TMP, '.codex', 'sessions', '2026', '09', '14');
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, 'rollout-runaway.jsonl'), 'x'.repeat(2 * 1024 * 1024));
+
+        expect(codexTranscriptPath('/Users/tak/app')).toBeNull();
+    });
+
+    it('ignores files in the shard that are not rollouts', async () => {
+        const { codexTranscriptPath } = await import('./remote-agents.js');
+        writeRollout('2026/09/14', 'notes.jsonl', META('/Users/tak/app'));
+        writeRollout('2026/09/14', 'rollout-a.json', META('/Users/tak/app'));
+
+        expect(codexTranscriptPath('/Users/tak/app')).toBeNull();
+    });
+
+    // Opening a 22KB header out of every rollout in two shards is the most
+    // expensive resolver here, and `turn-watch` re-resolves every
+    // TRANSCRIPT_RECHECK_MS per watcher.
+    it('does not re-scan the shards for the same pane', async () => {
+        const { codexTranscriptPath } = await import('./remote-agents.js');
+        const path = writeRollout('2026/09/14', 'rollout-a.jsonl', META('/Users/tak/app'));
+
+        expect(codexTranscriptPath('/Users/tak/app', 4242)).toBe(path);
+
+        // The tree is gone; only a cached answer can still name the file.
+        rmSync(join(TMP, '.codex'), { recursive: true, force: true });
+        expect(codexTranscriptPath('/Users/tak/app', 4242)).toBe(path);
+    });
+
+    it('resolves again when the pane is a different process', async () => {
+        const { codexTranscriptPath } = await import('./remote-agents.js');
+        const first = writeRollout('2026/09/14', 'rollout-a.jsonl', META('/Users/tak/app'), new Date(Date.now() - 60_000));
+
+        expect(codexTranscriptPath('/Users/tak/app', 1111)).toBe(first);
+
+        const restarted = writeRollout('2026/09/14', 'rollout-b.jsonl', META('/Users/tak/app'));
+        expect(codexTranscriptPath('/Users/tak/app', 1111)).toBe(first);
+        expect(codexTranscriptPath('/Users/tak/app', 2222)).toBe(restarted);
+    });
+
+    // The binary reports `CODEX_HOME` in its own `doctor` output and carries
+    // `failed to resolve CODEX_HOME`, so the override is the writer's, not ours.
+    it('follows CODEX_HOME, the override Codex itself honours', async () => {
+        const { codexTranscriptPath } = await import('./remote-agents.js');
+        const elsewhere = join(TMP, 'custom-codex-home');
+        process.env.CODEX_HOME = elsewhere;
+        try {
+            const dir = join(elsewhere, 'sessions', '2026', '09', '14');
+            mkdirSync(dir, { recursive: true });
+            const path = join(dir, 'rollout-a.jsonl');
+            writeFileSync(path, `${META('/Users/tak/app')}\n`);
+
+            expect(codexTranscriptPath('/Users/tak/app')).toBe(path);
+        } finally {
+            delete process.env.CODEX_HOME;
+        }
+    });
+});

@@ -21,6 +21,7 @@ import {
     clamp,
     finiteNumber,
     MAX_EVENT_TEXT_CHARS,
+    oneLine,
     resultLinesOf,
     targetFrom,
     type ProjectorOptions,
@@ -152,17 +153,6 @@ const textOf = (content: unknown): string => {
     }
     return text;
 };
-
-/**
- * One line, always.
- *
- * pi's `subagent` calls carry a `task` briefing that runs to hundreds of
- * characters with newlines in it — measured at 2 of 1825 tool calls, which is
- * rare but renders as a wall of text where a label belongs. Collapsed here
- * rather than inside the shared `targetFrom`, because that helper feeds Claude's
- * projector too and the Spec requires a Claude timeline to stay byte-identical.
- */
-const oneLine = (target: string | undefined): string | undefined => target?.replace(/\s+/g, ' ');
 
 /**
  * pi writes one line per message, not one per content block, so a message's
