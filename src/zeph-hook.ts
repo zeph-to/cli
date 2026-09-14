@@ -1,5 +1,4 @@
-import { execFileSync } from 'node:child_process';
-import { listenerDeviceId } from './listener-device-id.js';
+import { agentSessionContext } from './agent-session.js';
 import type { ZephOptions, NotifyPayload, NotifyResult, ListParams, ListResult, PushItem, DismissOneResult, DismissAllResult, ApiErrorResponse, UploadRequestResult } from './types.js';
 import { ZephError, AuthenticationError, QuotaExceededError } from './errors.js';
 import { initCrypto, getKeyPair, disableCrypto, selectRecipients, encryptPushBodyForDevices, encryptFileForDevices, type DeviceRecipient } from './crypto.js';
@@ -8,32 +7,6 @@ const DEFAULT_BASE_URL = 'https://api.zeph.to/v1';
 const DEFAULT_TIMEOUT_MS = 30_000;
 const BODY_FILE_THRESHOLD = 512;
 const PREVIEW_LENGTH = 200;
-
-/**
- * Stable agent-session grouping when running inside a tmux agent session, so a
- * hook/notify (e.g. the Stop-hook recap) files under the same session key as
- * the listener's pushes — surviving Claude session-UUID rotation. The device id
- * MUST equal the listener's `computeListenerDeviceId`, so it's resolved the same
- * way (machine-id hash → sticky file → hostname) via the shared read-only
- * helper — NOT a bare hostname hash, which drifts from the listener's id when a
- * machine id is readable and files the push under a non-matching session key.
- */
-const agentSessionContext = (): { agentDeviceId: string; agentSessionName: string } | null => {
-  if (!process.env.TMUX) return null;
-  // A pi subagent pane carries its own wire name (<#S>.<pane> — the
-  // listener's naming) in this env, set by the extension for its notify
-  // children. It wins over #S, which would file the push under the parent.
-  const fromEnv = process.env.ZEPH_AGENT_SESSION_NAME?.trim();
-  if (fromEnv) return { agentDeviceId: listenerDeviceId(), agentSessionName: fromEnv };
-  let name: string;
-  try {
-    name = execFileSync('tmux', ['display-message', '-p', '#S'], { encoding: 'utf-8' }).trim();
-  } catch {
-    return null;
-  }
-  if (!name) return null;
-  return { agentDeviceId: listenerDeviceId(), agentSessionName: name };
-};
 
 const inferMimeType = (fileName: string): string => {
   const ext = fileName.split('.').pop()?.toLowerCase();
