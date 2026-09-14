@@ -17,6 +17,7 @@
  * amortise; plain polling is the whole protocol here.
  */
 import { loadConfig, resolvedEnv, resolveHookId } from './config.js';
+import { agentSessionContext } from './agent-session.js';
 
 /** Server-side hook trigger + event read. Kept narrow on purpose — this
  *  module needs two routes, not an API client. */
@@ -42,6 +43,16 @@ export interface AskOptions {
     body?: string;
     actions?: AskAction[];
     timeoutSeconds: number;
+    /**
+     * Stable agent-session key, when this ask was raised from a tmux agent
+     * pane. Both fields or neither: the phone's deep link needs the pair to
+     * open the agent chat — which is where the live terminal and the key row
+     * live — and falls back to the plain push screen without it. Agents with
+     * no MCP (pi, codex) reach the phone only through this command, so leaving
+     * them off is what made their asks land outside the chat.
+     */
+    agentDeviceId?: string;
+    agentSessionName?: string;
 }
 
 /** Injected so the poll loop is testable without a clock or a network. */
@@ -127,6 +138,8 @@ export const requestApproval = async (opts: AskOptions, deps: AskDeps): Promise<
             actions: opts.actions,
             timeout: opts.timeoutSeconds,
             hookType: 'combo',
+            agentDeviceId: opts.agentDeviceId,
+            agentSessionName: opts.agentSessionName,
         });
         const id = trigger.data?.eventId;
         if (!id) return { answered: false, error: 'no eventId in trigger response' };
@@ -195,6 +208,7 @@ export const handleAsk = async (args: Record<string, string | boolean>): Promise
             body: args.body as string | undefined,
             actions: parseActions(args.actions as string | undefined),
             timeoutSeconds: Number.isFinite(timeoutSeconds) && timeoutSeconds > 0 ? timeoutSeconds : 60,
+            ...(agentSessionContext() ?? {}),
         },
         liveDeps(),
     );
