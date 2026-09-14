@@ -62,7 +62,9 @@ export const readCodexMcpArgv = (filePath: string): string[] | null => {
 };
 
 /**
- * Where each agent records the MCP launch, and under which container key.
+ * Where each agent records the MCP launch, and how to read it back — the row
+ * carries its own reader because codex keeps its registry in TOML while every
+ * other agent keeps it in JSON.
  * `agent` matches the label `detectAgents` uses so one report never names the
  * same agent two ways. Cursor/Windsurf/OpenCode are files the installer writes
  * itself; the Gemini row is READ-ONLY — `zeph install` shells out to
@@ -76,6 +78,7 @@ const MCP_REGISTRIES: ReadonlyArray<{ agent: string; path: string; argv: (path: 
     { agent: 'OpenCode', path: join(HOME, '.config', 'opencode', 'opencode.json'), argv: (p) => registeredMcpArgv(p, 'mcp') },
     { agent: 'Codex CLI', path: join(HOME, '.codex', 'config.toml'), argv: readCodexMcpArgv },
 ];
+
 /**
  * The launch argv a registry file records for zeph, verbatim — null when the
  * file is absent, unparseable, or has no zeph entry. Two schemas in the wild:

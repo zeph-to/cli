@@ -286,6 +286,18 @@ describe('rmCodexMcpEntry — codex config.toml', () => {
         expect(out).toContain('model = "gpt-5.6-luna"');
     });
 
+it('round-trips with the installer on a config that has a zeph sub-table', async () => {
+        const body = 'model = "gpt-5.6-luna"\n\n[mcp_servers.graft]\ncommand = "graft"\n';
+        const file = write('.codex/roundtrip.toml', body);
+        const { injectCodexMcpEntry } = await import('./installer.js');
+        const { rmCodexMcpEntry } = await import('./uninstall.js');
+        injectCodexMcpEntry(file);
+        // Codex adds this itself once the user approves a tool "always".
+        writeFileSync(file, readFileSync(file, 'utf-8') + '\n[mcp_servers.zeph.tools.zeph_ask]\napproval_mode = "approve"\n');
+        expect(rmCodexMcpEntry(file, false)).toBeTruthy();
+        expect(readFileSync(file, 'utf-8')).toBe(body);
+    });
+
     it('leaves the file alone in dry-run, and reports nothing when zeph is absent', async () => {
         const body = 'model = "gpt-5.6-luna"\n\n[mcp_servers.zeph]\ncommand = "zeph"\nargs = ["mcp"]\n';
         const file = write('.codex/config.toml', body);
