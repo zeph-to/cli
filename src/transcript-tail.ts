@@ -314,6 +314,45 @@ export type TurnEvent = { at?: string } & (
  * on the watcher instead would grow with the session.
  */
 
+/**
+ * What a projector is told about the read it is projecting.
+ *
+ * Both flags are about the *read*, not about any one format, but only
+ * `sinceLastPrompt` means something to every agent: it is "this is a backfill,
+ * keep the turn still in flight". `includeSidechain` is Claude Code's word for
+ * its in-process subagents, and an agent with no such concept ignores it. A
+ * projector ignoring an option its format has no notion of is the contract, not
+ * an oversight — do not read an unused field here as a missed case.
+ */
+export interface ProjectorOptions {
+    sinceLastPrompt?: boolean;
+    includeSidechain?: boolean;
+}
+
+/**
+ * One agent's transcript format, reduced to the events the timeline draws.
+ *
+ * Pure by contract: lines in, events out, no filesystem and no clock. That is
+ * what lets `readTranscriptDelta` above stay the single tailer for every agent
+ * whose transcript is an append-only text log — the bytes are the same problem
+ * for all of them, and only the shape of a line differs.
+ */
+export type TranscriptProjector = (lines: readonly string[], opts?: ProjectorOptions) => TurnEvent[];
+
+/**
+ * A transcript and the projector that can read it, resolved together.
+ *
+ * They travel as one because they are one answer: a path with no projector is a
+ * file nothing can parse, which reaches a viewer as an empty timeline — strictly
+ * worse than the honest `no_transcript` it would replace. Resolving them apart
+ * would also mean two `detectRemoteAgent` lookups per recheck, on a path that is
+ * uncached and blocking (see `TurnWatchDeps.resolveTranscript`).
+ */
+export interface TranscriptSource {
+    readonly path: string;
+    readonly project: TranscriptProjector;
+}
+
 /** Edits larger than this are counted, not diffed: splitting them into lines
  *  is the one allocation here that scales with what the agent wrote. */
 export const EDIT_DIFF_MAX_CHARS = 64 * 1024;
@@ -376,7 +415,13 @@ const lineChangesOf = (name: string, input: unknown): { add?: number; del?: numb
 };
 
 /** Lines of a result's text — a string, or the text blocks of a block list. Images and the like count as nothing. */
-const resultLinesOf = (content: unknown): number => {
+/**
+ * How long a tool result was, from either shape a result body takes: a bare
+ * string, or blocks with a `text` field. Exported for the same reason as
+ * `clamp` — the shape is not one agent's vocabulary, and `lines` means the same
+ * number on the wire whoever produced it.
+ */
+export const resultLinesOf = (content: unknown): number => {
     if (typeof content === 'string') return countLines(content);
     if (!Array.isArray(content)) return 0;
     let lines = 0;
@@ -388,7 +433,37 @@ const resultLinesOf = (content: unknown): number => {
     return lines;
 };
 
-const num = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0);
+/**
+ * One line, always.
+ *
+ * A label is not a paragraph: a tool argument that runs to hundreds of
+ * characters with newlines in it renders as a wall where a row's label belongs.
+ * Applied by the projectors that need it rather than inside `targetFrom`,
+ * because that helper feeds Claude's projector too and the Spec requires a
+ * Claude timeline to stay byte-identical.
+ */
+export const oneLine = (target: string | undefined): string | undefined => target?.replace(/\s+/g, ' ');
+
+/**
+ * The backfill window, applied the same way by every projector.
+ *
+ * This is about `TurnEvent` and `ProjectorOptions`, not about any one agent's
+ * vocabulary — unlike the per-format helpers beside it, which are deliberately
+ * not shared. Every projector ends with this call, and a fourth one should too.
+ */
+export const sliceSinceLastPrompt = (events: TurnEvent[], opts: ProjectorOptions): TurnEvent[] => {
+    if (!opts.sinceLastPrompt) return events;
+    // Scanned backwards rather than by mapping to kinds and taking the last
+    // index: the map allocates a whole array to find one number.
+    for (let i = events.length - 1; i >= 0; i--) {
+        if (events[i].kind === 'prompt') return events.slice(i);
+    }
+    return events;
+};
+
+/** A usable number, or 0 — token counts are the one place a missing field must not become `NaN` on the wire. */
+export const finiteNumber = (value: unknown): number =>
+    typeof value === 'number' && Number.isFinite(value) ? value : 0;
 
 /** The `msg` for an assistant entry, or null when it carries no usable usage. */
 const messageMetaOf = (entry: Record<string, unknown>, at: string | undefined): Extract<TurnEvent, { kind: 'msg' }> | null => {
@@ -407,8 +482,8 @@ const messageMetaOf = (entry: Record<string, unknown>, at: string | undefined): 
         kind: 'msg',
         mid: clamp(mid),
         ...(model ? { model: clamp(model) } : {}),
-        out: num(u.output_tokens),
-        ctx: num(u.input_tokens) + num(u.cache_read_input_tokens) + num(u.cache_creation_input_tokens),
+        out: finiteNumber(u.output_tokens),
+        ctx: finiteNumber(u.input_tokens) + finiteNumber(u.cache_read_input_tokens) + finiteNumber(u.cache_creation_input_tokens),
         ...(at ? { at } : {}),
     };
 };
@@ -430,18 +505,32 @@ const messageMetaOf = (entry: Record<string, unknown>, at: string | undefined): 
  */
 const TARGET_KEYS = ['description', 'file_path', 'path', 'pattern', 'query', 'url', 'skill'] as const;
 
-const clamp = (value: string, max = MAX_EVENT_FIELD_CHARS): string =>
+/**
+ * Cut one field to the wire's budget. Exported because every projector shares
+ * the same 12KB frame ceiling (`MAX_TURN_FRAME_BYTES` in `turn-watch`), so a
+ * second projector with its own idea of "long enough" would be a second way to
+ * overflow the one transport.
+ */
+export const clamp = (value: string, max = MAX_EVENT_FIELD_CHARS): string =>
     value.length > max ? value.slice(0, max) : value;
 
-const targetOf = (input: unknown): string | undefined => {
+/**
+ * First of `keys` that holds a non-blank string, clamped — the loop every
+ * projector needs, without the key list every projector has to choose for
+ * itself. The keys stay the caller's: they are that agent's vocabulary, and
+ * merging them into one list is exactly what the `TARGET_KEYS` note forbids.
+ */
+export const targetFrom = (input: unknown, keys: readonly string[]): string | undefined => {
     if (!input || typeof input !== 'object') return undefined;
     const record = input as Record<string, unknown>;
-    for (const key of TARGET_KEYS) {
+    for (const key of keys) {
         const value = record[key];
         if (typeof value === 'string' && value.trim()) return clamp(value.trim());
     }
     return undefined;
 };
+
+const targetOf = (input: unknown): string | undefined => targetFrom(input, TARGET_KEYS);
 
 const contentBlocks = (entry: Record<string, unknown>): Record<string, unknown>[] => {
     const message = entry.message;
@@ -555,14 +644,13 @@ const nonEmpty = (text: string): string | null => {
  *
  * Everything here — the block shapes, the entry types, `TARGET_KEYS` — is Claude
  * Code's transcript format. Supporting another agent (pi, Codex) means a
- * projector of its own alongside this one, reached the way `REMOTE_AGENTS`
- * already reaches per-agent session resolvers; `turn-watch` takes the reader as
- * a dependency and needs no change for it.
+ * projector of its own alongside this one, satisfying `TranscriptProjector` and
+ * reached the way `REMOTE_AGENTS` already reaches per-agent session resolvers:
+ * `RemoteAgent.projectTranscript`, resolved together with the path as a
+ * `TranscriptSource`. `turn-watch` calls whichever projector it is handed and
+ * knows about none of them by name.
  */
-export const projectTranscriptEntries = (
-    lines: readonly string[],
-    opts: { sinceLastPrompt?: boolean } = {},
-): TurnEvent[] => {
+export const projectTranscriptEntries: TranscriptProjector = (lines, opts = {}): TurnEvent[] => {
     const events: TurnEvent[] = [];
     // One `msg` per API message in this batch, kept where it first appeared.
     const messages = new Map<string, Extract<TurnEvent, { kind: 'msg' }>>();
@@ -578,8 +666,10 @@ export const projectTranscriptEntries = (
         }
 
         // A subagent's own tool calls belong to the Task/Agent call that spawned
-        // it, which the parent transcript already shows as one row.
-        if (entry.isSidechain) continue;
+        // it, which the parent transcript already shows as one row — unless this
+        // IS the subagent's transcript, where every line is a sidechain and
+        // dropping them leaves a viewer watching an empty file.
+        if (entry.isSidechain && !opts.includeSidechain) continue;
 
         const at = typeof entry.timestamp === 'string' ? entry.timestamp : undefined;
 
@@ -646,8 +736,5 @@ export const projectTranscriptEntries = (
         }
     }
 
-    if (!opts.sinceLastPrompt) return events;
-
-    const lastPrompt = events.map((e) => e.kind).lastIndexOf('prompt');
-    return lastPrompt === -1 ? events : events.slice(lastPrompt);
+    return sliceSinceLastPrompt(events, opts);
 };

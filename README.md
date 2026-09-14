@@ -128,6 +128,31 @@ a 30-second idle heartbeat. The phone picker stays in sync with no
 manual configuration, and an idle listener costs the backend a fraction
 of what a fixed 5-second report cycle would.
 
+### Live timeline
+
+While a session is working, the phone can draw what the agent is doing right
+now — the prompt that started the turn, each tool call and its outcome, the
+agent's own replies, and per-message token counts. It is read by tailing the
+agent's transcript on disk; nothing a tool read or wrote leaves the machine,
+only names, short labels and numbers.
+
+Each agent stores its transcript differently, so a row in `REMOTE_AGENT_TABLE`
+(`src/remote-agents.ts`) names two things: where the file is, and which
+projector reads it. An agent with neither answers `no_transcript` and the phone
+says it has no live timeline.
+
+| Agent | Transcript | Projector |
+|-------|-----------|-----------|
+| Claude Code | `~/.claude/projects/<encoded cwd>/<uuid>.jsonl` | `src/transcript-tail.ts` |
+| pi | `~/.pi/agent/sessions/<encoded cwd>/<ts>_<id>.jsonl` (`PI_CODING_AGENT_DIR`) | `src/pi-transcript.ts` |
+| Codex CLI | `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl` (`CODEX_HOME`) | `src/codex-transcript.ts` |
+| Cursor, Gemini, Hermes, OpenCode | — none yet | — |
+
+Adding an agent means a projector file of its own, not another branch in an
+existing one: the formats share no vocabulary. Each projector is pinned to the
+vendor layout it was read against, and an entry type it has never seen draws no
+row rather than breaking the watch.
+
 ### Remote-origin detection (sticky REMOTE mode)
 
 A message injected via `send-keys` is indistinguishable from typing — so
@@ -146,13 +171,19 @@ an answerable `zeph_ask`).
 | Pi | `before_agent_start` → `zeph remote-hook pi` (via extension) | `zeph setup` |
 | Cursor CLI | — none yet | — |
 
-**Subagents (view-only).** A pi subagent spawned into an extra pane of the
-same tmux window shows up on your phone as a child of its parent card, named
-`<session>.<pane>` — its terminal mirror streams live, but input, keys, exit,
+**Subagents (view-only).** A subagent shows up on your phone as a child of its
+parent card, named `<session>.<n>` — it streams live, but input, keys, exit,
 resume and forget are all refused: you watch from the phone and answer at the
-terminal, where the parent owns the conversation. The pane is labelled from
-`@zeph_pane_label` (the pi extension sets it from `PI_SUBAGENT_NAME`), and a
-prompt push from a subagent names it and opens its stream directly.
+terminal, where the parent owns the conversation. A prompt push from a subagent
+names it and opens its stream directly.
+
+They reach the roster two ways. A pi subagent spawned into an extra pane of the
+same tmux window is found as a pane, and labelled from `@zeph_pane_label` (the
+pi extension sets it from `PI_SUBAGENT_NAME`). A Claude Code subagent — the
+`Agent` tool — has no pane at all; it is found in the parent's transcript
+directory instead (`src/subagent-transcripts.ts`), labelled from the
+description the parent gave it, and carries the number of tools it has run so
+far. Both kinds are numbered in one sequence, so the names never collide.
 
 Detection is exact-match: a terminal keystroke racing a phone message
 can never false-flag. Muted projects are never flagged.
