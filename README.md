@@ -185,6 +185,13 @@ directory instead (`src/subagent-transcripts.ts`), labelled from the
 description the parent gave it, and carries the number of tools it has run so
 far. Both kinds are numbered in one sequence, so the names never collide.
 
+A Claude Code subagent is marked `inProcess`, because the phone cannot mirror a
+pane that does not exist — its terminal view draws the transcript instead. It
+leaves the roster the moment the parent's transcript records its end (a
+background subagent's task notification, or a foreground one's `Agent` call
+returning), rather than after five quiet minutes; one that is resumed comes
+back when it writes again.
+
 Detection is exact-match: a terminal keystroke racing a phone message
 can never false-flag. Muted projects are never flagged.
 
