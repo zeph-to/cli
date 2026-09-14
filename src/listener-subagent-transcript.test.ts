@@ -123,14 +123,14 @@ describe('in-process subagents in the inventory sweep', () => {
 
         // Both are what turn-watch asks every tick. tmux cannot answer either
         // for `zeph-a.1` — it reads the `.1` as a pane index of `zeph-a`.
-        expect(listener.hasSession('zeph-a.1')).toBe(true);
+        expect(listener.sessionExists('zeph-a.1')).toBe(true);
         const source = listener.resolveWatchTranscript('zeph-a.1');
         expect(source?.path).toContain('subagents/agent-a90c3941.jsonl');
         // A subagent transcript is Claude Code's own format, so the pair has to
         // name Claude's projector — a source with a path and no reader is the
         // empty timeline the pair exists to prevent.
         expect(source?.project).toBe(projectTranscriptEntries);
-        expect(listener.hasSession('zeph-a.9')).toBe(false);
+        expect(listener.sessionExists('zeph-a.9')).toBe(false);
     });
 
     it('holds a subagent watch to its own transcript, never the parent it came from', () => {

@@ -1709,7 +1709,9 @@ export const handleSessionForgetRequest = (
  * the transcript map instead. Both maps are the same statement — the last sweep
  * saw this thing — and the split is which of the two the sweep could record.
  */
-const sessionExists = (name: string): boolean => {
+/** Exported for the same reason as the resolver below: the subagent branch is
+ *  the load-bearing one, and a test has to be able to reach it. */
+export const sessionExists = (name: string): boolean => {
     if (isSubagentSessionName(name)) {
         return targetsBySession.has(name) || subagentTranscriptsBySession.has(name);
     }
@@ -2334,10 +2336,6 @@ export const resolveWatchTranscript = (
     if (!agent.projectTranscript) return miss(`${agent.kind} resolves a transcript but has no projector`);
     return { path, project: agent.projectTranscript };
 };
-
-/** Whether this machine holds a session by this name — exported for the same
- *  reason as the resolver above: the subagent branch is the load-bearing one. */
-export const hasSession = (name: string): boolean => sessionExists(name);
 
 /**
  * The live agent-chat timeline (`turn-watch.ts`), kept beside `activeStreams`
@@ -3440,7 +3438,16 @@ export const collectSessionsVerbose = (): CollectResult => {
         // `Agent` tool). They are found in the parent's transcript directory
         // instead — see `subagent-transcripts.ts` — and reported as the same
         // view-only rows, numbered around the pane ids just taken above.
-        const transcriptPath = info.currentPath
+        //
+        // Claude Code only, and the kind is checked here rather than inferred
+        // from `resolveTranscript` existing: that used to mean "Claude", and
+        // stopped meaning it the moment pi and Codex got resolvers of their own.
+        // Without the check every pi and Codex session enters `scanSubagents`,
+        // whose `launchSeen` can never flip for a format that has no launch
+        // line — so it would re-read that session's transcript delta on every
+        // sweep for as long as the session lived, and pay Codex's two-shard
+        // header scan to produce a path it throws away one line later.
+        const transcriptPath = info.currentPath && main.agent.kind === 'claude'
             ? (main.agent.resolveTranscript?.(info.currentPath, info.panePid ?? undefined) ?? null)
             : null;
         if (transcriptPath) {

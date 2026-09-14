@@ -23,6 +23,7 @@ import {
     MAX_EVENT_TEXT_CHARS,
     oneLine,
     resultLinesOf,
+    sliceSinceLastPrompt,
     targetFrom,
     type ProjectorOptions,
     type TranscriptProjector,
@@ -254,8 +255,5 @@ export const projectPiEntries: TranscriptProjector = (lines, opts: ProjectorOpti
         }
     }
 
-    if (!opts.sinceLastPrompt) return events;
-
-    const lastPrompt = events.map((e) => e.kind).lastIndexOf('prompt');
-    return lastPrompt === -1 ? events : events.slice(lastPrompt);
+    return sliceSinceLastPrompt(events, opts);
 };

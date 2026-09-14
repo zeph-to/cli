@@ -444,10 +444,26 @@ export const resultLinesOf = (content: unknown): number => {
  */
 export const oneLine = (target: string | undefined): string | undefined => target?.replace(/\s+/g, ' ');
 
+/**
+ * The backfill window, applied the same way by every projector.
+ *
+ * This is about `TurnEvent` and `ProjectorOptions`, not about any one agent's
+ * vocabulary — unlike the per-format helpers beside it, which are deliberately
+ * not shared. Every projector ends with this call, and a fourth one should too.
+ */
+export const sliceSinceLastPrompt = (events: TurnEvent[], opts: ProjectorOptions): TurnEvent[] => {
+    if (!opts.sinceLastPrompt) return events;
+    // Scanned backwards rather than by mapping to kinds and taking the last
+    // index: the map allocates a whole array to find one number.
+    for (let i = events.length - 1; i >= 0; i--) {
+        if (events[i].kind === 'prompt') return events.slice(i);
+    }
+    return events;
+};
+
 /** A usable number, or 0 — token counts are the one place a missing field must not become `NaN` on the wire. */
 export const finiteNumber = (value: unknown): number =>
     typeof value === 'number' && Number.isFinite(value) ? value : 0;
-
 
 /** The `msg` for an assistant entry, or null when it carries no usable usage. */
 const messageMetaOf = (entry: Record<string, unknown>, at: string | undefined): Extract<TurnEvent, { kind: 'msg' }> | null => {
@@ -720,8 +736,5 @@ export const projectTranscriptEntries: TranscriptProjector = (lines, opts = {}):
         }
     }
 
-    if (!opts.sinceLastPrompt) return events;
-
-    const lastPrompt = events.map((e) => e.kind).lastIndexOf('prompt');
-    return lastPrompt === -1 ? events : events.slice(lastPrompt);
+    return sliceSinceLastPrompt(events, opts);
 };

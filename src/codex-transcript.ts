@@ -55,6 +55,7 @@ import {
     MAX_EVENT_TEXT_CHARS,
     oneLine,
     resultLinesOf,
+    sliceSinceLastPrompt,
     targetFrom,
     type ProjectorOptions,
     type TranscriptProjector,
@@ -243,13 +244,13 @@ export const projectCodexEntries: TranscriptProjector = (lines, opts: ProjectorO
             // secrets.
             const name = parsed && typeof parsed.type === 'string' ? parsed.type : 'exec';
             const target = oneLine(targetFrom(parsed, CODEX_PARSED_KEYS));
-            const lines = resultLinesOf(item.aggregated_output);
+            const resultLines = resultLinesOf(item.aggregated_output);
             events.push({ kind: 'tool', id: item.id, name: clamp(name), ...(target ? { target } : {}), ...stamp });
             events.push({
                 kind: 'tool_result',
                 id: item.id,
                 ok: succeeded(item),
-                ...(lines ? { lines } : {}),
+                ...(resultLines ? { lines: resultLines } : {}),
                 ...stamp,
             });
             continue;
@@ -283,8 +284,5 @@ export const projectCodexEntries: TranscriptProjector = (lines, opts: ProjectorO
         // reading its fields without a sample is guessing at a vendor's format.
     }
 
-    if (!opts.sinceLastPrompt) return events;
-
-    const lastPrompt = events.map((e) => e.kind).lastIndexOf('prompt');
-    return lastPrompt === -1 ? events : events.slice(lastPrompt);
+    return sliceSinceLastPrompt(events, opts);
 };
