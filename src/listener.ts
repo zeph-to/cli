@@ -74,9 +74,20 @@ import { createTurnWatchers, type TurnWatchControl } from './turn-watch.js';
 import { diskTurnRing } from './turn-ring.js';
 import { createInputSequencer, type InputSequencer, type SequencedInput } from './input-sequencer.js';
 import { startKeepAwake } from './keep-awake.js';
+import { createLanPublisher } from './lan-endpoint.js';
+import { startLanReceiver } from './lan-receiver.js';
+import { createLanTransfer, type LanTransfer } from './lan-transfer.js';
 import { PAYLOAD_LIMIT_BYTES, scanAgentCommands, type AgentCommandCatalog, type ScanResult } from './command-scan.js';
 
 const PING_INTERVAL_MS = 25_000;
+// Shutdown budget for the local-transfer retract PUT. `stopListener`
+// (listener-process.ts) SIGKILLs the daemon 3 s after SIGTERM on --stop /
+// --restart / service install, so the wait cap (2.5 s) sits above both
+// retract attempts (2 × 1 s) and under that 3 s. A retract the cap or the
+// kill still cuts off is harmless: senders also require `isOnline`, which
+// the dead WebSocket no longer satisfies.
+const LAN_RETRACT_TIMEOUT_MS = 1_000;
+const LAN_RETRACT_WAIT_MS = 2_500;
 const PONG_TIMEOUT_MS = 10_000;
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
@@ -3810,6 +3821,12 @@ export const setAttachmentContext = (ctx: { apiKey: string; baseUrl: string }): 
     attachmentCtx = ctx;
 };
 
+// Local transfer (ADR-0013). Set by handleListener; streamSession tells it
+// about every WebSocket open because $connect is what makes the device record
+// exist. null before the daemon starts and after stop — the relay path never
+// depends on it. Lifecycle and ordering live in lan-transfer.ts.
+let lanTransfer: LanTransfer | null = null;
+
 /**
  * Make a filesystem-safe single path segment: take the basename (drops
  * any `../` prefix), strip control chars and embedded separators, remove
@@ -4093,6 +4110,8 @@ export const computeListenerDeviceId = (host?: string): string => {
 interface StreamHandle {
     done: Promise<SessionResult>;
     terminate: () => void;
+    /** True once the socket reached `open` — the device record exists from then on. */
+    opened: () => boolean;
 }
 
 /**
@@ -4282,6 +4301,9 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             opened = true;
             lastRoundTripAt = Date.now();
             log('connected');
+            // The device record exists now — (re)publish where this machine
+            // can be reached for a local transfer (lan-transfer.ts).
+            lanTransfer?.onOpen();
             // Initial inventory so the phone's picker has something to
             // show as soon as the listener comes online.
             void reportSessions();
@@ -4440,6 +4462,7 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
     return {
         done,
         terminate: () => { ws?.terminate(); },
+        opened: () => opened,
     };
 };
 
@@ -4693,7 +4716,20 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     // interrupted — otherwise a SIGINT during the (up to 30s) backoff waits
     // out the full delay before the loop notices shuttingDown.
     let notifyStop: () => void = () => undefined;
+    let lanClearing: Promise<void> | null = null;
     const stopped = new Promise<void>((resolve) => { notifyStop = resolve; });
+
+    // Local transfer (ADR-0013): bind once the device keypair is loaded —
+    // every route the receiver grows authenticates with it — publish on WS
+    // open, retract on stop. Off with one log line if keys or bind fail.
+    lanTransfer = createLanTransfer({
+        log,
+        initCrypto: async () => { await initDeviceCrypto(); },
+        startReceiver: ({ onError }) => startLanReceiver({ log, onError }),
+        createPublisher: () => createLanPublisher({ deviceId: computeListenerDeviceId(), apiKey, baseUrl, log }),
+        isOpen: () => activeHandle?.opened() ?? false,
+    });
+
     const stop = (sig: string): void => {
         if (shuttingDown) return;
         shuttingDown = true;
@@ -4702,6 +4738,12 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
         // immediately instead of waiting for the server to drop us.
         activeHandle?.terminate();
         keepAwake.stop();
+        // Retract the endpoint so no sender is pointed at a port about to
+        // close; the loop tail waits (briefly) for this PUT before exiting.
+        if (lanTransfer) {
+            lanClearing = lanTransfer.stop({ retractTimeoutMs: LAN_RETRACT_TIMEOUT_MS });
+            lanTransfer = null;
+        }
         notifyStop();
     };
     process.on('SIGINT', () => stop('SIGINT'));
@@ -4734,6 +4776,16 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
         attempt = Math.min(attempt + 1, 10);
     }
 
+    // `main` calls process.exit right after this returns. The cap keeps
+    // Ctrl-C from hanging on a slow server and keeps the exit ahead of
+    // stopListener's SIGKILL (see LAN_RETRACT_WAIT_MS). A publish PUT still
+    // in flight (5 s budget) runs ahead of the retract on the same chain and
+    // can eat the whole cap — the retract is then lost, and `isOnline`
+    // covers it.
+    if (lanClearing) {
+        log('retracting local transfer endpoint…');
+        await Promise.race([lanClearing, sleep(LAN_RETRACT_WAIT_MS)]);
+    }
     inventoryOffload.close();
     removeListenerPid();
     return 0;

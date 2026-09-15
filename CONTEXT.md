@@ -85,3 +85,14 @@ plist는 node·cli.js 절대경로와 **tmux가 잡히는 PATH**를 설치 시�
 files that MUST change together, else a new key is rejected before it reaches the
 daemon: zeph `pushes.ts ALLOWED_AGENT_KEYS` (server gate) and the zeph web key row.
 Add a key → update all three.
+
+### LAN Endpoint (`lan-endpoint.ts`, `lan-receiver.ts`)
+Where this Machine Device can be reached for a **local transfer** (see `zeph/docs/adr/0013-local-transfer.md`):
+`{ host, port }` on its own device record, written through `PUT /v1/devices/{id}` and read by
+senders from `GET /devices`. Discovery is the account server, not mDNS. `host` is the first
+private IPv4 (RFC 1918 · CGNAT · link-local) — the server refuses anything else; `port` is
+OS-assigned by the receiver at boot. Published on every WebSocket **open** (that is when the
+device record is guaranteed to exist) and from a 60 s address watch; retracted with
+`lan: null` on shutdown. Liveness is the device's `isOnline`, never a timestamp here.
+The receiver only starts once the Device Keypair has loaded — every route it grows authenticates
+with it.

@@ -665,6 +665,15 @@ cap). Heartbeat is ping every 25 s with a 10 s pong timeout. On an
 authentication failure close (4001/4002/4003) the listener exits with
 code 3 instead of looping forever — fix the key and restart.
 
+**Local transfer.** Once its device keys are loaded the listener also opens a
+small HTTP server on an OS-assigned port and publishes `host:port` (private
+IPv4 only) on its device record, so a sender on the same Wi-Fi can hand a
+file straight to this machine instead of going through the cloud. The log
+says `local transfer: listening on 0.0.0.0:<port>`. If the macOS firewall is
+on, the first bind may ask *"Do you want the application node to accept
+incoming network connections?"* — declining is safe; files simply keep
+taking the relay.
+
 ### List Options
 
 | Flag | Description |
