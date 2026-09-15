@@ -23,7 +23,7 @@
 
 import { spawnSync } from 'child_process';
 import { createHash } from 'crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'fs';
+import { constants as fsConstants, copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { homedir, hostname, userInfo } from 'os';
 import { join, basename, isAbsolute, resolve, sep } from 'path';
 import WebSocket from 'ws';
@@ -69,8 +69,10 @@ import {
 import { advanceState, evaluateState, findPatternMatch, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
 import { startInventoryOffload, type InventoryOffload } from './inventory-offload.js';
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
-import { decryptEphemeral, decryptPushBodyForDevice, encryptEphemeral, getDevicePublicKey, initDeviceCrypto, unwrapDeviceKey, type EncryptedEphemeralPayload } from './crypto.js';
-import { downloadsDir, resolveDownloadPath } from './downloads.js';
+import { decryptEphemeral, decryptPushBodyForDevice, deriveLanSharedSecret, encryptEphemeral, getDevicePublicKey, initDeviceCrypto, unwrapDeviceKey, type EncryptedEphemeralPayload } from './crypto.js';
+import { createDeviceDirectory } from './device-directory.js';
+import { isTransferId } from './lan-auth.js';
+import { downloadsDir, resolveDownloadPath, safeFileName } from './downloads.js';
 import { notifyDesktop, type DesktopNotification } from './desktop-notify.js';
 import { saveStream, withIdleTimeout } from './file-crypto.js';
 import { createTurnWatchers, type TurnWatchControl } from './turn-watch.js';
@@ -3708,6 +3710,10 @@ interface HandlePushDeps {
      *  file was not wrapped for this device. Defaults to the streaming S3
      *  downloader. */
     saveFile?: (push: PushItem, file: PushFileAttachment) => Promise<string | null>;
+    /** Move a finished local transfer out of the landing zone into
+     *  `~/Downloads/Zeph/`; null when it is not there. Defaults to the
+     *  filesystem move under `~/.zeph/attachments/lan`. */
+    claimLanFile?: (file: PushFileAttachment) => Promise<string | null>;
     /** Desktop banner after a save. Defaults to osascript / notify-send. */
     notify?: (note: DesktopNotification) => Promise<boolean>;
     /** This machine's device id — what `targetDeviceId` and `deviceKeyMap` are keyed by. */
@@ -3840,6 +3846,8 @@ const tryInjectKeys = (session: string, tokens: string[], deps: HandlePushDeps):
 // ─── Attachment download (agent.command files[]) ────────────────────
 
 const ATTACHMENTS_DIR = join(homedir(), '.zeph', 'attachments');
+/** Local-transfer landing zone: `lan/<transferId>/<fileName>` until its push record arrives. */
+const LAN_LANDING_DIR = join(ATTACHMENTS_DIR, 'lan');
 const DEFAULT_API_BASE = 'https://api.zeph.to/v1';
 
 // apiKey + baseUrl for the file-download REST calls, set once in
@@ -4013,6 +4021,39 @@ const defaultSaveFile = (push: PushItem, file: PushFileAttachment): Promise<stri
     saveFileFromS3(push, file, { ctx: attachmentCtx, fetchFn: fetch, deviceId: computeListenerDeviceId, downloadsDir });
 
 /**
+ * Move a local-transfer file the receiver already decrypted into the
+ * Downloads folder, now that its push record has arrived. `link` + unlink
+ * keeps the never-overwrite rule (`resolveDownloadPath` picks a free name,
+ * link refuses a taken one); a Downloads folder on another volume gets a
+ * copy instead. Null when the transfer is not in the landing zone — already
+ * claimed by a duplicated push.new, or swept as an orphan.
+ */
+export const claimLanFile = (
+    file: { fileName: string; transferId: string },
+    landingDir: string = LAN_LANDING_DIR,
+    downloads: string = downloadsDir(),
+): string | null => {
+    if (!isTransferId(file.transferId)) throw new Error(`malformed transferId ${JSON.stringify(file.transferId)}`);
+    const transferDir = join(landingDir, file.transferId);
+    const src = join(transferDir, safeFileName(file.fileName));
+    if (!existsSync(src)) return null;
+    mkdirSync(downloads, { recursive: true });
+    const dest = resolveDownloadPath(file.fileName, downloads);
+    try {
+        linkSync(src, dest);
+    } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err;
+        copyFileSync(src, dest, fsConstants.COPYFILE_EXCL);
+    }
+    unlinkSync(src);
+    rmSync(transferDir, { recursive: true, force: true });
+    return dest;
+};
+
+const defaultClaimLanFile = async (file: PushFileAttachment): Promise<string | null> =>
+    claimLanFile({ fileName: file.fileName, transferId: file.transferId ?? '' });
+
+/**
  * What the banner says under the file name: the sender's push title
  * (`[project] name.ext` from the MCP, or whatever the phone typed) — it is
  * inside the encrypted body, so open it with our slot when we can; otherwise
@@ -4048,13 +4089,36 @@ const handleFilePush = async (push: PushItem, deps: HandlePushDeps): Promise<boo
     const notify = deps.notify ?? notifyDesktop;
     const from = await describeSender(push, me);
     let saved = 0;
+    const announce = (f: PushFileAttachment, dest: string): void => {
+        saved++;
+        log(`⇣ ${f.fileName} → ${dest}`);
+        // `notify` is an injection point; one that throws or rejects must
+        // not become an unhandled rejection, nor read as a failed save.
+        void Promise.resolve()
+            .then(() => notify({ title: `Zeph · ${basename(dest)}`, body: from }))
+            .catch((err: unknown) => log(`! banner failed — ${err instanceof Error ? err.message : String(err)}`));
+    };
     for (const f of files) {
         if (!f.fileKey) {
-            // No bytes in S3. Either handed over the LAN (`lanDeliveredTo`,
-            // ADR-0013 — the receiver that takes those in is the next slice)
-            // or a malformed attachment; both are nothing to fetch.
+            // No bytes in S3: handed over the LAN (`lanDeliveredTo`, ADR-0013),
+            // or a malformed attachment. Ours to claim only when it was
+            // delivered to this device.
+            if (f.lanDeliveredTo === me && f.transferId) {
+                const claim = deps.claimLanFile ?? defaultClaimLanFile;
+                try {
+                    const dest = await claim(f);
+                    if (dest === null) {
+                        log(`local transfer: "${f.fileName}" (${f.transferId}) is not in the landing zone — already claimed, or swept`);
+                        continue;
+                    }
+                    announce(f, dest);
+                } catch (err) {
+                    log(`! local transfer: claim of "${f.fileName}" failed — ${(err as Error).message}`);
+                }
+                continue;
+            }
             log(f.lanDeliveredTo
-                ? `local transfer: "${f.fileName}" was delivered over the LAN to ${f.lanDeliveredTo} — no receiver in this build, skipping`
+                ? `local transfer: "${f.fileName}" was delivered to ${f.lanDeliveredTo}, not this device — skipping`
                 : `! file "${f.fileName}": no fileKey — nothing to fetch, skipping`);
             continue;
         }
@@ -4064,13 +4128,7 @@ const handleFilePush = async (push: PushItem, deps: HandlePushDeps): Promise<boo
                 log(`file "${f.fileName}": not wrapped for this device — skipping`);
                 continue;
             }
-            saved++;
-            log(`⇣ ${f.fileName} → ${dest}`);
-            // `notify` is an injection point; one that throws or rejects must
-            // not become an unhandled rejection, nor read as a failed save.
-            void Promise.resolve()
-                .then(() => notify({ title: `Zeph · ${basename(dest)}`, body: from }))
-                .catch((err: unknown) => log(`! banner failed — ${err instanceof Error ? err.message : String(err)}`));
+            announce(f, dest);
         } catch (err) {
             log(`! file "${f.fileName}": save failed — ${(err as Error).message}`);
         }
@@ -4101,12 +4159,20 @@ export const gcAttachments = (
     now: number = Date.now(),
     dir: string = ATTACHMENTS_DIR,
     ttl: number = ATTACHMENT_TTL_MS,
+    landingDir: string = LAN_LANDING_DIR,
 ): number => {
     let removed = 0;
     let entries: string[];
     try { entries = readdirSync(dir); } catch { return 0; }
     for (const name of entries) {
         const full = join(dir, name);
+        if (full === landingDir) {
+            // Local-transfer landing zone: sweep the transfers inside it,
+            // never the zone itself. Matched by full path, so a transfer
+            // or push that happens to be called `lan` is swept like any other.
+            removed += gcAttachments(now, full, ttl, landingDir);
+            continue;
+        }
         try {
             if (now - statSync(full).mtimeMs <= ttl) continue;
             rmSync(full, { recursive: true, force: true });
@@ -4902,10 +4968,19 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     // Local transfer (ADR-0013): bind once the device keypair is loaded —
     // every route the receiver grows authenticates with it — publish on WS
     // open, retract on stop. Off with one log line if keys or bind fail.
+    const deviceDirectory = createDeviceDirectory({ apiKey, baseUrl, log });
     lanTransfer = createLanTransfer({
         log,
         initCrypto: async () => { await initDeviceCrypto(); },
-        startReceiver: ({ onError }) => startLanReceiver({ log, onError }),
+        startReceiver: ({ onError }) => startLanReceiver({
+            log,
+            onError,
+            deviceId: computeListenerDeviceId,
+            lookupSenderPublicKey: deviceDirectory.publicKeyOf,
+            deriveSharedSecret: deriveLanSharedSecret,
+            unwrapFileKey: unwrapDeviceKey,
+            landingDir: () => LAN_LANDING_DIR,
+        }),
         createPublisher: () => createLanPublisher({ deviceId: computeListenerDeviceId(), apiKey, baseUrl, log }),
         isOpen: () => activeHandle?.opened() ?? false,
     });

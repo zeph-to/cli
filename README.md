@@ -678,10 +678,23 @@ taking the relay.
 `zeph notify --file`, the phone's share sheet) is saved to `~/Downloads/Zeph/`
 under its own name — `name (2).ext` when that name is taken, never
 overwritten, never cleaned up — and a desktop banner (`Zeph · <file>` over
-the push's title, e.g. `[myproject] shot.png`) says it landed. Encrypted files are opened with this machine's own
-device key on the way down; nothing is buffered, so a 1 GB recording streams
-straight to disk. `agent.command` attachments are unaffected: they still go
-to `~/.zeph/attachments/<pushId>/` and are swept after 24 h.
+the push's title, e.g. `[myproject] shot.png`) says it landed. Encrypted
+files are opened with this machine's own device key on the way down; nothing
+is buffered, so a 1 GB recording streams straight to disk. `agent.command`
+attachments are unaffected: they still go to `~/.zeph/attachments/<pushId>/`
+and are swept after 24 h.
+
+A sender on the same network can skip the cloud entirely: it pings this
+machine's endpoint, then uploads the encrypted file straight to it. Every
+request is authenticated with a key only a device registered on your account
+can derive (ECDH with this machine's device key), so an unknown sender — or a
+replayed or tampered upload — gets an empty 401 and nothing is written. File
+names and the recipient list travel sealed too; someone sniffing the Wi-Fi
+sees a device id and a transfer id, nothing else. A device removed from the
+account is refused within a minute. The file waits in `~/.zeph/attachments/lan/`
+until its push record arrives, then moves to `~/Downloads/Zeph/` like any
+other; a transfer whose record never comes is swept after 24 h. Two uploads at
+a time, 1 GB each at most.
 
 ### List Options
 

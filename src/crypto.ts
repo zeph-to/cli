@@ -481,6 +481,18 @@ export const initDeviceCrypto = (): Promise<string> => {
 export const getDevicePublicKey = (): string | null => deviceExportedPublicKey;
 
 /**
+ * Raw ECDH secret between this device and `peerPublicKeyRaw` (Base64
+ * SPKI) — the 32-byte x-coordinate WebCrypto's `deriveBits` yields for
+ * P-256. Input to the local-transfer MAC key (lan-auth.ts `deriveLanKey`);
+ * never used as a key by itself. Requires initDeviceCrypto().
+ */
+export const deriveLanSharedSecret = async (peerPublicKeyRaw: string): Promise<Buffer> => {
+  if (!deviceKeyPair) throw new Error('Device crypto not initialized');
+  const peer = await importPublicKey(peerPublicKeyRaw);
+  return Buffer.from(await crypto.subtle.deriveBits({ name: 'ECDH', public: peer }, deviceKeyPair.privateKey, 256));
+};
+
+/**
  * Open this device's slot in a `deviceKeyMap` (the JSON `{ encryptedKey,
  * keyIv }` `wrapForDevices` writes) and return the raw AES key inside —
  * the per-file key for an attachment, or the message key for a push body.
