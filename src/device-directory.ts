@@ -9,6 +9,8 @@
  * unknown id after a fresh fetch is simply not a device of this account.
  */
 
+import { apiFetch, apiUrl } from './api.js';
+
 export interface DeviceDirectoryDeps {
     apiKey: string;
     baseUrl: string;
@@ -34,7 +36,7 @@ export const createDeviceDirectory = (deps: DeviceDirectoryDeps): DeviceDirector
     const now = deps.now ?? (() => Date.now());
     const ttlMs = deps.ttlMs ?? DEFAULT_TTL_MS;
     const refreshMinMs = deps.refreshMinMs ?? DEFAULT_REFRESH_MIN_MS;
-    const url = `${deps.baseUrl.replace(/\/+$/, '')}/devices`;
+    const url = apiUrl(deps.baseUrl, '/devices');
 
     let keys = new Map<string, string>();
     let fetchedAt = -Infinity;
@@ -47,7 +49,7 @@ export const createDeviceDirectory = (deps: DeviceDirectoryDeps): DeviceDirector
         if (inFlight) return inFlight;
         triedAt = now();
         inFlight = (async () => {
-            const res = await fetchFn(url, { headers: { 'X-API-Key': deps.apiKey }, signal: AbortSignal.timeout(deps.timeoutMs ?? 5_000) });
+            const res = await apiFetch(fetchFn, url, deps.apiKey, deps.timeoutMs ?? 5_000);
             if (!res.ok) throw new Error(`devices ${res.status}`);
             const json = (await res.json()) as { data?: { deviceId?: unknown; publicKey?: unknown }[] };
             const next = new Map<string, string>();

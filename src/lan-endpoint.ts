@@ -1,4 +1,5 @@
 import { networkInterfaces, type NetworkInterfaceInfo } from 'node:os';
+import { apiFetch, apiUrl } from './api.js';
 
 /**
  * Local transfer (ADR-0013) — the listener's side of the rendezvous.
@@ -69,7 +70,7 @@ export const createLanPublisher = (deps: LanPublisherDeps): LanPublisher => {
     const fetchFn = deps.fetchFn ?? fetch;
     const pickHost = deps.pickHost ?? (() => pickLanIpv4());
     const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const url = `${deps.baseUrl.replace(/\/+$/, '')}/devices/${encodeURIComponent(deps.deviceId)}`;
+    const url = apiUrl(deps.baseUrl, `/devices/${encodeURIComponent(deps.deviceId)}`);
 
     let published: { host: string; port: number } | null = null;
     let watchTimer: NodeJS.Timeout | null = null;
@@ -79,11 +80,9 @@ export const createLanPublisher = (deps: LanPublisherDeps): LanPublisher => {
 
     const put = async (lan: { host: string; port: number } | null, budgetMs = timeoutMs): Promise<boolean> => {
         try {
-            const res = await fetchFn(url, {
+            const res = await apiFetch(fetchFn, url, deps.apiKey, budgetMs, {
                 method: 'PUT',
-                headers: { 'X-API-Key': deps.apiKey, 'Content-Type': 'application/json' },
                 body: JSON.stringify({ lan }),
-                signal: AbortSignal.timeout(budgetMs),
             });
             if (!res.ok) {
                 deps.log(`local transfer: publish rejected (${res.status}) — relay only until it succeeds`);

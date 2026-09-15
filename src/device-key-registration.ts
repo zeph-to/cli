@@ -15,6 +15,8 @@
  * The private half never leaves `~/.zeph/device-keys.json`.
  */
 
+import { apiFetch, apiUrl } from './api.js';
+
 export interface DeviceKeyRegistrationDeps {
     deviceId: string;
     apiKey: string;
@@ -36,7 +38,7 @@ const DEFAULT_TIMEOUT_MS = 5_000;
 
 export const createDeviceKeyRegistration = (deps: DeviceKeyRegistrationDeps): DeviceKeyRegistration => {
     const fetchFn = deps.fetchFn ?? fetch;
-    const url = `${deps.baseUrl.replace(/\/+$/, '')}/devices/${encodeURIComponent(deps.deviceId)}`;
+    const url = apiUrl(deps.baseUrl, `/devices/${encodeURIComponent(deps.deviceId)}`);
     // Two opens in quick succession (a flapping socket) share one PUT. A record
     // recreated inside that window waits for the open after — accepted.
     let inFlight: Promise<boolean> | null = null;
@@ -44,11 +46,9 @@ export const createDeviceKeyRegistration = (deps: DeviceKeyRegistrationDeps): De
     const register = async (): Promise<boolean> => {
         try {
             const publicKey = await deps.publicKey();
-            const res = await fetchFn(url, {
+            const res = await apiFetch(fetchFn, url, deps.apiKey, deps.timeoutMs ?? DEFAULT_TIMEOUT_MS, {
                 method: 'PUT',
-                headers: { 'X-API-Key': deps.apiKey, 'Content-Type': 'application/json' },
                 body: JSON.stringify({ publicKey }),
-                signal: AbortSignal.timeout(deps.timeoutMs ?? DEFAULT_TIMEOUT_MS),
             });
             if (!res.ok) {
                 deps.log(`device key: registration rejected (${res.status}) — encrypted pushes skip this machine until the next connect`);
