@@ -6,6 +6,7 @@ import { detectAgents } from './agents.js';
 import { SERVICE_LABEL, serviceInstalled, uninstallService } from './listener-service.js';
 import { isZephHookGroup, removeManagedBlock } from './templates.js';
 import { CONFIG_FILE, VERSION } from './config.js';
+import { removeZephMcpTable } from './codex-config.js';
 
 const HOME = homedir();
 
@@ -43,6 +44,22 @@ export const rmMcpEntry = (filePath: string, dry: boolean, key = 'mcpServers'): 
         delete servers.zeph;
         writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n');
     }
+    return `${verb(dry)} zeph from ${filePath}`;
+};
+
+/** Remove `[mcp_servers.zeph]` from codex's TOML config, leaving the rest of
+ *  the user's file byte-for-byte. Exported for tests. */
+export const rmCodexMcpEntry = (filePath: string, dry: boolean): string | null => {
+    if (!existsSync(filePath)) return null;
+    let config: string;
+    try {
+        config = readFileSync(filePath, 'utf-8');
+    } catch {
+        return null;
+    }
+    const stripped = removeZephMcpTable(config);
+    if (stripped === null) return null;
+    if (!dry) writeFileSync(filePath, stripped);
     return `${verb(dry)} zeph from ${filePath}`;
 };
 
@@ -194,6 +211,7 @@ const AGENT_UNINSTALLERS: Record<string, (dry: boolean) => void> = {
     codex: (dry) => runSteps([
         () => rmCodexHook(join(HOME, '.codex', 'hooks.json'), dry),
         () => stripManagedRule(join(HOME, '.codex', 'AGENTS.md'), dry),
+        () => rmCodexMcpEntry(join(HOME, '.codex', 'config.toml'), dry),
     ]),
     copilot: (dry) => runSteps([
         () => rmFile(join(HOME, '.copilot', 'hooks', 'zeph.json'), dry),

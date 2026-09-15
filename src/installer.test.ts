@@ -279,6 +279,29 @@ describe('templates.ts: pi extension + opencode plugin artifacts', () => {
     });
 });
 
+describe('injectCodexMcpEntry — codex config.toml', () => {
+    it('registers zeph without disturbing the user\'s own settings', async () => {
+        const file = join(TMP, '.codex', 'config.toml');
+        mkdirSync(join(TMP, '.codex'), { recursive: true });
+        writeFileSync(file, 'model = "gpt-5.6-luna"\n\n[mcp_servers.graft]\ncommand = "graft"\nargs = ["mcp"]\n');
+        const { injectCodexMcpEntry } = await import('./installer.js');
+        injectCodexMcpEntry(file);
+        const out = readFileSync(file, 'utf-8');
+        expect(out).toContain('[mcp_servers.zeph]');
+        expect(out).toContain('model = "gpt-5.6-luna"');
+        expect(out).toContain('[mcp_servers.graft]');
+    });
+
+    it('re-run is idempotent', async () => {
+        const file = join(TMP, '.codex', 'config.toml');
+        const { injectCodexMcpEntry } = await import('./installer.js');
+        injectCodexMcpEntry(file);
+        const once = readFileSync(file, 'utf-8');
+        injectCodexMcpEntry(file);
+        expect(readFileSync(file, 'utf-8')).toBe(once);
+    });
+});
+
 describe('injectMcpEntry — opencode.json mcp schema', () => {
     it('writes mcp.zeph in opencode shape (array command, type local, enabled)', async () => {
         const file = join(TMP, '.config', 'opencode', 'opencode.json');

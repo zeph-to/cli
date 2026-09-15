@@ -12,6 +12,7 @@ import { ensureTmux, planTmuxInstall } from './tmux-install.js';
 import {
   GEMINI_MCP_ADD, GEMINI_MCP_ADD_LEGACY, MCP_SERVERS_ENTRY, OPENCODE_MCP_ENTRY,
 } from './mcp-command.js';
+import { upsertZephMcpTable } from './codex-config.js';
 import { installService, serviceSupported } from './listener-service.js';
 import type { Agent } from './agents.js';
 import {
@@ -147,6 +148,16 @@ export const injectMcpEntry = (filePath: string, key: string, entry: Record<stri
   writeFile(filePath, JSON.stringify(data, null, 2));
 };
 
+/** `[mcp_servers.zeph]` in codex's own TOML config — the one registry that is
+ *  not JSON. Exported for tests, like `injectMcpEntry`. */
+export const injectCodexMcpEntry = (filePath: string): void => {
+  let config = '';
+  try {
+    config = readFileSync(filePath, 'utf-8');
+  } catch { /* new file */ }
+  writeFile(filePath, upsertZephMcpTable(config).trimEnd());
+};
+
 const installClaude = (): void => {
   try {
     execSync('claude plugin marketplace add zeph-to/plugin', { stdio: 'pipe' });
@@ -245,6 +256,16 @@ const installCodex = (): void => {
     ok('Rules added to AGENTS.md');
   } catch {
     fail('Rule install failed. Manual: add zeph rules to ~/.codex/AGENTS.md');
+  }
+  try {
+    // The rules above tell codex to call zeph_ask, so it needs the server that
+    // provides it: codex has no bundled route to zeph the way pi's extension
+    // does. Written straight into the user's config.toml rather than shelled
+    // out to `codex mcp add`, which older codex builds do not have.
+    injectCodexMcpEntry(join(HOME, '.codex', 'config.toml'));
+    ok('MCP server registered in config.toml');
+  } catch {
+    fail('MCP install failed. Manual: codex mcp add zeph -- zeph mcp');
   }
 };
 
@@ -354,7 +375,7 @@ const AGENT_PLAN_LABELS: Record<string, string> = {
   cursor: 'Cursor — MCP + hooks + rules',
   windsurf: 'Windsurf — MCP + hooks + rules',
   gemini: 'Gemini CLI — MCP + hooks + rules',
-  codex: 'Codex CLI — hooks + rules',
+  codex: 'Codex CLI — MCP + hooks + rules',
   copilot: 'Copilot CLI — hooks + rules',
   cline: 'Cline — rules',
   aider: 'Aider — conventions',

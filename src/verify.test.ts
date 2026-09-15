@@ -104,3 +104,32 @@ describe('binaryResolves', () => {
         expect(binaryResolves('nope; echo injected')).toBe(false);
     });
 });
+
+describe('readCodexMcpArgv — the one TOML registry', () => {
+    const writeToml = (rel: string, body: string): string => {
+        const file = join(TMP, rel);
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, body);
+        return file;
+    };
+
+    it('reads the registration the installer writes', async () => {
+        const { readCodexMcpArgv } = await import('./verify.js');
+        const file = writeToml('config.toml', '[mcp_servers.zeph]\ncommand = "zeph"\nargs = ["mcp"]\n');
+        expect(readCodexMcpArgv(file)).toEqual(['zeph', 'mcp']);
+    });
+
+    it('hands back a stale registration unnormalized, so it can be called stale', async () => {
+        const { readCodexMcpArgv, classifyMcpRegistration } = await import('./verify.js');
+        const file = writeToml('stale.toml', '[mcp_servers.zeph]\ncommand = "npx"\nargs = ["-y", "@zeph-to/mcp-server"]\n');
+        const argv = readCodexMcpArgv(file);
+        expect(argv).toEqual(['npx', '-y', '@zeph-to/mcp-server']);
+        expect(classifyMcpRegistration(argv, () => true)).toEqual({ state: 'stale', argv });
+    });
+
+    it('is null for a config without zeph, and for a file that is not there', async () => {
+        const { readCodexMcpArgv } = await import('./verify.js');
+        expect(readCodexMcpArgv(writeToml('bare.toml', 'model = "gpt-5.6-luna"\n'))).toBeNull();
+        expect(readCodexMcpArgv(join(TMP, 'absent.toml'))).toBeNull();
+    });
+});

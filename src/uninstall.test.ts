@@ -274,6 +274,42 @@ describe('rmMcpEntry is keyed on the entry name, not the command', () => {
     });
 });
 
+describe('rmCodexMcpEntry — codex config.toml', () => {
+    it('removes only the zeph table, keeping the rest of the config', async () => {
+        const file = write('.codex/config.toml',
+            'model = "gpt-5.6-luna"\n\n[mcp_servers.zeph]\ncommand = "zeph"\nargs = ["mcp"]\n\n[mcp_servers.graft]\ncommand = "graft"\n');
+        const { rmCodexMcpEntry } = await import('./uninstall.js');
+        expect(rmCodexMcpEntry(file, false)).toBeTruthy();
+        const out = readFileSync(file, 'utf-8');
+        expect(out).not.toContain('mcp_servers.zeph');
+        expect(out).toContain('[mcp_servers.graft]');
+        expect(out).toContain('model = "gpt-5.6-luna"');
+    });
+
+it('round-trips with the installer on a config that has a zeph sub-table', async () => {
+        const body = 'model = "gpt-5.6-luna"\n\n[mcp_servers.graft]\ncommand = "graft"\n';
+        const file = write('.codex/roundtrip.toml', body);
+        const { injectCodexMcpEntry } = await import('./installer.js');
+        const { rmCodexMcpEntry } = await import('./uninstall.js');
+        injectCodexMcpEntry(file);
+        // Codex adds this itself once the user approves a tool "always".
+        writeFileSync(file, readFileSync(file, 'utf-8') + '\n[mcp_servers.zeph.tools.zeph_ask]\napproval_mode = "approve"\n');
+        expect(rmCodexMcpEntry(file, false)).toBeTruthy();
+        expect(readFileSync(file, 'utf-8')).toBe(body);
+    });
+
+    it('leaves the file alone in dry-run, and reports nothing when zeph is absent', async () => {
+        const body = 'model = "gpt-5.6-luna"\n\n[mcp_servers.zeph]\ncommand = "zeph"\nargs = ["mcp"]\n';
+        const file = write('.codex/config.toml', body);
+        const { rmCodexMcpEntry } = await import('./uninstall.js');
+        expect(rmCodexMcpEntry(file, true)).toBeTruthy();
+        expect(readFileSync(file, 'utf-8')).toBe(body);
+
+        const clean = write('.codex/other.toml', 'model = "gpt-5.6-luna"\n');
+        expect(rmCodexMcpEntry(clean, false)).toBeNull();
+    });
+});
+
 describe('rmMcpEntry with a custom container key (opencode.json)', () => {
     // Shared-body semantics (absent file, bad JSON, dry-run, idempotency) are
     // covered through handleUninstall above; the new fact is the `mcp` routing.
