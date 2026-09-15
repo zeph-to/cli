@@ -23,7 +23,8 @@ plugin은 hook이라 flag 없음). 우선순위 변경 시 이 절부터 갱신�
 ### Device Keypair
 The ECDH P-256 key material owned by a Machine Device. The **private** key never
 leaves the host. The **public** key is registered with the server so other devices
-can encrypt to this one. Distinct from the obsolete per-user keypair (removed).
+can encrypt to this one — by the listener, on every WebSocket open
+(`device-key-registration.ts`). Distinct from the obsolete per-user keypair (removed).
 
 ### Sender / Recipient
 A **Sender** is the process producing a push (CLI notify, MCP tool). A **Recipient**

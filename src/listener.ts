@@ -84,6 +84,7 @@ import type { ReadableStream } from 'node:stream/web';
 import { createLanPublisher } from './lan-endpoint.js';
 import { startLanReceiver } from './lan-receiver.js';
 import { createLanTransfer, type LanTransfer } from './lan-transfer.js';
+import { createDeviceKeyRegistration, type DeviceKeyRegistration } from './device-key-registration.js';
 import { PAYLOAD_LIMIT_BYTES, scanAgentCommands, type AgentCommandCatalog, type ScanResult } from './command-scan.js';
 
 const PING_INTERVAL_MS = 25_000;
@@ -3865,6 +3866,9 @@ export const setAttachmentContext = (ctx: { apiKey: string; baseUrl: string }): 
 // exist. null before the daemon starts and after stop — the relay path never
 // depends on it. Lifecycle and ordering live in lan-transfer.ts.
 let lanTransfer: LanTransfer | null = null;
+// This machine's public key on its device record (ADR-0007), re-registered on
+// every open for the same reason. Set by handleListener.
+let deviceKeyRegistration: DeviceKeyRegistration | null = null;
 
 /**
  * Make a filesystem-safe single path segment: take the basename (drops
@@ -4550,6 +4554,7 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             // The device record exists now — (re)publish where this machine
             // can be reached for a local transfer (lan-transfer.ts).
             lanTransfer?.onOpen();
+            void deviceKeyRegistration?.onOpen();
             // Initial inventory so the phone's picker has something to
             // show as soon as the listener comes online.
             void reportSessions();
@@ -4969,6 +4974,7 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     // every route the receiver grows authenticates with it — publish on WS
     // open, retract on stop. Off with one log line if keys or bind fail.
     const deviceDirectory = createDeviceDirectory({ apiKey, baseUrl, log });
+    deviceKeyRegistration = createDeviceKeyRegistration({ deviceId: computeListenerDeviceId(), apiKey, baseUrl, log, publicKey: initDeviceCrypto });
     lanTransfer = createLanTransfer({
         log,
         initCrypto: async () => { await initDeviceCrypto(); },
@@ -4999,6 +5005,7 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
             lanClearing = lanTransfer.stop({ retractTimeoutMs: LAN_RETRACT_TIMEOUT_MS });
             lanTransfer = null;
         }
+        deviceKeyRegistration = null;
         notifyStop();
     };
     process.on('SIGINT', () => stop('SIGINT'));

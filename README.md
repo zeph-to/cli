@@ -955,8 +955,12 @@ A device that has not registered a per-device public key cannot be sent
 to; it is skipped, and if no device qualifies the push goes out in the
 clear rather than arriving as something nothing can open.
 
-The `zeph listener` ignores `isEncrypted` pushes for now — it does not
-try to decrypt them. Stop-hook auto-pushes and `zeph_ask` responses are
+This host becomes a device others can encrypt for once `zeph listener`
+runs: it registers the public key on this machine's device record each
+time it connects to Zeph.
+
+The `zeph listener` opens encrypted file pushes addressed to it, and
+ignores every other `isEncrypted` push — it does not try to decrypt them. Stop-hook auto-pushes and `zeph_ask` responses are
 not part of the `@<session>` injection path, so this doesn't affect
 normal use.
 
