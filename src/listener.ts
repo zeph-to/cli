@@ -69,11 +69,16 @@ import {
 import { advanceState, evaluateState, findPatternMatch, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
 import { startInventoryOffload, type InventoryOffload } from './inventory-offload.js';
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
-import { decryptEphemeral, encryptEphemeral, getDevicePublicKey, initDeviceCrypto, type EncryptedEphemeralPayload } from './crypto.js';
+import { decryptEphemeral, decryptPushBodyForDevice, encryptEphemeral, getDevicePublicKey, initDeviceCrypto, unwrapDeviceKey, type EncryptedEphemeralPayload } from './crypto.js';
+import { downloadsDir, resolveDownloadPath } from './downloads.js';
+import { notifyDesktop, type DesktopNotification } from './desktop-notify.js';
+import { saveStream, withIdleTimeout } from './file-crypto.js';
 import { createTurnWatchers, type TurnWatchControl } from './turn-watch.js';
 import { diskTurnRing } from './turn-ring.js';
 import { createInputSequencer, type InputSequencer, type SequencedInput } from './input-sequencer.js';
 import { startKeepAwake } from './keep-awake.js';
+import { Readable } from 'node:stream';
+import type { ReadableStream } from 'node:stream/web';
 import { createLanPublisher } from './lan-endpoint.js';
 import { startLanReceiver } from './lan-receiver.js';
 import { createLanTransfer, type LanTransfer } from './lan-transfer.js';
@@ -3638,18 +3643,28 @@ export const isInventoried = (sessionName: string): boolean => {
 // ─── Push handling ──────────────────────────────────────────────────
 
 /**
- * One file riding on an `agent.command` push. agent.command attachments
- * are uploaded in *plaintext* (the listener has no per-user crypto key),
- * so `iv`/`encryptedKey` should be absent. If either is present the file
- * is encrypted and the listener can't read it — it gets skipped.
+ * One file riding on a push — `libs/shared` `PushFileAttachment`, the
+ * fields this daemon reads.
+ *
+ * `agent.command` attachments are uploaded in *plaintext* (the phone has no
+ * key for this host's scratch space); an encrypted one is skipped there. A
+ * `type: 'file'` push is the opposite: encrypted per device, and this
+ * machine opens its own `deviceKeyMap` slot (ADR-0007). `lanDeliveredTo`
+ * marks bytes that never went to S3 — handed straight to that device over
+ * the LAN (ADR-0013) — so there is no `fileKey` to fetch.
  */
 interface PushFileAttachment {
-    fileKey: string;
+    fileKey?: string;
     fileName: string;
     fileType?: string;
     fileSize?: number;
     iv?: string;
+    /** Legacy account-key wrap — nothing here can open it. */
     encryptedKey?: string;
+    /** deviceId → JSON `{ encryptedKey, keyIv }` (per-device wrap). */
+    deviceKeyMap?: Record<string, string>;
+    lanDeliveredTo?: string;
+    transferId?: string;
 }
 
 interface PushItem {
@@ -3659,6 +3674,12 @@ interface PushItem {
     title?: string;
     createdAt?: string;
     isEncrypted?: boolean;
+    senderDeviceId?: string;
+    targetDeviceId?: string;
+    /** E2E: the sender's per-device public key, needed to open our slot. */
+    senderPublicKey?: string;
+    /** E2E: per-device wrapped message key for the push body. */
+    deviceKeyMap?: Record<string, string>;
     /** Set when type='agent.command' — tmux session name to inject into. */
     agentSessionName?: string;
     /** Named keys (Esc/arrows/Enter) to inject instead of body text —
@@ -3667,7 +3688,8 @@ interface PushItem {
     /** Literal text delivered WITHOUT the submitting Enter (see the same field
      *  on AgentCommandInput for why it is a field and not a flag). */
     insert?: string;
-    /** Optional image/file attachments (agent.command only, plaintext). */
+    /** Attachments: plaintext scratch files on `agent.command`, the delivered
+     *  file(s) on `type: 'file'`. */
     files?: PushFileAttachment[];
 }
 
@@ -3681,6 +3703,15 @@ interface HandlePushDeps {
     now?: () => number;
     /** Injectable for tests; defaults to the REST-backed downloader. */
     downloadAttachments?: (pushId: string, files: PushFileAttachment[]) => Promise<string[]>;
+    /** `type: 'file'` delivery: fetch, decrypt and save one attachment into
+     *  `~/Downloads/Zeph/`; resolves with the path written, or null when the
+     *  file was not wrapped for this device. Defaults to the streaming S3
+     *  downloader. */
+    saveFile?: (push: PushItem, file: PushFileAttachment) => Promise<string | null>;
+    /** Desktop banner after a save. Defaults to osascript / notify-send. */
+    notify?: (note: DesktopNotification) => Promise<boolean>;
+    /** This machine's device id — what `targetDeviceId` and `deviceKeyMap` are keyed by. */
+    deviceId?: () => string;
     /** Pane cwd lookup for the remote-origin marker (ADR-0002). */
     paneCwd?: (session: string) => string | null;
     /** Fired after a successful named-key injection so the WS loop can push
@@ -3841,21 +3872,30 @@ const safeSegment = (raw: string, fallback: string): string => {
     return (cleaned || fallback).slice(0, 200);
 };
 
+/** Resolve fileKey → presigned download URL. Throws on any HTTP failure. */
+const resolveDownloadUrl = async (
+    fileKey: string,
+    ctx: { apiKey: string; baseUrl: string },
+    fetchFn: typeof fetch = fetch,
+): Promise<string> => {
+    const metaUrl = `${ctx.baseUrl.replace(/\/+$/, '')}/files/${encodeURIComponent(fileKey)}`;
+    const meta = await fetchFn(metaUrl, { headers: { 'X-API-Key': ctx.apiKey } });
+    if (!meta.ok) throw new Error(`metadata ${meta.status}`);
+    // Server wraps responses as { data: { downloadUrl } } (see lib/response ok()).
+    const body = (await meta.json()) as { data?: { downloadUrl?: string }; downloadUrl?: string };
+    const downloadUrl = body.data?.downloadUrl ?? body.downloadUrl;
+    if (!downloadUrl) throw new Error('response had no downloadUrl');
+    return downloadUrl;
+};
+
 /** Resolve fileKey → presigned URL → bytes. Throws on any HTTP failure so
  *  the caller can isolate one file's failure from the rest of the batch. */
 const fetchAttachmentBytes = async (
     fileKey: string,
     ctx: { apiKey: string; baseUrl: string },
 ): Promise<Buffer> => {
-    const metaUrl = `${ctx.baseUrl.replace(/\/+$/, '')}/files/${encodeURIComponent(fileKey)}`;
-    const meta = await fetch(metaUrl, { headers: { 'X-API-Key': ctx.apiKey } });
-    if (!meta.ok) throw new Error(`metadata ${meta.status}`);
-    // Server wraps responses as { data: { downloadUrl } } (see lib/response ok()).
-    const body = (await meta.json()) as { data?: { downloadUrl?: string }; downloadUrl?: string };
-    const downloadUrl = body.data?.downloadUrl ?? body.downloadUrl;
-    if (!downloadUrl) throw new Error('response had no downloadUrl');
     // The presigned URL is self-authenticating — no API key header.
-    const bin = await fetch(downloadUrl);
+    const bin = await fetch(await resolveDownloadUrl(fileKey, ctx));
     if (!bin.ok) throw new Error(`download ${bin.status}`);
     return Buffer.from(await bin.arrayBuffer());
 };
@@ -3880,6 +3920,10 @@ const downloadAttachments = async (
             log(`! attachment "${f.fileName}": encrypted (iv/encryptedKey present) — listener can't decrypt, skipping`);
             continue;
         }
+        if (!f.fileKey) {
+            log(`! attachment "${f.fileName}": no fileKey — nothing to fetch, skipping`);
+            continue;
+        }
         try {
             const bytes = await fetchAttachmentBytes(f.fileKey, ctx);
             mkdirSync(dir, { recursive: true });
@@ -3900,6 +3944,138 @@ const defaultDownloadAttachments = (pushId: string, files: PushFileAttachment[])
         return Promise.resolve([]);
     }
     return downloadAttachments(pushId, files, attachmentCtx);
+};
+
+// ─── File pushes (type: 'file') → ~/Downloads/Zeph/ ─────────────────
+//
+// The receive half ADR-0007 left unbuilt: until now every `type: 'file'`
+// push was dropped here, so a Mac could send files but never take one.
+// Bytes stream from S3 straight through the GCM decrypt to disk (no
+// buffering — the Pro cap is 1 GiB), land flat in ~/Downloads/Zeph/ under
+// the sender's name (` (2)` on collision, never overwritten, never GC'd),
+// and a desktop banner says so. Local-transfer deliveries (`lanDeliveredTo`)
+// take the same exit once the receiver lands.
+
+/** A download that sends no bytes for this long is dead, not slow. */
+const DOWNLOAD_IDLE_MS = 60_000;
+
+export interface SaveFileDeps {
+    ctx: { apiKey: string; baseUrl: string } | null;
+    fetchFn: typeof fetch;
+    deviceId: () => string;
+    downloadsDir: () => string;
+    idleTimeoutMs?: number;
+}
+
+/**
+ * Fetch one attachment and save it under `~/Downloads/Zeph/`, decrypting
+ * with this device's `deviceKeyMap` slot when the file is encrypted.
+ * Resolves with the path written; null when the file is encrypted for
+ * other devices only (a broadcast this machine is not a recipient of —
+ * not a failure); throws when the bytes cannot be fetched or opened.
+ * Exported with its deps so the real path is testable without S3.
+ */
+export const saveFileFromS3 = async (
+    push: PushItem,
+    file: PushFileAttachment,
+    deps: SaveFileDeps,
+): Promise<string | null> => {
+    if (!deps.ctx) throw new Error('attachment context not initialised');
+    if (!file.fileKey) throw new Error('no fileKey');
+    let decrypt: { rawKey: Buffer; iv: Buffer } | undefined;
+    if (file.deviceKeyMap) {
+        // Per-device wrap (ADR-0007). Precedence over the legacy field, as
+        // libs/shared documents: a migrated sender may still write both.
+        const slot = file.deviceKeyMap[deps.deviceId()];
+        if (!slot) return null;
+        if (!push.senderPublicKey) throw new Error('encrypted push carries no senderPublicKey');
+        if (!file.iv) throw new Error('encrypted file carries no iv');
+        decrypt = { rawKey: await unwrapDeviceKey(slot, push.senderPublicKey), iv: Buffer.from(file.iv, 'base64') };
+    } else if (file.encryptedKey) {
+        throw new Error('legacy account-key encryption — this device cannot open it');
+    } else if (file.iv) {
+        throw new Error('encrypted, but no key material on the attachment');
+    }
+    const controller = new AbortController();
+    // The presigned URL is self-authenticating: no API key goes to S3.
+    const res = await deps.fetchFn(await resolveDownloadUrl(file.fileKey, deps.ctx, deps.fetchFn), { signal: controller.signal });
+    if (!res.ok) throw new Error(`download ${res.status}`);
+    if (!res.body) throw new Error('download had no body');
+    // fetch's body is typed by undici without the async-iterator members
+    // node:stream/web declares; at runtime it is that same ReadableStream.
+    const source = withIdleTimeout(Readable.fromWeb(res.body as ReadableStream), deps.idleTimeoutMs ?? DOWNLOAD_IDLE_MS, controller);
+    const dir = deps.downloadsDir();
+    const saved = await saveStream(source, () => resolveDownloadPath(file.fileName, dir), decrypt);
+    return saved.path;
+};
+
+const defaultSaveFile = (push: PushItem, file: PushFileAttachment): Promise<string | null> =>
+    saveFileFromS3(push, file, { ctx: attachmentCtx, fetchFn: fetch, deviceId: computeListenerDeviceId, downloadsDir });
+
+/**
+ * What the banner says under the file name: the sender's push title
+ * (`[project] name.ext` from the MCP, or whatever the phone typed) — it is
+ * inside the encrypted body, so open it with our slot when we can; otherwise
+ * the plaintext title, then the sender device id. Never throws — the banner
+ * is not worth a lost file.
+ */
+const describeSender = async (push: PushItem, me: string): Promise<string> => {
+    let title = push.title;
+    const slot = push.deviceKeyMap?.[me];
+    if (push.isEncrypted && push.body && slot && push.senderPublicKey) {
+        try {
+            title = (await decryptPushBodyForDevice(push.body, slot, push.senderPublicKey)).title ?? title;
+        } catch (err) {
+            log(`! push ${push.pushId}: title unreadable — ${(err as Error).message}`);
+        }
+    }
+    return `from ${title || push.senderDeviceId || 'another device'}`;
+};
+
+/**
+ * Save every attachment of a `type: 'file'` push addressed to this machine.
+ * Returns true when at least one file landed. Pushes for another device,
+ * and this device's own sends (never wrapped for the sender — MCP and
+ * listener on one host share a device id), are left alone.
+ */
+const handleFilePush = async (push: PushItem, deps: HandlePushDeps): Promise<boolean> => {
+    const me = deps.deviceId?.() ?? computeListenerDeviceId();
+    if (push.targetDeviceId && push.targetDeviceId !== me) return false;
+    if (push.senderDeviceId === me) return false;
+    const files = push.files ?? [];
+    if (files.length === 0) return false;
+    const save = deps.saveFile ?? defaultSaveFile;
+    const notify = deps.notify ?? notifyDesktop;
+    const from = await describeSender(push, me);
+    let saved = 0;
+    for (const f of files) {
+        if (!f.fileKey) {
+            // No bytes in S3. Either handed over the LAN (`lanDeliveredTo`,
+            // ADR-0013 — the receiver that takes those in is the next slice)
+            // or a malformed attachment; both are nothing to fetch.
+            log(f.lanDeliveredTo
+                ? `local transfer: "${f.fileName}" was delivered over the LAN to ${f.lanDeliveredTo} — no receiver in this build, skipping`
+                : `! file "${f.fileName}": no fileKey — nothing to fetch, skipping`);
+            continue;
+        }
+        try {
+            const dest = await save(push, f);
+            if (dest === null) {
+                log(`file "${f.fileName}": not wrapped for this device — skipping`);
+                continue;
+            }
+            saved++;
+            log(`⇣ ${f.fileName} → ${dest}`);
+            // `notify` is an injection point; one that throws or rejects must
+            // not become an unhandled rejection, nor read as a failed save.
+            void Promise.resolve()
+                .then(() => notify({ title: `Zeph · ${basename(dest)}`, body: from }))
+                .catch((err: unknown) => log(`! banner failed — ${err instanceof Error ? err.message : String(err)}`));
+        } catch (err) {
+            log(`! file "${f.fileName}": save failed — ${(err as Error).message}`);
+        }
+    }
+    return saved > 0;
 };
 
 /**
@@ -3941,21 +4117,25 @@ export const gcAttachments = (
 };
 
 /**
- * Process one push. Returns true when an injection actually fired.
- * Exported for unit testing with mocked deps.
+ * Process one push. Returns true when it did something: an injection
+ * fired, or a file was saved. Exported for unit testing with mocked deps.
  *
- * Only acts on `type='agent.command'` pushes carrying both an
- * `agentSessionName` (tmux session to inject into) and a non-empty
- * `body`. Everything else (Stop-hook auto-pushes, zeph_ask responses,
- * encrypted pushes, normal text/link/file notifications) is ignored.
+ * Two push types act here. `type='file'` addressed to this machine is saved
+ * to ~/Downloads/Zeph/ (encrypted or not — this device opens its own
+ * `deviceKeyMap` slot). `type='agent.command'` carrying an `agentSessionName`
+ * (tmux session to inject into) and a non-empty `body` injects, and only in
+ * plaintext — that path predates per-device keys and is unchanged. Everything
+ * else (Stop-hook auto-pushes, zeph_ask responses, text/link notifications)
+ * is ignored.
  */
 export const handlePush = async (
     push: PushItem,
     deps: HandlePushDeps = {},
 ): Promise<boolean> => {
+    if (push.type === 'file') return handleFilePush(push, deps);
     if (push.isEncrypted) {
-        // Per-device keys aren't wired yet; encrypted pushes are opaque
-        // to the listener.
+        // An encrypted agent.command is opaque to the injector; the phone
+        // never sends one, and the guard keeps it that way.
         return false;
     }
     if (push.type !== 'agent.command' || !push.agentSessionName) return false;

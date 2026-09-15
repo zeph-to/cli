@@ -674,6 +674,15 @@ on, the first bind may ask *"Do you want the application node to accept
 incoming network connections?"* — declining is safe; files simply keep
 taking the relay.
 
+**Receiving files.** A file push addressed to this machine (`zeph_file`,
+`zeph notify --file`, the phone's share sheet) is saved to `~/Downloads/Zeph/`
+under its own name — `name (2).ext` when that name is taken, never
+overwritten, never cleaned up — and a desktop banner (`Zeph · <file>` over
+the push's title, e.g. `[myproject] shot.png`) says it landed. Encrypted files are opened with this machine's own
+device key on the way down; nothing is buffered, so a 1 GB recording streams
+straight to disk. `agent.command` attachments are unaffected: they still go
+to `~/.zeph/attachments/<pushId>/` and are swept after 24 h.
+
 ### List Options
 
 | Flag | Description |

@@ -96,3 +96,14 @@ device record is guaranteed to exist) and from a 60 s address watch; retracted w
 `lan: null` on shutdown. Liveness is the device's `isOnline`, never a timestamp here.
 The receiver only starts once the Device Keypair has loaded — every route it grows authenticates
 with it.
+
+### Downloads Folder (`downloads.ts`, `file-crypto.ts`, `desktop-notify.ts`)
+Where a `type: 'file'` push addressed to this Machine Device lands: `~/Downloads/Zeph/`, flat,
+`name (2).ext` on collision, never overwritten (`link` + `unlink`, not `rename`) and never
+garbage-collected — the user's folder, not the daemon's cache (that is `~/.zeph/attachments/`,
+`agent.command` only, 24 h sweep). Bytes stream S3 → `node:crypto` AES-256-GCM decrypt → disk
+(`file-crypto.ts` holds back the trailing 16-byte tag WebCrypto appends; same wire format as
+`libs/crypto` `encryptFile`); the per-file key comes out of this device's `deviceKeyMap` slot
+(`crypto.ts` `unwrapDeviceKey`). A banner (`osascript` / `notify-send` / none) names the file
+and the sender's push title. `handlePush` routes `type: 'file'` here before the `agent.command`
+gates, which are unchanged.

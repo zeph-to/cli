@@ -481,6 +481,58 @@ export const initDeviceCrypto = (): Promise<string> => {
 export const getDevicePublicKey = (): string | null => deviceExportedPublicKey;
 
 /**
+ * Open this device's slot in a `deviceKeyMap` (the JSON `{ encryptedKey,
+ * keyIv }` `wrapForDevices` writes) and return the raw AES key inside —
+ * the per-file key for an attachment, or the message key for a push body.
+ * The ECDH secret is derived from this device's private half and the
+ * sender's `senderPublicKey`; anything but that pairing fails the GCM tag
+ * and rejects. Requires initDeviceCrypto().
+ */
+const unwrapDeviceKeyRaw = async (entryJson: string, senderPublicKeyRaw: string): Promise<ArrayBuffer> => {
+  if (!deviceKeyPair) throw new Error('Device crypto not initialized');
+  const entry = JSON.parse(entryJson) as { encryptedKey?: unknown; keyIv?: unknown };
+  if (typeof entry.encryptedKey !== 'string' || typeof entry.keyIv !== 'string') {
+    throw new Error('deviceKeyMap entry is not { encryptedKey, keyIv }');
+  }
+  const sharedKey = await deriveAesKey(deviceKeyPair.privateKey, await importPublicKey(senderPublicKeyRaw));
+  return crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: new Uint8Array(fromBase64(entry.keyIv)) },
+    sharedKey,
+    fromBase64(entry.encryptedKey),
+  );
+};
+
+export const unwrapDeviceKey = async (entryJson: string, senderPublicKeyRaw: string): Promise<Buffer> =>
+  Buffer.from(await unwrapDeviceKeyRaw(entryJson, senderPublicKeyRaw));
+
+/**
+ * Decrypt a push body sealed by `encryptPushBodyForDevices` (any client's
+ * twin of it) for this device: `body` is the JSON `{ ciphertext, iv }`
+ * envelope, the message key comes out of this device's `deviceKeyMap` slot.
+ * Returns the `{ title, body, url }` the sender put in.
+ */
+export const decryptPushBodyForDevice = async (
+  body: string,
+  entryJson: string,
+  senderPublicKeyRaw: string,
+): Promise<{ title?: string; body?: string; url?: string }> => {
+  const envelope = JSON.parse(body) as { ciphertext?: unknown; iv?: unknown };
+  if (typeof envelope.ciphertext !== 'string' || typeof envelope.iv !== 'string') {
+    throw new Error('push body is not a { ciphertext, iv } envelope');
+  }
+  const rawKey = await unwrapDeviceKeyRaw(entryJson, senderPublicKeyRaw);
+  const messageKey = await crypto.subtle.importKey('raw', rawKey, { name: 'AES-GCM' }, false, ['decrypt']);
+  const plaintext = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: new Uint8Array(fromBase64(envelope.iv)) },
+    messageKey,
+    fromBase64(envelope.ciphertext),
+  );
+  const parsed = JSON.parse(new TextDecoder().decode(plaintext)) as { title?: unknown; body?: unknown; url?: unknown };
+  const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
+  return { title: str(parsed.title), body: str(parsed.body), url: str(parsed.url) };
+};
+
+/**
  * Encrypt an ephemeral payload (e.g. a stream frame) for one recipient
  * device. Requires initDeviceCrypto() to have completed.
  */
