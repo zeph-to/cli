@@ -29,14 +29,19 @@ export interface TestSender {
     publicKey: string;
     /** Keys against `receiverPublicKey`, via the same ECDH + HKDF the receiver runs. */
     keys: LanKeys;
+    /** Raw ECDH secret against any public key — what `tryLanDelivery` takes. */
+    deriveSharedSecret: (publicKey: string) => Promise<Buffer>;
     /** `{ ciphertext, iv, deviceKeyMap }` for the receiver, byte-exact `encryptFileForDevices` output. */
     seal: (plaintext: Buffer, recipients?: { deviceId: string; publicKey: string }[]) => Promise<{ ciphertext: Buffer; iv: string; deviceKeyMap: Record<string, string> }>;
 }
 
 export const createTestSender = async (deviceId: string, receiverPublicKey: string): Promise<TestSender> => {
     const pair = await subtle.generateKey(ECDH, true, ['deriveKey', 'deriveBits']);
-    const receiverPub = await subtle.importKey('spki', Buffer.from(receiverPublicKey, 'base64'), ECDH, true, []);
-    const secret = Buffer.from(await subtle.deriveBits({ name: 'ECDH', public: receiverPub }, pair.privateKey, 256));
+    const deriveSharedSecret = async (publicKey: string): Promise<Buffer> => {
+        const pub = await subtle.importKey('spki', Buffer.from(publicKey, 'base64'), ECDH, true, []);
+        return Buffer.from(await subtle.deriveBits({ name: 'ECDH', public: pub }, pair.privateKey, 256));
+    };
+    const secret = await deriveSharedSecret(receiverPublicKey);
     const wrapFor = async (rawFileKey: ArrayBuffer, publicKey: string): Promise<string> => {
         const pub = await subtle.importKey('spki', Buffer.from(publicKey, 'base64'), ECDH, true, []);
         const shared = await subtle.deriveKey({ name: 'ECDH', public: pub }, pair.privateKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
@@ -48,6 +53,7 @@ export const createTestSender = async (deviceId: string, receiverPublicKey: stri
         deviceId,
         publicKey: b64(await subtle.exportKey('spki', pair.publicKey)),
         keys: deriveLanKeys(secret),
+        deriveSharedSecret,
         seal: async (plaintext, recipients) => {
             const fileKey = await subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt']);
             const iv = webcrypto.getRandomValues(new Uint8Array(12));

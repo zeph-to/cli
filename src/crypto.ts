@@ -30,10 +30,10 @@
 
 /// <reference lib="dom" />
 
-import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync, linkSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
-import { webcrypto } from 'node:crypto';
+import { randomBytes, webcrypto } from 'node:crypto';
 
 // Node 18 has no `crypto` global (unflagged only from 19.0.0) — resolve the
 // Web Crypto implementation explicitly so encryption works on the declared
@@ -446,9 +446,31 @@ const loadStoredDeviceKeys = (): ExportedKeyPair | null => {
   }
 };
 
-const storeDeviceKeys = (exported: ExportedKeyPair): void => {
+/**
+ * Create the keypair file, exclusively. The MCP server creates the same file
+ * (one Machine Device keypair per host, ADR-0007), and two processes each
+ * writing their own pair would leave one of them holding a key that is not on
+ * disk — and not the one registered. Returns what is on disk afterwards: ours,
+ * or the pair that won the race.
+ */
+const storeDeviceKeys = (exported: ExportedKeyPair): ExportedKeyPair => {
   mkdirSync(DEVICE_KEYS_DIR, { recursive: true, mode: 0o700 });
-  writeFileSync(DEVICE_KEYS_PATH, JSON.stringify(exported, null, 2), { mode: 0o600 });
+  // Written whole to a private temp name, then linked into place: `link` is
+  // atomic and fails if the name exists, so the file under the real name is
+  // never half-written, and a process that loses the race reads a complete one.
+  const temp = `${DEVICE_KEYS_PATH}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  writeFileSync(temp, JSON.stringify(exported, null, 2), { mode: 0o600, flag: 'wx' });
+  try {
+    linkSync(temp, DEVICE_KEYS_PATH);
+    return exported;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    const winner = loadStoredDeviceKeys();
+    if (!winner?.publicKey || !winner.privateKey) throw new Error(`${DEVICE_KEYS_PATH} exists but holds no keypair`);
+    return winner;
+  } finally {
+    try { unlinkSync(temp); } catch { /* already gone — fine */ }
+  }
 };
 
 /**
@@ -467,10 +489,10 @@ export const initDeviceCrypto = (): Promise<string> => {
     }
     const keyPair = await generateKeyPair();
     const exported = await exportKeyPair(keyPair);
-    storeDeviceKeys(exported);
-    deviceKeyPair = keyPair;
-    deviceExportedPublicKey = exported.publicKey;
-    return exported.publicKey;
+    const onDisk = storeDeviceKeys(exported);
+    deviceKeyPair = onDisk === exported ? keyPair : await importKeyPair(onDisk);
+    deviceExportedPublicKey = onDisk.publicKey;
+    return onDisk.publicKey;
   })().catch((err) => {
     deviceInitPromise = null;
     throw err;

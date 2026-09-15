@@ -690,7 +690,10 @@ request is authenticated with a key only a device registered on your account
 can derive (ECDH with this machine's device key), so an unknown sender — or a
 replayed or tampered upload — gets an empty 401 and nothing is written. File
 names and the recipient list travel sealed too; someone sniffing the Wi-Fi
-sees a device id and a transfer id, nothing else. A device removed from the
+sees a device id and a transfer id, nothing else. The sender counts a file
+delivered only on a receipt this machine alone can compute, so a host that
+merely answers on this machine's address cannot swallow it — the file goes via
+the cloud instead. A device removed from the
 account is refused within a minute. The file waits in `~/.zeph/attachments/lan/`
 until its push record arrives, then moves to `~/Downloads/Zeph/` like any
 other; a transfer whose record never comes is swept after 24 h. Two uploads at

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { request as httpRequest } from 'node:http';
 import { connect, type Socket } from 'node:net';
 import { startLanReceiver, type LanReceiver, type LanReceiverOptions } from './lan-receiver.js';
-import { LAN_CLOCK_SKEW_MS, LAN_HEADERS, LAN_PATHS, createNonceRegistry, deriveLanKeys, sealMeta } from './lan-auth.js';
+import { LAN_CLOCK_SKEW_MS, LAN_HEADERS, LAN_PATHS, createNonceRegistry, deriveLanKeys, sealMeta, verifyLanReceipt } from './lan-auth.js';
 import { deriveLanSharedSecret, getDevicePublicKey, initDeviceCrypto, unwrapDeviceKey } from './crypto.js';
 import { createTestSender, pingUrl, signPing, signUpload, uploadUrl, type TestSender } from '../tests/helpers/lan-sender.js';
 
@@ -79,10 +79,13 @@ describe('ping', () => {
         expect(await res.text()).toBe('');
     });
 
-    it('a registered sender gets {deviceId}', async () => {
-        const res = await fetch(pingUrl(receiver.port), { headers: signPing(sender) });
+    it('a registered sender gets {deviceId} and a receipt over its own MAC; a refusal carries none', async () => {
+        const headers = signPing(sender);
+        const res = await fetch(pingUrl(receiver.port), { headers });
         expect(res.status).toBe(200);
         expect(await res.json()).toEqual({ deviceId: ME });
+        expect(verifyLanReceipt(sender.keys.macKey, headers[LAN_HEADERS.mac], res.headers.get(LAN_HEADERS.receipt))).toBe(true);
+        expect((await fetch(pingUrl(receiver.port), { headers: signPing(stranger) })).headers.get(LAN_HEADERS.receipt)).toBeNull();
     });
 
     it('a device not on the account is 401 even with well-formed, self-consistent headers', async () => {
@@ -121,9 +124,11 @@ describe('ping', () => {
 describe('upload', () => {
     it('a sealed file from a registered sender lands decrypted in <landing>/<transferId>/<fileName>, 201', async () => {
         const { plain, env, meta } = await sealed(sender, 'hello over the LAN');
-        const res = await upload(signUpload(sender, 'tr_ok_1', env.ciphertext, meta), env.ciphertext);
+        const headers = signUpload(sender, 'tr_ok_1', env.ciphertext, meta);
+        const res = await upload(headers, env.ciphertext);
         expect(res.status).toBe(201);
         expect(await res.json()).toEqual({ transferId: 'tr_ok_1' });
+        expect(verifyLanReceipt(sender.keys.macKey, headers[LAN_HEADERS.mac], res.headers.get(LAN_HEADERS.receipt))).toBe(true);
         expect(readFileSync(join(landing, 'tr_ok_1', 'note.txt')).equals(plain)).toBe(true);
         expect(logs.some((l) => /received "note.txt" \(18B\) from dev_mcp_sender as tr_ok_1/.test(l))).toBe(true);
     });

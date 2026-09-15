@@ -321,6 +321,15 @@ describe('initDeviceCrypto', () => {
         expect(second).toBe(first);
     });
 
+    it('two initialisers racing to create the keypair converge on the one linked into place', async () => {
+        const listener = await import('./crypto.js');
+        vi.resetModules();
+        const mcp = await import('./crypto.js');   // a second module instance stands in for the MCP server
+        const [a, b] = await Promise.all([listener.initDeviceCrypto(), mcp.initDeviceCrypto()]);
+        expect(a).toBe(b);
+        expect(JSON.parse(readFileSync(join(TMP, '.zeph', 'device-keys.json'), 'utf-8')).publicKey).toBe(a);
+    });
+
     it('deduplicates concurrent calls', async () => {
         const { initDeviceCrypto } = await import('./crypto.js');
         const [a, b] = await Promise.all([initDeviceCrypto(), initDeviceCrypto()]);

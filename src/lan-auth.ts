@@ -2,8 +2,8 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, ran
 
 /**
  * Local transfer (ADR-0013) — sender authentication, shared by every
- * implementation of the contract: this file, its byte-exact twin in
- * `mcp-server/src/lan-auth.ts`, and the Kotlin / Swift uploaders. They
+ * implementation of the contract: `src/lan-auth.ts` in `@zeph-to/cli` and,
+ * byte-exact, in `@zeph-to/mcp-server`, and the Kotlin / Swift uploaders. They
  * stay in step by `lan-auth.vectors.json`, not by reading each other.
  *
  * The device keys are ECDH-only (WebCrypto `deriveKey`), so there is no
@@ -14,6 +14,7 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, ran
  *   metaKey = HKDF-SHA256(same ikm,                               salt = "", info = "zeph-lan-v1-meta", 32)
  *   mac     = HMAC-SHA256(macKey, method | path | senderDeviceId | transferId | timestamp | nonce | sha256(body))
  *   meta    = base64( iv[12] || AES-256-GCM(metaKey, iv, json) )      — upload only
+ *   receipt = HMAC-SHA256(macKey, "zeph-lan-receipt|" + mac)            — on the 200 / 201
  *
  * The receiver derives the same keys from its own private key and the
  * sender's registered public key (the device list it already fetches), so
@@ -24,6 +25,12 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, ran
  * sender) run before a byte of it is read. The metadata is sealed because
  * the transport is plain HTTP on a LAN: a sniffer sees a sender device id
  * and a transfer id, never a file name or the account's device list.
+ *
+ * The receipt runs the other way. Without it any host that answers on the
+ * published address — an ARP spoof is enough — could return 201, and the
+ * sender would skip the relay for a file that never landed. Only the device
+ * holding the receiver's private key derives `macKey`, so a receipt over the
+ * request's own MAC proves this answer, for this request, came from it.
  */
 
 export const LAN_AUTH_INFO = 'zeph-lan-v1';
@@ -52,6 +59,8 @@ export const LAN_HEADERS = {
     mac: 'x-zeph-lan-mac',
     /** Sealed `{ fileName, fileType, fileSize, iv, deviceKeyMap, transferId }` — upload only. */
     meta: 'x-zeph-lan-meta',
+    /** On the receiver's 200 / 201: `signLanReceipt(macKey, request mac)`. */
+    receipt: 'x-zeph-lan-receipt',
 } as const;
 
 export interface LanAuthFields {
@@ -112,6 +121,18 @@ export const verifyLanMac = (macKey: Buffer, f: LanAuthFields, mac: string): boo
 };
 
 export const newNonce = (): string => randomBytes(16).toString('hex');
+
+const LAN_RECEIPT_PREFIX = 'zeph-lan-receipt|';
+
+/** The receiver's proof that it, and not whatever answered on the address, accepted `requestMac`. */
+export const signLanReceipt = (macKey: Buffer, requestMac: string): string =>
+    createHmac('sha256', macKey).update(LAN_RECEIPT_PREFIX + requestMac).digest('hex');
+
+/** Constant-time; a missing or malformed receipt is simply wrong. */
+export const verifyLanReceipt = (macKey: Buffer, requestMac: string, receipt: string | null | undefined): boolean => {
+    if (typeof receipt !== 'string' || !HEX_64.test(receipt)) return false;
+    return timingSafeEqual(Buffer.from(signLanReceipt(macKey, requestMac), 'hex'), Buffer.from(receipt, 'hex'));
+};
 
 // ─── Sealed metadata ───
 

@@ -3,7 +3,8 @@
   "hkdf": "HKDF-SHA256, salt empty, 32 bytes; info zeph-lan-v1 (mac) / zeph-lan-v1-meta (meta)",
   "mac": "HMAC-SHA256 over method|path|senderDeviceId|transferId|timestamp|nonce|sha256(body), hex",
   "meta": "base64(iv[12] || AES-256-GCM(metaKey, iv, compact JSON) || tag[16])",
-  "generatedBy": "python hashlib/hmac + cryptography AESGCM (independent of every consumer)",
+  "receipt": "HMAC-SHA256(macKey, \"zeph-lan-receipt|\" + mac hex), hex — the receiver's answer header on 200/201",
+  "generatedBy": "python hashlib/hmac + cryptography AESGCM (independent of every consumer); receiptHex added with python hmac",
   "cases": [
     {
       "name": "zero secret, ping, empty body",
@@ -21,7 +22,8 @@
         "nonce": "00000000000000000000000000000000"
       },
       "canonical": "GET|/zeph/lan/v1/ping|dev_listener_0123abcd|ping|1800000000000|00000000000000000000000000000000|e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "macHex": "91057fc758a420e5cc942f2146246620d8f5dca9629ef87f9f59aae15104379c"
+      "macHex": "91057fc758a420e5cc942f2146246620d8f5dca9629ef87f9f59aae15104379c",
+      "receiptHex": "ddaee9d8511c07030a151dfb72bc4038b7bfbddcd080874e82673f05c10f07bc"
     },
     {
       "name": "sequential secret, upload, small body, sealed meta",
@@ -42,7 +44,8 @@
       "macHex": "a34ce81ab1be665543f9e12c2cfef725602ce1908b73fdbaa8fa4b03eb31ceba",
       "metaJson": "{\"fileName\":\"shot.png\",\"fileType\":\"image/png\",\"fileSize\":20,\"iv\":\"AAAAAAAAAAAAAAAA\",\"deviceKeyMap\":{\"dev_listener_0123abcd\":\"{\\\"encryptedKey\\\":\\\"AA==\\\",\\\"keyIv\\\":\\\"AA==\\\"}\"},\"transferId\":\"tr_01J9ZK3Q5W8X\"}",
       "metaIvHex": "000102030405060708090a0b",
-      "metaSealedBase64": "AAECAwQFBgcICQoLol0iwLvlvA2tMoBBMyK60975U5I4SW1FZuM1aLTqID6fU4FTa0OyrIst9fDU9BzMBteAW6r1rE51jvOfQMUJ8WgzgGa0MvOUxnZwvUTACYyfNJugYhPxeM0nfsL+awT8WlDl0pcgB7rYmgKC1Po4E2LvIBzI/wLmRCEJj/SdN55sZxScK549CAauZfZSC8OGRcx8BG5CiG8Z07F3IuyDtjXapQzyDxHm8oFBAygRwXCxtjAMlLcGc4VJNe4FJVnwagXYqaR75EyqMCMB7ugc/F+0bGGZZN/+WJT/X10="
+      "metaSealedBase64": "AAECAwQFBgcICQoLol0iwLvlvA2tMoBBMyK60975U5I4SW1FZuM1aLTqID6fU4FTa0OyrIst9fDU9BzMBteAW6r1rE51jvOfQMUJ8WgzgGa0MvOUxnZwvUTACYyfNJugYhPxeM0nfsL+awT8WlDl0pcgB7rYmgKC1Po4E2LvIBzI/wLmRCEJj/SdN55sZxScK549CAauZfZSC8OGRcx8BG5CiG8Z07F3IuyDtjXapQzyDxHm8oFBAygRwXCxtjAMlLcGc4VJNe4FJVnwagXYqaR75EyqMCMB7ugc/F+0bGGZZN/+WJT/X10=",
+      "receiptHex": "a576c146f14e51a6a101c18ff10d99c47174a8b7153665f07bbbdb0119989760"
     },
     {
       "name": "all-ff secret, upload, binary body",
@@ -60,7 +63,8 @@
         "nonce": "ffffffffffffffffffffffffffffffff"
       },
       "canonical": "POST|/zeph/lan/v1/upload|dev_android_abc.def:1|a-b_c|1|ffffffffffffffffffffffffffffffff|40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
-      "macHex": "9fccca16af7a1657ba1817da2ca32d38d9b40b375ce2101b8c33f97721970135"
+      "macHex": "9fccca16af7a1657ba1817da2ca32d38d9b40b375ce2101b8c33f97721970135",
+      "receiptHex": "9e261a5cfe10471d95a7f0ac7be64943aee3678c9cbbdfb9dd8e75795b6d3193"
     }
   ]
 }

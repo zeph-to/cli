@@ -17,9 +17,11 @@ import {
     parseLanAuthHeaders,
     sealMeta,
     sha256Hex,
+    signLanReceipt,
     signLanRequest,
     toLanAuthHeaders,
     verifyLanMac,
+    verifyLanReceipt,
     type LanAuthFields,
 } from './lan-auth.js';
 import { deriveLanSharedSecret, getDevicePublicKey, initDeviceCrypto } from './crypto.js';
@@ -42,6 +44,7 @@ interface VectorCase {
     fields: Omit<LanAuthFields, 'bodySha256' | 'method' | 'path'>;
     canonical: string;
     macHex: string;
+    receiptHex: string;
     metaJson?: string;
     metaIvHex?: string;
     metaSealedBase64?: string;
@@ -70,11 +73,26 @@ describe('lan-auth vectors', () => {
         expect(canonicalString(f)).toBe(c.canonical);
         expect(signLanRequest(k.macKey, f)).toBe(c.macHex);
         expect(verifyLanMac(k.macKey, f, c.macHex)).toBe(true);
+        expect(signLanReceipt(k.macKey, c.macHex)).toBe(c.receiptHex);
+        expect(verifyLanReceipt(k.macKey, c.macHex, c.receiptHex)).toBe(true);
         if (c.metaSealedBase64 !== undefined) {
             // Decrypt what Python sealed, and seal the same JSON with the same iv back to the same bytes.
             expect(openMeta(k.metaKey, c.metaSealedBase64)).toEqual(JSON.parse(c.metaJson ?? ''));
             expect(sealMeta(k.metaKey, JSON.parse(c.metaJson ?? '') as object, Buffer.from(c.metaIvHex ?? '', 'hex'))).toBe(c.metaSealedBase64);
         }
+    });
+});
+
+describe('receipt', () => {
+    it('binds the request MAC and the key; anything missing or malformed is false', () => {
+        const mac = signLanRequest(keys.macKey, fields);
+        const receipt = signLanReceipt(keys.macKey, mac);
+        expect(verifyLanReceipt(keys.macKey, mac, receipt)).toBe(true);
+        expect(verifyLanReceipt(keys.macKey, signLanRequest(keys.macKey, { ...fields, nonce: newNonce() }), receipt)).toBe(false);
+        expect(verifyLanReceipt(deriveLanKeys(Buffer.alloc(32, 8)).macKey, mac, receipt)).toBe(false);
+        for (const bad of [undefined, null, '', receipt.toUpperCase(), receipt.slice(1)]) expect(verifyLanReceipt(keys.macKey, mac, bad)).toBe(false);
+        // A receipt is not a request MAC: echoing the request's own MAC back does not pass.
+        expect(verifyLanReceipt(keys.macKey, mac, mac)).toBe(false);
     });
 });
 
@@ -147,7 +165,7 @@ describe('headers', () => {
     it('rejects a missing, duplicated or malformed header — null, before any crypto', () => {
         const good = toLanAuthHeaders(headerFields, 'ab'.repeat(32));
         for (const name of Object.values(LAN_HEADERS)) {
-            if (name === LAN_HEADERS.meta) continue;
+            if (name === LAN_HEADERS.meta || name === LAN_HEADERS.receipt) continue;   // not request-auth headers
             const { [name]: _dropped, ...rest } = good;
             expect(parseLanAuthHeaders(rest)).toBeNull();
             expect(parseLanAuthHeaders({ ...good, [name]: [good[name], good[name]] })).toBeNull();

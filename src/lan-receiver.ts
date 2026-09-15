@@ -16,6 +16,7 @@ import {
     isTimestampFresh,
     openMeta,
     parseLanAuthHeaders,
+    signLanReceipt,
     verifyLanMac,
     type LanAuthHeaderFields,
     type LanKeys,
@@ -235,6 +236,7 @@ export const startLanReceiver = (opts: LanReceiverOptions): Promise<LanReceiver>
                 && verifyLanMac(keys.macKey, { ...fields, method: 'GET', path: LAN_PATHS.ping, bodySha256: EMPTY_BODY_SHA256 }, fields.mac)
                 && commitNonce(fields.senderDeviceId, fields.nonce);
             if (!ok) { refuse(req, res, 401); return; }
+            res.setHeader(LAN_HEADERS.receipt, signLanReceipt(keys.macKey, fields.mac));
             end(res, 200, { deviceId: opts.deviceId() });
         };
 
@@ -314,6 +316,7 @@ export const startLanReceiver = (opts: LanReceiverOptions): Promise<LanReceiver>
                         return;
                     }
                     opts.log(`local transfer: received "${meta.fileName}" (${saved.bytes}B) from ${fields.senderDeviceId} as ${meta.transferId}`);
+                    res.setHeader(LAN_HEADERS.receipt, signLanReceipt(keys.macKey, fields.mac));
                     end(res, 201, { transferId: meta.transferId });
                 } catch (err) {
                     rmSync(transferDir, { recursive: true, force: true });
