@@ -1,13 +1,17 @@
 import { networkInterfaces, type NetworkInterfaceInfo } from 'node:os';
-import { apiFetch, apiUrl } from './api.js';
+import { LISTENER_PRESENCE } from './device-presence.js';
 
 /**
  * Local transfer (ADR-0013) — the listener's side of the rendezvous.
  *
  * There is no mDNS. The listener writes `lan: { host, port }` on its own
- * device record through `PUT /v1/devices/{id}`; a sender on the same network
- * reads it from `GET /devices` and tries a direct upload before the S3
- * relay. Liveness is the device's `isOnline` (the WebSocket), so this module
+ * device record by sending `listener.presence` over the WebSocket it already
+ * holds; a sender on the same network reads it back from `GET /devices` and
+ * tries a direct upload before the S3 relay. The socket is the transport
+ * because it is what proves which device is speaking — the HTTP device-record
+ * route is JWT-only and the daemon holds an API key.
+ *
+ * Liveness is the device's `isOnline` (that same socket), so this module
  * republishes on every reconnect and otherwise only when the address moves.
  *
  * The server refuses anything but a private IPv4, so `pickLanIpv4` applies
@@ -35,110 +39,75 @@ export const pickLanIpv4 = (
 };
 
 export interface LanPublisherDeps {
-    deviceId: string;
-    apiKey: string;
-    baseUrl: string;
     log: (msg: string) => void;
-    fetchFn?: typeof fetch;
+    /** Send one frame on the live socket; false when there is none. The
+     *  server's answer (`listener.presence.ack` / `.error`) arrives on the
+     *  socket's message handler, not here. */
+    send: (msg: object) => boolean;
     pickHost?: () => string | null;
-    /** How long one PUT may take. The daemon's reconnect loop must not wait behind it. */
-    timeoutMs?: number;
 }
 
 export interface LanPublisher {
     /**
      * Publish `{host, port}` if it differs from what was last published (or
      * always, with `force` — used on every WebSocket open, because the device
-     * record may have been recreated). Resolves true when a PUT was sent and
-     * accepted. Never throws: a rejected publish is logged and the relay path
-     * is unaffected.
+     * record may have been recreated). True when a frame went out. Never
+     * throws: a socket that is not there leaves the relay path unaffected.
      */
-    publish: (port: number, opts?: { force?: boolean }) => Promise<boolean>;
+    publish: (port: number, opts?: { force?: boolean }) => boolean;
     /** `lan: null` on the device record — shutdown, or the LAN went away.
-     *  `timeoutMs` bounds each of the two attempts; shutdown passes a short
-     *  one because `stopListener` SIGKILLs the daemon 3 s after SIGTERM. */
-    clear: (opts?: { timeoutMs?: number }) => Promise<void>;
+     *  Best-effort: every reader gates on `isOnline`, so an endpoint left
+     *  behind by a socket that dropped is already inert. */
+    clear: () => void;
     /** Poll the address and republish on change. One watcher at a time. */
     startWatch: (port: number, intervalMs?: number) => void;
     stopWatch: () => void;
 }
 
 const DEFAULT_WATCH_INTERVAL_MS = 60_000;
-const DEFAULT_TIMEOUT_MS = 5_000;
 
 export const createLanPublisher = (deps: LanPublisherDeps): LanPublisher => {
-    const fetchFn = deps.fetchFn ?? fetch;
     const pickHost = deps.pickHost ?? (() => pickLanIpv4());
-    const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const url = apiUrl(deps.baseUrl, `/devices/${encodeURIComponent(deps.deviceId)}`);
 
     let published: { host: string; port: number } | null = null;
     let watchTimer: NodeJS.Timeout | null = null;
-    // One PUT at a time: a watch tick landing on top of the forced publish
-    // from a socket open must not interleave two writes of `published`.
-    let inFlight: Promise<boolean> = Promise.resolve(false);
 
-    const put = async (lan: { host: string; port: number } | null, budgetMs = timeoutMs): Promise<boolean> => {
-        try {
-            const res = await apiFetch(fetchFn, url, deps.apiKey, budgetMs, {
-                method: 'PUT',
-                body: JSON.stringify({ lan }),
-            });
-            if (!res.ok) {
-                deps.log(`local transfer: publish rejected (${res.status}) — relay only until it succeeds`);
-                return false;
-            }
-            return true;
-        } catch (err) {
-            deps.log(`local transfer: publish failed — ${err instanceof Error ? err.message : String(err)}`);
-            return false;
-        }
+    /** One frame. Synchronous, so a watch tick cannot interleave with the
+     *  forced publish from a socket open the way two in-flight writes could. */
+    const announce = (lan: { host: string; port: number } | null): boolean => {
+        const sent = deps.send({ type: LISTENER_PRESENCE, data: { lan } });
+        if (!sent) deps.log('local transfer: endpoint not published — no connection right now, relay until the next open');
+        return sent;
     };
 
-    const publishNow = async (port: number, opts?: { force?: boolean }): Promise<boolean> => {
+    const publish: LanPublisher['publish'] = (port, opts) => {
         try {
             const host = pickHost();
             if (host === null) {
                 // The LAN went away (or never existed). Retract a stale endpoint
                 // so no sender is pointed at an address we no longer hold.
-                if (published !== null && (await put(null))) published = null;
+                if (published !== null && announce(null)) published = null;
                 return false;
             }
             const unchanged = published !== null && published.host === host && published.port === port;
             if (unchanged && !opts?.force) return false;
-            const ok = await put({ host, port });
-            if (ok) published = { host, port };
-            return ok;
+            const sent = announce({ host, port });
+            if (sent) published = { host, port };
+            return sent;
         } catch (err) {
-            // `publish` is called with `void` from timers and socket events;
-            // a throw here (a host picker that fails) would be an unhandled
-            // rejection and take the daemon down.
+            // Called from timers and socket events; a throw here (a host
+            // picker that fails) must not take the daemon down.
             deps.log(`local transfer: publish skipped — ${err instanceof Error ? err.message : String(err)}`);
             return false;
         }
     };
 
-    const publish: LanPublisher['publish'] = (port, opts) => {
-        inFlight = inFlight.then(() => publishNow(port, opts), () => publishNow(port, opts));
-        return inFlight;
-    };
-
-    // The last write before the port closes gets one retry; `published` is
-    // only forgotten once the server confirmed, so a failed retract is
-    // retried by the next tick rather than mistaken for done.
-    const clearNow = async (budgetMs?: number): Promise<boolean> => {
-        if (published === null) return true;
-        const ok = (await put(null, budgetMs)) || (await put(null, budgetMs));
-        if (ok) published = null;
-        return ok;
-    };
-
-    // Same chain as publish: a retract must land after any `{host, port}`
-    // PUT already in flight, or the record ends up pointing at a dead port.
-    const clear: LanPublisher['clear'] = async (opts) => {
-        const run = () => clearNow(opts?.timeoutMs);
-        inFlight = inFlight.then(run, run);
-        await inFlight;
+    const clear: LanPublisher['clear'] = () => {
+        if (published === null) return;
+        // Forgotten either way: the socket is closing, and what keeps a
+        // sender away from this port after that is `isOnline`, not this field.
+        announce(null);
+        published = null;
     };
 
     const stopWatch = (): void => {
@@ -148,7 +117,7 @@ export const createLanPublisher = (deps: LanPublisherDeps): LanPublisher => {
 
     const startWatch: LanPublisher['startWatch'] = (port, intervalMs = DEFAULT_WATCH_INTERVAL_MS) => {
         stopWatch();
-        watchTimer = setInterval(() => void publish(port), intervalMs);
+        watchTimer = setInterval(() => publish(port), intervalMs);
         watchTimer.unref();
     };
 

@@ -28,10 +28,10 @@ export interface LanTransferDeps {
 export interface LanTransfer {
     /** Call on every WebSocket `open`. No-op until the receiver is bound. */
     onOpen: () => void;
-    /** Retract the endpoint and release the port. Idempotent. Resolves once the
-     *  retract PUT settles; `retractTimeoutMs` bounds each attempt so the
-     *  whole retract fits the caller's shutdown budget. */
-    stop: (opts?: { retractTimeoutMs?: number }) => Promise<void>;
+    /** Retract the endpoint and release the port. Idempotent. Resolves once
+     *  the receiver's socket is closed; the retract itself is one frame on a
+     *  socket that is already closing, so it is sent and not waited on. */
+    stop: () => Promise<void>;
 }
 
 interface Live {
@@ -62,32 +62,30 @@ export const createLanTransfer = (deps: LanTransferDeps): LanTransfer => {
             const publisher = deps.createPublisher(receiver.port);
             live = { publisher, receiver };
             publisher.startWatch(receiver.port);
-            if (deps.isOpen()) void publisher.publish(receiver.port, { force: true });
+            if (deps.isOpen()) publisher.publish(receiver.port, { force: true });
         })
         .catch((err: unknown) => {
             deps.log(`local transfer: off — ${err instanceof Error ? err.message : String(err)}`);
         });
 
     const onOpen = (): void => {
-        if (live) void live.publisher.publish(live.receiver.port, { force: true });
+        if (live) live.publisher.publish(live.receiver.port, { force: true });
     };
 
-    const teardown = async (retractTimeoutMs?: number): Promise<void> => {
+    const teardown = async (): Promise<void> => {
         if (!live) return;
         const current = live;
         live = null;
         current.publisher.stopWatch();
-        await Promise.all([
-            current.publisher.clear(retractTimeoutMs === undefined ? undefined : { timeoutMs: retractTimeoutMs }),
-            current.receiver.stop(),
-        ]);
+        current.publisher.clear();
+        await current.receiver.stop();
     };
 
     let stopped: Promise<void> | null = null;
-    const stop: LanTransfer['stop'] = (opts) => {
+    const stop: LanTransfer['stop'] = () => {
         if (stopped) return stopped;
         stopping = true;
-        stopped = ready.then(() => teardown(opts?.retractTimeoutMs));
+        stopped = ready.then(() => teardown());
         return stopped;
     };
 

@@ -22,8 +22,8 @@ const harness = () => {
     const bind = deferred<LanReceiver>();
     const receiver: LanReceiver = { port: 54321, stop: vi.fn(async () => undefined) };
     const publisher: LanPublisher = {
-        publish: vi.fn(async () => true),
-        clear: vi.fn(async () => undefined),
+        publish: vi.fn(() => true),
+        clear: vi.fn(),
         startWatch: vi.fn(),
         stopWatch: vi.fn(),
     };
@@ -70,11 +70,13 @@ describe('createLanTransfer', () => {
         expect(h.publisher.publish).not.toHaveBeenCalled();
     });
 
-    it('stop({retractTimeoutMs}) hands the shutdown budget to the retract', async () => {
+    it('stop() retracts the endpoint and releases the port', async () => {
         const h = harness();
         h.init.resolve(); h.bind.resolve(h.receiver); await h.settle();
-        await h.transfer.stop({ retractTimeoutMs: 1_000 });
-        expect(h.publisher.clear).toHaveBeenCalledWith({ timeoutMs: 1_000 });
+        await h.transfer.stop();
+        expect(h.publisher.stopWatch).toHaveBeenCalled();
+        expect(h.publisher.clear).toHaveBeenCalled();
+        expect(h.receiver.stop).toHaveBeenCalled();
     });
 
     it('SIGTERM before the receiver is up: closes it on arrival, never publishes or watches', async () => {

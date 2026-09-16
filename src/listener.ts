@@ -84,17 +84,17 @@ import type { ReadableStream } from 'node:stream/web';
 import { createLanPublisher } from './lan-endpoint.js';
 import { startLanReceiver } from './lan-receiver.js';
 import { createLanTransfer, type LanTransfer } from './lan-transfer.js';
-import { createDeviceKeyRegistration, type DeviceKeyRegistration } from './device-key-registration.js';
+import { createDeviceKeyRegistration, type DeviceKeyRegistration } from './device-presence.js';
 import { PAYLOAD_LIMIT_BYTES, scanAgentCommands, type AgentCommandCatalog, type ScanResult } from './command-scan.js';
 
 const PING_INTERVAL_MS = 25_000;
-// Shutdown budget for the local-transfer retract PUT. `stopListener`
+// Shutdown cap for releasing the local-transfer port. The retract itself is
+// one frame on the socket that is already closing, not a round trip; what
+// this waits for is the receiver's own close. `stopListener`
 // (listener-process.ts) SIGKILLs the daemon 3 s after SIGTERM on --stop /
-// --restart / service install, so the wait cap (2.5 s) sits above both
-// retract attempts (2 × 1 s) and under that 3 s. A retract the cap or the
-// kill still cuts off is harmless: senders also require `isOnline`, which
-// the dead WebSocket no longer satisfies.
-const LAN_RETRACT_TIMEOUT_MS = 1_000;
+// --restart / service install, so the cap stays under that. A retract the
+// kill cuts off is harmless: senders also require `isOnline`, which the dead
+// WebSocket no longer satisfies.
 const LAN_RETRACT_WAIT_MS = 2_500;
 const PONG_TIMEOUT_MS = 10_000;
 const RECONNECT_BASE_MS = 1_000;
@@ -4362,6 +4362,10 @@ interface StreamHandle {
     terminate: () => void;
     /** True once the socket reached `open` — the device record exists from then on. */
     opened: () => boolean;
+    /** Send one frame; false when the socket is not open. Local transfer
+     *  publishes its endpoint and this machine's public key this way
+     *  (`listener.presence`) — the HTTP device route is JWT-only. */
+    send: (msg: object) => boolean;
 }
 
 /**
@@ -4714,6 +4718,11 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
         done,
         terminate: () => { ws?.terminate(); },
         opened: () => opened,
+        send: (msg) => {
+            if (ws?.readyState !== WebSocket.OPEN) return false;
+            ws.send(JSON.stringify(msg));
+            return true;
+        },
     };
 };
 
@@ -4974,7 +4983,11 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     // every route the receiver grows authenticates with it — publish on WS
     // open, retract on stop. Off with one log line if keys or bind fail.
     const deviceDirectory = createDeviceDirectory({ apiKey, baseUrl, log });
-    deviceKeyRegistration = createDeviceKeyRegistration({ deviceId: computeListenerDeviceId(), apiKey, baseUrl, log, publicKey: initDeviceCrypto });
+    // Both halves of `listener.presence` ride whatever socket is live right
+    // now; between connections there is nothing to send on, and the next
+    // open republishes.
+    const sendPresence = (msg: object): boolean => activeHandle?.send(msg) ?? false;
+    deviceKeyRegistration = createDeviceKeyRegistration({ log, send: sendPresence, publicKey: initDeviceCrypto });
     lanTransfer = createLanTransfer({
         log,
         initCrypto: async () => { await initDeviceCrypto(); },
@@ -4987,7 +5000,7 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
             unwrapFileKey: unwrapDeviceKey,
             landingDir: () => LAN_LANDING_DIR,
         }),
-        createPublisher: () => createLanPublisher({ deviceId: computeListenerDeviceId(), apiKey, baseUrl, log }),
+        createPublisher: () => createLanPublisher({ log, send: sendPresence }),
         isOpen: () => activeHandle?.opened() ?? false,
     });
 
@@ -5002,7 +5015,7 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
         // Retract the endpoint so no sender is pointed at a port about to
         // close; the loop tail waits (briefly) for this PUT before exiting.
         if (lanTransfer) {
-            lanClearing = lanTransfer.stop({ retractTimeoutMs: LAN_RETRACT_TIMEOUT_MS });
+            lanClearing = lanTransfer.stop();
             lanTransfer = null;
         }
         deviceKeyRegistration = null;
@@ -5039,11 +5052,8 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     }
 
     // `main` calls process.exit right after this returns. The cap keeps
-    // Ctrl-C from hanging on a slow server and keeps the exit ahead of
-    // stopListener's SIGKILL (see LAN_RETRACT_WAIT_MS). A publish PUT still
-    // in flight (5 s budget) runs ahead of the retract on the same chain and
-    // can eat the whole cap — the retract is then lost, and `isOnline`
-    // covers it.
+    // Ctrl-C from hanging on a receiver that will not close and keeps the
+    // exit ahead of stopListener's SIGKILL (see LAN_RETRACT_WAIT_MS).
     if (lanClearing) {
         log('retracting local transfer endpoint…');
         await Promise.race([lanClearing, sleep(LAN_RETRACT_WAIT_MS)]);

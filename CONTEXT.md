@@ -24,7 +24,7 @@ plugin은 hook이라 flag 없음). 우선순위 변경 시 이 절부터 갱신�
 The ECDH P-256 key material owned by a Machine Device. The **private** key never
 leaves the host. The **public** key is registered with the server so other devices
 can encrypt to this one — by the listener, on every WebSocket open
-(`device-key-registration.ts`). Distinct from the obsolete per-user keypair (removed).
+(`device-presence.ts`). Distinct from the obsolete per-user keypair (removed).
 
 ### Sender / Recipient
 A **Sender** is the process producing a push (CLI notify, MCP tool). A **Recipient**
@@ -89,7 +89,8 @@ Add a key → update all three.
 
 ### LAN Endpoint (`lan-endpoint.ts`, `lan-receiver.ts`)
 Where this Machine Device can be reached for a **local transfer** (see `zeph/docs/adr/0013-local-transfer.md`):
-`{ host, port }` on its own device record, written through `PUT /v1/devices/{id}` and read by
+`{ host, port }` on its own device record, written by the `listener.presence` message on the
+daemon's own WebSocket (the HTTP device route is JWT-only, this daemon holds an API key) and read by
 senders from `GET /devices`. Discovery is the account server, not mDNS. `host` is the first
 private IPv4 (RFC 1918 · CGNAT · link-local) — the server refuses anything else; `port` is
 OS-assigned by the receiver at boot. Published on every WebSocket **open** (that is when the
