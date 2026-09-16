@@ -23,7 +23,7 @@
 
 import { spawnSync } from 'child_process';
 import { createHash } from 'crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'fs';
+import { constants as fsConstants, copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { homedir, hostname, userInfo } from 'os';
 import { join, basename, isAbsolute, resolve, sep } from 'path';
 import WebSocket from 'ws';
@@ -69,14 +69,33 @@ import {
 import { advanceState, evaluateState, findPatternMatch, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
 import { startInventoryOffload, type InventoryOffload } from './inventory-offload.js';
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
-import { decryptEphemeral, encryptEphemeral, getDevicePublicKey, initDeviceCrypto, type EncryptedEphemeralPayload } from './crypto.js';
+import { decryptEphemeral, decryptPushBodyForDevice, deriveLanSharedSecret, encryptEphemeral, getDevicePublicKey, initDeviceCrypto, unwrapDeviceKey, type EncryptedEphemeralPayload } from './crypto.js';
+import { createDeviceDirectory } from './device-directory.js';
+import { isTransferId } from './lan-auth.js';
+import { downloadsDir, resolveDownloadPath, safeFileName } from './downloads.js';
+import { notifyDesktop, type DesktopNotification } from './desktop-notify.js';
+import { saveStream, withIdleTimeout } from './file-crypto.js';
 import { createTurnWatchers, type TurnWatchControl } from './turn-watch.js';
 import { diskTurnRing } from './turn-ring.js';
 import { createInputSequencer, type InputSequencer, type SequencedInput } from './input-sequencer.js';
 import { startKeepAwake } from './keep-awake.js';
+import { Readable } from 'node:stream';
+import type { ReadableStream } from 'node:stream/web';
+import { createLanPublisher } from './lan-endpoint.js';
+import { startLanReceiver } from './lan-receiver.js';
+import { createLanTransfer, type LanTransfer } from './lan-transfer.js';
+import { createDeviceKeyRegistration, type DeviceKeyRegistration } from './device-presence.js';
 import { PAYLOAD_LIMIT_BYTES, scanAgentCommands, type AgentCommandCatalog, type ScanResult } from './command-scan.js';
 
 const PING_INTERVAL_MS = 25_000;
+// Shutdown cap for releasing the local-transfer port. The retract itself is
+// one frame on the socket that is already closing, not a round trip; what
+// this waits for is the receiver's own close. `stopListener`
+// (listener-process.ts) SIGKILLs the daemon 3 s after SIGTERM on --stop /
+// --restart / service install, so the cap stays under that. A retract the
+// kill cuts off is harmless: senders also require `isOnline`, which the dead
+// WebSocket no longer satisfies.
+const LAN_RETRACT_WAIT_MS = 2_500;
 const PONG_TIMEOUT_MS = 10_000;
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
@@ -3627,18 +3646,28 @@ export const isInventoried = (sessionName: string): boolean => {
 // ─── Push handling ──────────────────────────────────────────────────
 
 /**
- * One file riding on an `agent.command` push. agent.command attachments
- * are uploaded in *plaintext* (the listener has no per-user crypto key),
- * so `iv`/`encryptedKey` should be absent. If either is present the file
- * is encrypted and the listener can't read it — it gets skipped.
+ * One file riding on a push — `libs/shared` `PushFileAttachment`, the
+ * fields this daemon reads.
+ *
+ * `agent.command` attachments are uploaded in *plaintext* (the phone has no
+ * key for this host's scratch space); an encrypted one is skipped there. A
+ * `type: 'file'` push is the opposite: encrypted per device, and this
+ * machine opens its own `deviceKeyMap` slot (ADR-0007). `lanDeliveredTo`
+ * marks bytes that never went to S3 — handed straight to that device over
+ * the LAN (ADR-0013) — so there is no `fileKey` to fetch.
  */
 interface PushFileAttachment {
-    fileKey: string;
+    fileKey?: string;
     fileName: string;
     fileType?: string;
     fileSize?: number;
     iv?: string;
+    /** Legacy account-key wrap — nothing here can open it. */
     encryptedKey?: string;
+    /** deviceId → JSON `{ encryptedKey, keyIv }` (per-device wrap). */
+    deviceKeyMap?: Record<string, string>;
+    lanDeliveredTo?: string;
+    transferId?: string;
 }
 
 interface PushItem {
@@ -3648,6 +3677,12 @@ interface PushItem {
     title?: string;
     createdAt?: string;
     isEncrypted?: boolean;
+    senderDeviceId?: string;
+    targetDeviceId?: string;
+    /** E2E: the sender's per-device public key, needed to open our slot. */
+    senderPublicKey?: string;
+    /** E2E: per-device wrapped message key for the push body. */
+    deviceKeyMap?: Record<string, string>;
     /** Set when type='agent.command' — tmux session name to inject into. */
     agentSessionName?: string;
     /** Named keys (Esc/arrows/Enter) to inject instead of body text —
@@ -3656,7 +3691,8 @@ interface PushItem {
     /** Literal text delivered WITHOUT the submitting Enter (see the same field
      *  on AgentCommandInput for why it is a field and not a flag). */
     insert?: string;
-    /** Optional image/file attachments (agent.command only, plaintext). */
+    /** Attachments: plaintext scratch files on `agent.command`, the delivered
+     *  file(s) on `type: 'file'`. */
     files?: PushFileAttachment[];
 }
 
@@ -3670,6 +3706,19 @@ interface HandlePushDeps {
     now?: () => number;
     /** Injectable for tests; defaults to the REST-backed downloader. */
     downloadAttachments?: (pushId: string, files: PushFileAttachment[]) => Promise<string[]>;
+    /** `type: 'file'` delivery: fetch, decrypt and save one attachment into
+     *  `~/Downloads/Zeph/`; resolves with the path written, or null when the
+     *  file was not wrapped for this device. Defaults to the streaming S3
+     *  downloader. */
+    saveFile?: (push: PushItem, file: PushFileAttachment) => Promise<string | null>;
+    /** Move a finished local transfer out of the landing zone into
+     *  `~/Downloads/Zeph/`; null when it is not there. Defaults to the
+     *  filesystem move under `~/.zeph/attachments/lan`. */
+    claimLanFile?: (file: PushFileAttachment) => Promise<string | null>;
+    /** Desktop banner after a save. Defaults to osascript / notify-send. */
+    notify?: (note: DesktopNotification) => Promise<boolean>;
+    /** This machine's device id — what `targetDeviceId` and `deviceKeyMap` are keyed by. */
+    deviceId?: () => string;
     /** Pane cwd lookup for the remote-origin marker (ADR-0002). */
     paneCwd?: (session: string) => string | null;
     /** Fired after a successful named-key injection so the WS loop can push
@@ -3798,6 +3847,8 @@ const tryInjectKeys = (session: string, tokens: string[], deps: HandlePushDeps):
 // ─── Attachment download (agent.command files[]) ────────────────────
 
 const ATTACHMENTS_DIR = join(homedir(), '.zeph', 'attachments');
+/** Local-transfer landing zone: `lan/<transferId>/<fileName>` until its push record arrives. */
+const LAN_LANDING_DIR = join(ATTACHMENTS_DIR, 'lan');
 const DEFAULT_API_BASE = 'https://api.zeph.to/v1';
 
 // apiKey + baseUrl for the file-download REST calls, set once in
@@ -3809,6 +3860,15 @@ let attachmentCtx: { apiKey: string; baseUrl: string } | null = null;
 export const setAttachmentContext = (ctx: { apiKey: string; baseUrl: string }): void => {
     attachmentCtx = ctx;
 };
+
+// Local transfer (ADR-0013). Set by handleListener; streamSession tells it
+// about every WebSocket open because $connect is what makes the device record
+// exist. null before the daemon starts and after stop — the relay path never
+// depends on it. Lifecycle and ordering live in lan-transfer.ts.
+let lanTransfer: LanTransfer | null = null;
+// This machine's public key on its device record (ADR-0007), re-registered on
+// every open for the same reason. Set by handleListener.
+let deviceKeyRegistration: DeviceKeyRegistration | null = null;
 
 /**
  * Make a filesystem-safe single path segment: take the basename (drops
@@ -3824,21 +3884,30 @@ const safeSegment = (raw: string, fallback: string): string => {
     return (cleaned || fallback).slice(0, 200);
 };
 
+/** Resolve fileKey → presigned download URL. Throws on any HTTP failure. */
+const resolveDownloadUrl = async (
+    fileKey: string,
+    ctx: { apiKey: string; baseUrl: string },
+    fetchFn: typeof fetch = fetch,
+): Promise<string> => {
+    const metaUrl = `${ctx.baseUrl.replace(/\/+$/, '')}/files/${encodeURIComponent(fileKey)}`;
+    const meta = await fetchFn(metaUrl, { headers: { 'X-API-Key': ctx.apiKey } });
+    if (!meta.ok) throw new Error(`metadata ${meta.status}`);
+    // Server wraps responses as { data: { downloadUrl } } (see lib/response ok()).
+    const body = (await meta.json()) as { data?: { downloadUrl?: string }; downloadUrl?: string };
+    const downloadUrl = body.data?.downloadUrl ?? body.downloadUrl;
+    if (!downloadUrl) throw new Error('response had no downloadUrl');
+    return downloadUrl;
+};
+
 /** Resolve fileKey → presigned URL → bytes. Throws on any HTTP failure so
  *  the caller can isolate one file's failure from the rest of the batch. */
 const fetchAttachmentBytes = async (
     fileKey: string,
     ctx: { apiKey: string; baseUrl: string },
 ): Promise<Buffer> => {
-    const metaUrl = `${ctx.baseUrl.replace(/\/+$/, '')}/files/${encodeURIComponent(fileKey)}`;
-    const meta = await fetch(metaUrl, { headers: { 'X-API-Key': ctx.apiKey } });
-    if (!meta.ok) throw new Error(`metadata ${meta.status}`);
-    // Server wraps responses as { data: { downloadUrl } } (see lib/response ok()).
-    const body = (await meta.json()) as { data?: { downloadUrl?: string }; downloadUrl?: string };
-    const downloadUrl = body.data?.downloadUrl ?? body.downloadUrl;
-    if (!downloadUrl) throw new Error('response had no downloadUrl');
     // The presigned URL is self-authenticating — no API key header.
-    const bin = await fetch(downloadUrl);
+    const bin = await fetch(await resolveDownloadUrl(fileKey, ctx));
     if (!bin.ok) throw new Error(`download ${bin.status}`);
     return Buffer.from(await bin.arrayBuffer());
 };
@@ -3863,6 +3932,10 @@ const downloadAttachments = async (
             log(`! attachment "${f.fileName}": encrypted (iv/encryptedKey present) — listener can't decrypt, skipping`);
             continue;
         }
+        if (!f.fileKey) {
+            log(`! attachment "${f.fileName}": no fileKey — nothing to fetch, skipping`);
+            continue;
+        }
         try {
             const bytes = await fetchAttachmentBytes(f.fileKey, ctx);
             mkdirSync(dir, { recursive: true });
@@ -3883,6 +3956,188 @@ const defaultDownloadAttachments = (pushId: string, files: PushFileAttachment[])
         return Promise.resolve([]);
     }
     return downloadAttachments(pushId, files, attachmentCtx);
+};
+
+// ─── File pushes (type: 'file') → ~/Downloads/Zeph/ ─────────────────
+//
+// The receive half ADR-0007 left unbuilt: until now every `type: 'file'`
+// push was dropped here, so a Mac could send files but never take one.
+// Bytes stream from S3 straight through the GCM decrypt to disk (no
+// buffering — the Pro cap is 1 GiB), land flat in ~/Downloads/Zeph/ under
+// the sender's name (` (2)` on collision, never overwritten, never GC'd),
+// and a desktop banner says so. Local-transfer deliveries (`lanDeliveredTo`)
+// take the same exit once the receiver lands.
+
+/** A download that sends no bytes for this long is dead, not slow. */
+const DOWNLOAD_IDLE_MS = 60_000;
+
+export interface SaveFileDeps {
+    ctx: { apiKey: string; baseUrl: string } | null;
+    fetchFn: typeof fetch;
+    deviceId: () => string;
+    downloadsDir: () => string;
+    idleTimeoutMs?: number;
+}
+
+/**
+ * Fetch one attachment and save it under `~/Downloads/Zeph/`, decrypting
+ * with this device's `deviceKeyMap` slot when the file is encrypted.
+ * Resolves with the path written; null when the file is encrypted for
+ * other devices only (a broadcast this machine is not a recipient of —
+ * not a failure); throws when the bytes cannot be fetched or opened.
+ * Exported with its deps so the real path is testable without S3.
+ */
+export const saveFileFromS3 = async (
+    push: PushItem,
+    file: PushFileAttachment,
+    deps: SaveFileDeps,
+): Promise<string | null> => {
+    if (!deps.ctx) throw new Error('attachment context not initialised');
+    if (!file.fileKey) throw new Error('no fileKey');
+    let decrypt: { rawKey: Buffer; iv: Buffer } | undefined;
+    if (file.deviceKeyMap) {
+        // Per-device wrap (ADR-0007). Precedence over the legacy field, as
+        // libs/shared documents: a migrated sender may still write both.
+        const slot = file.deviceKeyMap[deps.deviceId()];
+        if (!slot) return null;
+        if (!push.senderPublicKey) throw new Error('encrypted push carries no senderPublicKey');
+        if (!file.iv) throw new Error('encrypted file carries no iv');
+        decrypt = { rawKey: await unwrapDeviceKey(slot, push.senderPublicKey), iv: Buffer.from(file.iv, 'base64') };
+    } else if (file.encryptedKey) {
+        throw new Error('legacy account-key encryption — this device cannot open it');
+    } else if (file.iv) {
+        throw new Error('encrypted, but no key material on the attachment');
+    }
+    const controller = new AbortController();
+    // The presigned URL is self-authenticating: no API key goes to S3.
+    const res = await deps.fetchFn(await resolveDownloadUrl(file.fileKey, deps.ctx, deps.fetchFn), { signal: controller.signal });
+    if (!res.ok) throw new Error(`download ${res.status}`);
+    if (!res.body) throw new Error('download had no body');
+    // fetch's body is typed by undici without the async-iterator members
+    // node:stream/web declares; at runtime it is that same ReadableStream.
+    const source = withIdleTimeout(Readable.fromWeb(res.body as ReadableStream), deps.idleTimeoutMs ?? DOWNLOAD_IDLE_MS, controller);
+    const dir = deps.downloadsDir();
+    const saved = await saveStream(source, () => resolveDownloadPath(file.fileName, dir), decrypt);
+    return saved.path;
+};
+
+const defaultSaveFile = (push: PushItem, file: PushFileAttachment): Promise<string | null> =>
+    saveFileFromS3(push, file, { ctx: attachmentCtx, fetchFn: fetch, deviceId: computeListenerDeviceId, downloadsDir });
+
+/**
+ * Move a local-transfer file the receiver already decrypted into the
+ * Downloads folder, now that its push record has arrived. `link` + unlink
+ * keeps the never-overwrite rule (`resolveDownloadPath` picks a free name,
+ * link refuses a taken one); a Downloads folder on another volume gets a
+ * copy instead. Null when the transfer is not in the landing zone — already
+ * claimed by a duplicated push.new, or swept as an orphan.
+ */
+export const claimLanFile = (
+    file: { fileName: string; transferId: string },
+    landingDir: string = LAN_LANDING_DIR,
+    downloads: string = downloadsDir(),
+): string | null => {
+    if (!isTransferId(file.transferId)) throw new Error(`malformed transferId ${JSON.stringify(file.transferId)}`);
+    const transferDir = join(landingDir, file.transferId);
+    const src = join(transferDir, safeFileName(file.fileName));
+    if (!existsSync(src)) return null;
+    mkdirSync(downloads, { recursive: true });
+    const dest = resolveDownloadPath(file.fileName, downloads);
+    try {
+        linkSync(src, dest);
+    } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err;
+        copyFileSync(src, dest, fsConstants.COPYFILE_EXCL);
+    }
+    unlinkSync(src);
+    rmSync(transferDir, { recursive: true, force: true });
+    return dest;
+};
+
+const defaultClaimLanFile = async (file: PushFileAttachment): Promise<string | null> =>
+    claimLanFile({ fileName: file.fileName, transferId: file.transferId ?? '' });
+
+/**
+ * What the banner says under the file name: the sender's push title
+ * (`[project] name.ext` from the MCP, or whatever the phone typed) — it is
+ * inside the encrypted body, so open it with our slot when we can; otherwise
+ * the plaintext title, then the sender device id. Never throws — the banner
+ * is not worth a lost file.
+ */
+const describeSender = async (push: PushItem, me: string): Promise<string> => {
+    let title = push.title;
+    const slot = push.deviceKeyMap?.[me];
+    if (push.isEncrypted && push.body && slot && push.senderPublicKey) {
+        try {
+            title = (await decryptPushBodyForDevice(push.body, slot, push.senderPublicKey)).title ?? title;
+        } catch (err) {
+            log(`! push ${push.pushId}: title unreadable — ${(err as Error).message}`);
+        }
+    }
+    return `from ${title || push.senderDeviceId || 'another device'}`;
+};
+
+/**
+ * Save every attachment of a `type: 'file'` push addressed to this machine.
+ * Returns true when at least one file landed. Pushes for another device,
+ * and this device's own sends (never wrapped for the sender — MCP and
+ * listener on one host share a device id), are left alone.
+ */
+const handleFilePush = async (push: PushItem, deps: HandlePushDeps): Promise<boolean> => {
+    const me = deps.deviceId?.() ?? computeListenerDeviceId();
+    if (push.targetDeviceId && push.targetDeviceId !== me) return false;
+    if (push.senderDeviceId === me) return false;
+    const files = push.files ?? [];
+    if (files.length === 0) return false;
+    const save = deps.saveFile ?? defaultSaveFile;
+    const notify = deps.notify ?? notifyDesktop;
+    const from = await describeSender(push, me);
+    let saved = 0;
+    const announce = (f: PushFileAttachment, dest: string): void => {
+        saved++;
+        log(`⇣ ${f.fileName} → ${dest}`);
+        // `notify` is an injection point; one that throws or rejects must
+        // not become an unhandled rejection, nor read as a failed save.
+        void Promise.resolve()
+            .then(() => notify({ title: `Zeph · ${basename(dest)}`, body: from }))
+            .catch((err: unknown) => log(`! banner failed — ${err instanceof Error ? err.message : String(err)}`));
+    };
+    for (const f of files) {
+        if (!f.fileKey) {
+            // No bytes in S3: handed over the LAN (`lanDeliveredTo`, ADR-0013),
+            // or a malformed attachment. Ours to claim only when it was
+            // delivered to this device.
+            if (f.lanDeliveredTo === me && f.transferId) {
+                const claim = deps.claimLanFile ?? defaultClaimLanFile;
+                try {
+                    const dest = await claim(f);
+                    if (dest === null) {
+                        log(`local transfer: "${f.fileName}" (${f.transferId}) is not in the landing zone — already claimed, or swept`);
+                        continue;
+                    }
+                    announce(f, dest);
+                } catch (err) {
+                    log(`! local transfer: claim of "${f.fileName}" failed — ${(err as Error).message}`);
+                }
+                continue;
+            }
+            log(f.lanDeliveredTo
+                ? `local transfer: "${f.fileName}" was delivered to ${f.lanDeliveredTo}, not this device — skipping`
+                : `! file "${f.fileName}": no fileKey — nothing to fetch, skipping`);
+            continue;
+        }
+        try {
+            const dest = await save(push, f);
+            if (dest === null) {
+                log(`file "${f.fileName}": not wrapped for this device — skipping`);
+                continue;
+            }
+            announce(f, dest);
+        } catch (err) {
+            log(`! file "${f.fileName}": save failed — ${(err as Error).message}`);
+        }
+    }
+    return saved > 0;
 };
 
 /**
@@ -3908,12 +4163,20 @@ export const gcAttachments = (
     now: number = Date.now(),
     dir: string = ATTACHMENTS_DIR,
     ttl: number = ATTACHMENT_TTL_MS,
+    landingDir: string = LAN_LANDING_DIR,
 ): number => {
     let removed = 0;
     let entries: string[];
     try { entries = readdirSync(dir); } catch { return 0; }
     for (const name of entries) {
         const full = join(dir, name);
+        if (full === landingDir) {
+            // Local-transfer landing zone: sweep the transfers inside it,
+            // never the zone itself. Matched by full path, so a transfer
+            // or push that happens to be called `lan` is swept like any other.
+            removed += gcAttachments(now, full, ttl, landingDir);
+            continue;
+        }
         try {
             if (now - statSync(full).mtimeMs <= ttl) continue;
             rmSync(full, { recursive: true, force: true });
@@ -3924,21 +4187,25 @@ export const gcAttachments = (
 };
 
 /**
- * Process one push. Returns true when an injection actually fired.
- * Exported for unit testing with mocked deps.
+ * Process one push. Returns true when it did something: an injection
+ * fired, or a file was saved. Exported for unit testing with mocked deps.
  *
- * Only acts on `type='agent.command'` pushes carrying both an
- * `agentSessionName` (tmux session to inject into) and a non-empty
- * `body`. Everything else (Stop-hook auto-pushes, zeph_ask responses,
- * encrypted pushes, normal text/link/file notifications) is ignored.
+ * Two push types act here. `type='file'` addressed to this machine is saved
+ * to ~/Downloads/Zeph/ (encrypted or not — this device opens its own
+ * `deviceKeyMap` slot). `type='agent.command'` carrying an `agentSessionName`
+ * (tmux session to inject into) and a non-empty `body` injects, and only in
+ * plaintext — that path predates per-device keys and is unchanged. Everything
+ * else (Stop-hook auto-pushes, zeph_ask responses, text/link notifications)
+ * is ignored.
  */
 export const handlePush = async (
     push: PushItem,
     deps: HandlePushDeps = {},
 ): Promise<boolean> => {
+    if (push.type === 'file') return handleFilePush(push, deps);
     if (push.isEncrypted) {
-        // Per-device keys aren't wired yet; encrypted pushes are opaque
-        // to the listener.
+        // An encrypted agent.command is opaque to the injector; the phone
+        // never sends one, and the guard keeps it that way.
         return false;
     }
     if (push.type !== 'agent.command' || !push.agentSessionName) return false;
@@ -4093,6 +4360,12 @@ export const computeListenerDeviceId = (host?: string): string => {
 interface StreamHandle {
     done: Promise<SessionResult>;
     terminate: () => void;
+    /** True once the socket reached `open` — the device record exists from then on. */
+    opened: () => boolean;
+    /** Send one frame; false when the socket is not open. Local transfer
+     *  publishes its endpoint and this machine's public key this way
+     *  (`listener.presence`) — the HTTP device route is JWT-only. */
+    send: (msg: object) => boolean;
 }
 
 /**
@@ -4282,6 +4555,10 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             opened = true;
             lastRoundTripAt = Date.now();
             log('connected');
+            // The device record exists now — (re)publish where this machine
+            // can be reached for a local transfer (lan-transfer.ts).
+            lanTransfer?.onOpen();
+            void deviceKeyRegistration?.onOpen();
             // Initial inventory so the phone's picker has something to
             // show as soon as the listener comes online.
             void reportSessions();
@@ -4440,6 +4717,12 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
     return {
         done,
         terminate: () => { ws?.terminate(); },
+        opened: () => opened,
+        send: (msg) => {
+            if (ws?.readyState !== WebSocket.OPEN) return false;
+            ws.send(JSON.stringify(msg));
+            return true;
+        },
     };
 };
 
@@ -4693,7 +4976,34 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     // interrupted — otherwise a SIGINT during the (up to 30s) backoff waits
     // out the full delay before the loop notices shuttingDown.
     let notifyStop: () => void = () => undefined;
+    let lanClearing: Promise<void> | null = null;
     const stopped = new Promise<void>((resolve) => { notifyStop = resolve; });
+
+    // Local transfer (ADR-0013): bind once the device keypair is loaded —
+    // every route the receiver grows authenticates with it — publish on WS
+    // open, retract on stop. Off with one log line if keys or bind fail.
+    const deviceDirectory = createDeviceDirectory({ apiKey, baseUrl, log });
+    // Both halves of `listener.presence` ride whatever socket is live right
+    // now; between connections there is nothing to send on, and the next
+    // open republishes.
+    const sendPresence = (msg: object): boolean => activeHandle?.send(msg) ?? false;
+    deviceKeyRegistration = createDeviceKeyRegistration({ log, send: sendPresence, publicKey: initDeviceCrypto });
+    lanTransfer = createLanTransfer({
+        log,
+        initCrypto: async () => { await initDeviceCrypto(); },
+        startReceiver: ({ onError }) => startLanReceiver({
+            log,
+            onError,
+            deviceId: computeListenerDeviceId,
+            lookupSenderPublicKey: deviceDirectory.publicKeyOf,
+            deriveSharedSecret: deriveLanSharedSecret,
+            unwrapFileKey: unwrapDeviceKey,
+            landingDir: () => LAN_LANDING_DIR,
+        }),
+        createPublisher: () => createLanPublisher({ log, send: sendPresence }),
+        isOpen: () => activeHandle?.opened() ?? false,
+    });
+
     const stop = (sig: string): void => {
         if (shuttingDown) return;
         shuttingDown = true;
@@ -4702,6 +5012,13 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
         // immediately instead of waiting for the server to drop us.
         activeHandle?.terminate();
         keepAwake.stop();
+        // Retract the endpoint so no sender is pointed at a port about to
+        // close; the loop tail waits (briefly) for this PUT before exiting.
+        if (lanTransfer) {
+            lanClearing = lanTransfer.stop();
+            lanTransfer = null;
+        }
+        deviceKeyRegistration = null;
         notifyStop();
     };
     process.on('SIGINT', () => stop('SIGINT'));
@@ -4734,6 +5051,13 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
         attempt = Math.min(attempt + 1, 10);
     }
 
+    // `main` calls process.exit right after this returns. The cap keeps
+    // Ctrl-C from hanging on a receiver that will not close and keeps the
+    // exit ahead of stopListener's SIGKILL (see LAN_RETRACT_WAIT_MS).
+    if (lanClearing) {
+        log('retracting local transfer endpoint…');
+        await Promise.race([lanClearing, sleep(LAN_RETRACT_WAIT_MS)]);
+    }
     inventoryOffload.close();
     removeListenerPid();
     return 0;

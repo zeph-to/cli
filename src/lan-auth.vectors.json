@@ -1,0 +1,70 @@
+{
+  "info": "zeph-lan-v1",
+  "hkdf": "HKDF-SHA256, salt empty, 32 bytes; info zeph-lan-v1 (mac) / zeph-lan-v1-meta (meta)",
+  "mac": "HMAC-SHA256 over method|path|senderDeviceId|transferId|timestamp|nonce|sha256(body), hex",
+  "meta": "base64(iv[12] || AES-256-GCM(metaKey, iv, compact JSON) || tag[16])",
+  "receipt": "HMAC-SHA256(macKey, \"zeph-lan-receipt|\" + mac hex), hex — the receiver's answer header on 200/201",
+  "generatedBy": "python hashlib/hmac + cryptography AESGCM (independent of every consumer); receiptHex added with python hmac",
+  "cases": [
+    {
+      "name": "zero secret, ping, empty body",
+      "sharedSecretHex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "macKeyHex": "0fe67b6999030e454164a6d141eef7791cf2bd32aa13016c1b5dc98840dfa13e",
+      "metaKeyHex": "f2b58ba67b58430c3b62351a461d2dcf933676e895a7262f07afca523268ff78",
+      "method": "GET",
+      "path": "/zeph/lan/v1/ping",
+      "bodyHex": "",
+      "bodySha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fields": {
+        "senderDeviceId": "dev_listener_0123abcd",
+        "transferId": "ping",
+        "timestamp": 1800000000000,
+        "nonce": "00000000000000000000000000000000"
+      },
+      "canonical": "GET|/zeph/lan/v1/ping|dev_listener_0123abcd|ping|1800000000000|00000000000000000000000000000000|e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "macHex": "91057fc758a420e5cc942f2146246620d8f5dca9629ef87f9f59aae15104379c",
+      "receiptHex": "ddaee9d8511c07030a151dfb72bc4038b7bfbddcd080874e82673f05c10f07bc"
+    },
+    {
+      "name": "sequential secret, upload, small body, sealed meta",
+      "sharedSecretHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "macKeyHex": "570c7d3130de7d3c96e958c6e79869a518452d4fc95dea549d9e9557fdfaed16",
+      "metaKeyHex": "a2a538c2a6258ebf1a25a75380ed35da44756b1a015019cee2709aea8dede03a",
+      "method": "POST",
+      "path": "/zeph/lan/v1/upload",
+      "bodyHex": "68656c6c6f206c6f63616c207472616e73666572",
+      "bodySha256": "587985cf16d087a41a0ae357bfd133b02196f16e2344dfa85bfd767bfe3a1a5d",
+      "fields": {
+        "senderDeviceId": "dev_mcp_9f8e7d6c",
+        "transferId": "tr_01J9ZK3Q5W8X",
+        "timestamp": 1800000123456,
+        "nonce": "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+      },
+      "canonical": "POST|/zeph/lan/v1/upload|dev_mcp_9f8e7d6c|tr_01J9ZK3Q5W8X|1800000123456|0f1e2d3c4b5a69788796a5b4c3d2e1f0|587985cf16d087a41a0ae357bfd133b02196f16e2344dfa85bfd767bfe3a1a5d",
+      "macHex": "a34ce81ab1be665543f9e12c2cfef725602ce1908b73fdbaa8fa4b03eb31ceba",
+      "metaJson": "{\"fileName\":\"shot.png\",\"fileType\":\"image/png\",\"fileSize\":20,\"iv\":\"AAAAAAAAAAAAAAAA\",\"deviceKeyMap\":{\"dev_listener_0123abcd\":\"{\\\"encryptedKey\\\":\\\"AA==\\\",\\\"keyIv\\\":\\\"AA==\\\"}\"},\"transferId\":\"tr_01J9ZK3Q5W8X\"}",
+      "metaIvHex": "000102030405060708090a0b",
+      "metaSealedBase64": "AAECAwQFBgcICQoLol0iwLvlvA2tMoBBMyK60975U5I4SW1FZuM1aLTqID6fU4FTa0OyrIst9fDU9BzMBteAW6r1rE51jvOfQMUJ8WgzgGa0MvOUxnZwvUTACYyfNJugYhPxeM0nfsL+awT8WlDl0pcgB7rYmgKC1Po4E2LvIBzI/wLmRCEJj/SdN55sZxScK549CAauZfZSC8OGRcx8BG5CiG8Z07F3IuyDtjXapQzyDxHm8oFBAygRwXCxtjAMlLcGc4VJNe4FJVnwagXYqaR75EyqMCMB7ugc/F+0bGGZZN/+WJT/X10=",
+      "receiptHex": "a576c146f14e51a6a101c18ff10d99c47174a8b7153665f07bbbdb0119989760"
+    },
+    {
+      "name": "all-ff secret, upload, binary body",
+      "sharedSecretHex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "macKeyHex": "484550e0fbd7d1b5cd5d726502c521c285147051502b758ba920b2db6f252e9b",
+      "metaKeyHex": "0f32bd5fa69c28341b97234f1b4b4b4f69921312abdc4605145b6411c4dae75e",
+      "method": "POST",
+      "path": "/zeph/lan/v1/upload",
+      "bodyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+      "bodySha256": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+      "fields": {
+        "senderDeviceId": "dev_android_abc.def:1",
+        "transferId": "a-b_c",
+        "timestamp": 1,
+        "nonce": "ffffffffffffffffffffffffffffffff"
+      },
+      "canonical": "POST|/zeph/lan/v1/upload|dev_android_abc.def:1|a-b_c|1|ffffffffffffffffffffffffffffffff|40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+      "macHex": "9fccca16af7a1657ba1817da2ca32d38d9b40b375ce2101b8c33f97721970135",
+      "receiptHex": "9e261a5cfe10471d95a7f0ac7be64943aee3678c9cbbdfb9dd8e75795b6d3193"
+    }
+  ]
+}

@@ -30,10 +30,10 @@
 
 /// <reference lib="dom" />
 
-import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync, linkSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
-import { webcrypto } from 'node:crypto';
+import { randomBytes, webcrypto } from 'node:crypto';
 
 // Node 18 has no `crypto` global (unflagged only from 19.0.0) — resolve the
 // Web Crypto implementation explicitly so encryption works on the declared
@@ -446,9 +446,31 @@ const loadStoredDeviceKeys = (): ExportedKeyPair | null => {
   }
 };
 
-const storeDeviceKeys = (exported: ExportedKeyPair): void => {
+/**
+ * Create the keypair file, exclusively. The MCP server creates the same file
+ * (one Machine Device keypair per host, ADR-0007), and two processes each
+ * writing their own pair would leave one of them holding a key that is not on
+ * disk — and not the one registered. Returns what is on disk afterwards: ours,
+ * or the pair that won the race.
+ */
+const storeDeviceKeys = (exported: ExportedKeyPair): ExportedKeyPair => {
   mkdirSync(DEVICE_KEYS_DIR, { recursive: true, mode: 0o700 });
-  writeFileSync(DEVICE_KEYS_PATH, JSON.stringify(exported, null, 2), { mode: 0o600 });
+  // Written whole to a private temp name, then linked into place: `link` is
+  // atomic and fails if the name exists, so the file under the real name is
+  // never half-written, and a process that loses the race reads a complete one.
+  const temp = `${DEVICE_KEYS_PATH}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  writeFileSync(temp, JSON.stringify(exported, null, 2), { mode: 0o600, flag: 'wx' });
+  try {
+    linkSync(temp, DEVICE_KEYS_PATH);
+    return exported;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    const winner = loadStoredDeviceKeys();
+    if (!winner?.publicKey || !winner.privateKey) throw new Error(`${DEVICE_KEYS_PATH} exists but holds no keypair`);
+    return winner;
+  } finally {
+    try { unlinkSync(temp); } catch { /* already gone — fine */ }
+  }
 };
 
 /**
@@ -467,10 +489,10 @@ export const initDeviceCrypto = (): Promise<string> => {
     }
     const keyPair = await generateKeyPair();
     const exported = await exportKeyPair(keyPair);
-    storeDeviceKeys(exported);
-    deviceKeyPair = keyPair;
-    deviceExportedPublicKey = exported.publicKey;
-    return exported.publicKey;
+    const onDisk = storeDeviceKeys(exported);
+    deviceKeyPair = onDisk === exported ? keyPair : await importKeyPair(onDisk);
+    deviceExportedPublicKey = onDisk.publicKey;
+    return onDisk.publicKey;
   })().catch((err) => {
     deviceInitPromise = null;
     throw err;
@@ -479,6 +501,70 @@ export const initDeviceCrypto = (): Promise<string> => {
 };
 
 export const getDevicePublicKey = (): string | null => deviceExportedPublicKey;
+
+/**
+ * Raw ECDH secret between this device and `peerPublicKeyRaw` (Base64
+ * SPKI) — the 32-byte x-coordinate WebCrypto's `deriveBits` yields for
+ * P-256. Input to the local-transfer MAC key (lan-auth.ts `deriveLanKey`);
+ * never used as a key by itself. Requires initDeviceCrypto().
+ */
+export const deriveLanSharedSecret = async (peerPublicKeyRaw: string): Promise<Buffer> => {
+  if (!deviceKeyPair) throw new Error('Device crypto not initialized');
+  const peer = await importPublicKey(peerPublicKeyRaw);
+  return Buffer.from(await crypto.subtle.deriveBits({ name: 'ECDH', public: peer }, deviceKeyPair.privateKey, 256));
+};
+
+/**
+ * Open this device's slot in a `deviceKeyMap` (the JSON `{ encryptedKey,
+ * keyIv }` `wrapForDevices` writes) and return the raw AES key inside —
+ * the per-file key for an attachment, or the message key for a push body.
+ * The ECDH secret is derived from this device's private half and the
+ * sender's `senderPublicKey`; anything but that pairing fails the GCM tag
+ * and rejects. Requires initDeviceCrypto().
+ */
+const unwrapDeviceKeyRaw = async (entryJson: string, senderPublicKeyRaw: string): Promise<ArrayBuffer> => {
+  if (!deviceKeyPair) throw new Error('Device crypto not initialized');
+  const entry = JSON.parse(entryJson) as { encryptedKey?: unknown; keyIv?: unknown };
+  if (typeof entry.encryptedKey !== 'string' || typeof entry.keyIv !== 'string') {
+    throw new Error('deviceKeyMap entry is not { encryptedKey, keyIv }');
+  }
+  const sharedKey = await deriveAesKey(deviceKeyPair.privateKey, await importPublicKey(senderPublicKeyRaw));
+  return crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: new Uint8Array(fromBase64(entry.keyIv)) },
+    sharedKey,
+    fromBase64(entry.encryptedKey),
+  );
+};
+
+export const unwrapDeviceKey = async (entryJson: string, senderPublicKeyRaw: string): Promise<Buffer> =>
+  Buffer.from(await unwrapDeviceKeyRaw(entryJson, senderPublicKeyRaw));
+
+/**
+ * Decrypt a push body sealed by `encryptPushBodyForDevices` (any client's
+ * twin of it) for this device: `body` is the JSON `{ ciphertext, iv }`
+ * envelope, the message key comes out of this device's `deviceKeyMap` slot.
+ * Returns the `{ title, body, url }` the sender put in.
+ */
+export const decryptPushBodyForDevice = async (
+  body: string,
+  entryJson: string,
+  senderPublicKeyRaw: string,
+): Promise<{ title?: string; body?: string; url?: string }> => {
+  const envelope = JSON.parse(body) as { ciphertext?: unknown; iv?: unknown };
+  if (typeof envelope.ciphertext !== 'string' || typeof envelope.iv !== 'string') {
+    throw new Error('push body is not a { ciphertext, iv } envelope');
+  }
+  const rawKey = await unwrapDeviceKeyRaw(entryJson, senderPublicKeyRaw);
+  const messageKey = await crypto.subtle.importKey('raw', rawKey, { name: 'AES-GCM' }, false, ['decrypt']);
+  const plaintext = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: new Uint8Array(fromBase64(envelope.iv)) },
+    messageKey,
+    fromBase64(envelope.ciphertext),
+  );
+  const parsed = JSON.parse(new TextDecoder().decode(plaintext)) as { title?: unknown; body?: unknown; url?: unknown };
+  const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
+  return { title: str(parsed.title), body: str(parsed.body), url: str(parsed.url) };
+};
 
 /**
  * Encrypt an ephemeral payload (e.g. a stream frame) for one recipient

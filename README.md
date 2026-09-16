@@ -665,6 +665,40 @@ cap). Heartbeat is ping every 25 s with a 10 s pong timeout. On an
 authentication failure close (4001/4002/4003) the listener exits with
 code 3 instead of looping forever — fix the key and restart.
 
+**Local transfer.** Once its device keys are loaded the listener also opens a
+small HTTP server on an OS-assigned port and publishes `host:port` (private
+IPv4 only) on its device record, so a sender on the same Wi-Fi can hand a
+file straight to this machine instead of going through the cloud. The log
+says `local transfer: listening on 0.0.0.0:<port>`. If the macOS firewall is
+on, the first bind may ask *"Do you want the application node to accept
+incoming network connections?"* — declining is safe; files simply keep
+taking the relay.
+
+**Receiving files.** A file push addressed to this machine (`zeph_file`,
+`zeph notify --file`, the phone's share sheet) is saved to `~/Downloads/Zeph/`
+under its own name — `name (2).ext` when that name is taken, never
+overwritten, never cleaned up — and a desktop banner (`Zeph · <file>` over
+the push's title, e.g. `[myproject] shot.png`) says it landed. Encrypted
+files are opened with this machine's own device key on the way down; nothing
+is buffered, so a 1 GB recording streams straight to disk. `agent.command`
+attachments are unaffected: they still go to `~/.zeph/attachments/<pushId>/`
+and are swept after 24 h.
+
+A sender on the same network can skip the cloud entirely: it pings this
+machine's endpoint, then uploads the encrypted file straight to it. Every
+request is authenticated with a key only a device registered on your account
+can derive (ECDH with this machine's device key), so an unknown sender — or a
+replayed or tampered upload — gets an empty 401 and nothing is written. File
+names and the recipient list travel sealed too; someone sniffing the Wi-Fi
+sees a device id and a transfer id, nothing else. The sender counts a file
+delivered only on a receipt this machine alone can compute, so a host that
+merely answers on this machine's address cannot swallow it — the file goes via
+the cloud instead. A device removed from the
+account is refused within a minute. The file waits in `~/.zeph/attachments/lan/`
+until its push record arrives, then moves to `~/Downloads/Zeph/` like any
+other; a transfer whose record never comes is swept after 24 h. Two uploads at
+a time, 1 GB each at most.
+
 ### List Options
 
 | Flag | Description |
@@ -924,8 +958,12 @@ A device that has not registered a per-device public key cannot be sent
 to; it is skipped, and if no device qualifies the push goes out in the
 clear rather than arriving as something nothing can open.
 
-The `zeph listener` ignores `isEncrypted` pushes for now — it does not
-try to decrypt them. Stop-hook auto-pushes and `zeph_ask` responses are
+This host becomes a device others can encrypt for once `zeph listener`
+runs: it registers the public key on this machine's device record each
+time it connects to Zeph.
+
+The `zeph listener` opens encrypted file pushes addressed to it, and
+ignores every other `isEncrypted` push — it does not try to decrypt them. Stop-hook auto-pushes and `zeph_ask` responses are
 not part of the `@<session>` injection path, so this doesn't affect
 normal use.
 

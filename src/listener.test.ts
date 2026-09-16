@@ -272,6 +272,134 @@ describe('handlePush', () => {
     });
 });
 
+describe('handlePush — type: file (ADR-0013 receive half)', () => {
+    const ME = 'dev_listener_me';
+    type Deps = NonNullable<Parameters<typeof handlePush>[1]>;
+    const recorder = () => {
+        const saved: string[] = [];
+        const notes: { title: string; body: string }[] = [];
+        let injected = 0;
+        const deps: Deps = {
+            deviceId: () => ME,
+            saveFile: async (_push, file) => { saved.push(file.fileName); return `/home/u/Downloads/Zeph/${file.fileName}`; },
+            notify: async (n) => { notes.push(n); return true; },
+            inject: () => { injected++; return true; },
+            paneCommand: () => 'claude',
+            rateLimit: () => true,
+            paneCwd: () => null,
+        };
+        return { deps, saved, notes, injectedCount: () => injected };
+    };
+    const filePush = (overrides: Partial<Parameters<typeof handlePush>[0]> = {}) => ({
+        pushId: 'p1',
+        type: 'file',
+        title: '[myapp] shot.png',
+        senderDeviceId: 'dev_mcp_other_host',
+        targetDeviceId: ME,
+        files: [{ fileKey: 'fk1', fileName: 'shot.png', fileType: 'image/png', fileSize: 3 }],
+        ...overrides,
+    });
+
+    it('saves a file push addressed to this device and shows a banner naming the sender', async () => {
+        const r = recorder();
+        expect(await handlePush(filePush(), r.deps)).toBe(true);
+        expect(r.saved).toEqual(['shot.png']);
+        expect(r.notes).toEqual([{ title: 'Zeph · shot.png', body: 'from [myapp] shot.png' }]);
+        expect(r.injectedCount()).toBe(0);
+    });
+
+    it('saves a push with no targetDeviceId (sent to every device)', async () => {
+        const r = recorder();
+        expect(await handlePush(filePush({ targetDeviceId: undefined }), r.deps)).toBe(true);
+        expect(r.saved).toEqual(['shot.png']);
+    });
+
+    it('leaves a push for another device alone', async () => {
+        const r = recorder();
+        expect(await handlePush(filePush({ targetDeviceId: 'dev_phone' }), r.deps)).toBe(false);
+        expect(r.saved).toEqual([]);
+        expect(r.notes).toEqual([]);
+    });
+
+    it("leaves this device's own send alone — it was never wrapped for the sender", async () => {
+        const r = recorder();
+        expect(await handlePush(filePush({ senderDeviceId: ME }), r.deps)).toBe(false);
+        expect(r.saved).toEqual([]);
+    });
+
+    it('an encrypted file push is not dropped (unlike agent.command) — the saver opens our slot', async () => {
+        const r = recorder();
+        expect(await handlePush(filePush({ isEncrypted: true, title: undefined, body: 'not-an-envelope', senderPublicKey: 'pk', deviceKeyMap: { [ME]: '{}' } }), r.deps)).toBe(true);
+        expect(r.saved).toEqual(['shot.png']);
+        // The title could not be opened: the banner falls back to the sender id, the file still lands.
+        expect(r.notes[0]).toEqual({ title: 'Zeph · shot.png', body: 'from dev_mcp_other_host' });
+    });
+
+    it('a failed save is logged, no banner, returns false; other files in the push still land', async () => {
+        const r = recorder();
+        r.deps.saveFile = async (_push, file) => {
+            if (file.fileName === 'bad.bin') throw new Error('download 403');
+            return `/home/u/Downloads/Zeph/${file.fileName}`;
+        };
+        const push = filePush({ files: [{ fileKey: 'a', fileName: 'bad.bin' }, { fileKey: 'b', fileName: 'ok.txt' }] });
+        expect(await handlePush(push, r.deps)).toBe(true);
+        expect(r.notes.map((n) => n.title)).toEqual(['Zeph · ok.txt']);
+        r.notes.length = 0;
+        expect(await handlePush(filePush({ files: [{ fileKey: 'a', fileName: 'bad.bin' }] }), r.deps)).toBe(false);
+        expect(r.notes).toEqual([]);
+    });
+
+    it('a LAN-delivered attachment (lanDeliveredTo, no fileKey) is skipped in this build, not fetched', async () => {
+        const r = recorder();
+        expect(await handlePush(filePush({ files: [{ fileName: 'big.mov', lanDeliveredTo: ME, transferId: 't1' }] }), r.deps)).toBe(false);
+        expect(r.saved).toEqual([]);
+    });
+
+    it('a file not wrapped for this device (saver returns null) is a quiet skip: no banner, false', async () => {
+        const r = recorder();
+        r.deps.saveFile = async () => null;
+        expect(await handlePush(filePush(), r.deps)).toBe(false);
+        expect(r.notes).toEqual([]);
+    });
+
+    it('a banner that rejects does not fail the save', async () => {
+        const r = recorder();
+        r.deps.notify = async () => { throw new Error('osascript exploded'); };
+        expect(await handlePush(filePush(), r.deps)).toBe(true);
+        await new Promise((res) => setTimeout(res, 0));   // let the rejection settle — an unhandled one fails the run
+        expect(r.saved).toEqual(['shot.png']);
+    });
+
+    it('a file push with no files does nothing', async () => {
+        const r = recorder();
+        expect(await handlePush(filePush({ files: [] }), r.deps)).toBe(false);
+    });
+
+    it('the banner name falls back to the sender device id when there is no title', async () => {
+        const r = recorder();
+        await handlePush(filePush({ title: undefined }), r.deps);
+        expect(r.notes[0].body).toBe('from dev_mcp_other_host');
+    });
+
+    // Regression: the gate change for file pushes must not move agent.command.
+    it('agent.command is unchanged: encrypted still dropped, plaintext still injects, never saved', async () => {
+        const r = recorder();
+        const cmd = { pushId: 'c1', type: 'agent.command', agentSessionName: 'zeph-myapp', body: 'do it' };
+        expect(await handlePush({ ...cmd, isEncrypted: true }, r.deps)).toBe(false);
+        expect(r.injectedCount()).toBe(0);
+        expect(await handlePush(cmd, r.deps)).toBe(true);
+        expect(r.injectedCount()).toBe(1);
+        expect(r.saved).toEqual([]);
+        expect(r.notes).toEqual([]);
+    });
+
+    it('a type: file push never injects, even with an agentSessionName and body on it', async () => {
+        const r = recorder();
+        await handlePush(filePush({ agentSessionName: 'zeph-myapp', body: 'rm -rf /' }), r.deps);
+        expect(r.injectedCount()).toBe(0);
+    });
+});
+
 describe('resolveKeys', () => {
     it('maps whitelisted names (case/space-insensitive) to tmux tokens', () => {
         expect(resolveKeys(['Escape', 'up', ' Down ', 'LEFT', 'right', 'enter'])).toEqual([
