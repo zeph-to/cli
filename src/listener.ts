@@ -25,7 +25,7 @@ import { spawnSync } from 'child_process';
 import { createHash } from 'crypto';
 import { constants as fsConstants, copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { homedir, hostname, userInfo } from 'os';
-import { join, basename, isAbsolute, resolve, sep } from 'path';
+import { join, basename, dirname, isAbsolute, resolve, sep } from 'path';
 import WebSocket from 'ws';
 import { loadConfig, resolvedEnv, VERSION } from './config.js';
 import { legacyWsEnvNotice, resolveWsUrlDetailed } from './ws-url.js';
@@ -4078,6 +4078,16 @@ const describeSender = async (push: PushItem, me: string): Promise<string> => {
 };
 
 /**
+ * The folder a saved file is in, as a person would type it: the home prefix
+ * shown as `~`. The title already carries the name — the one the file was
+ * actually saved under, ` (2)` included — so the body only has to say where.
+ */
+export const displayFolder = (dest: string, home: string = homedir()): string => {
+    const dir = dirname(dest);
+    return dir === home || dir.startsWith(home + sep) ? `~${dir.slice(home.length)}` : dir;
+};
+
+/**
  * Save every attachment of a `type: 'file'` push addressed to this machine.
  * Returns true when at least one file landed. Pushes for another device,
  * and this device's own sends (never wrapped for the sender — MCP and
@@ -4099,7 +4109,7 @@ const handleFilePush = async (push: PushItem, deps: HandlePushDeps): Promise<boo
         // `notify` is an injection point; one that throws or rejects must
         // not become an unhandled rejection, nor read as a failed save.
         void Promise.resolve()
-            .then(() => notify({ title: `Zeph · ${basename(dest)}`, body: from }))
+            .then(() => notify({ title: `Zeph · ${basename(dest)}`, body: `${from} · ${displayFolder(dest)}`, reveal: dest }))
             .catch((err: unknown) => log(`! banner failed — ${err instanceof Error ? err.message : String(err)}`));
     };
     for (const f of files) {

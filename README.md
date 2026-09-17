@@ -678,7 +678,11 @@ taking the relay.
 `zeph notify --file`, the phone's share sheet) is saved to `~/Downloads/Zeph/`
 under its own name — `name (2).ext` when that name is taken, never
 overwritten, never cleaned up — and a desktop banner (`Zeph · <file>` over
-the push's title, e.g. `[myproject] shot.png`) says it landed. Encrypted
+the push's title and the folder, e.g. `[myproject] shot.png · ~/Downloads/Zeph`)
+says where it landed. The name in the banner is the one it was saved under, so
+a `(2)` shows up there. With [`terminal-notifier`](https://github.com/julienXX/terminal-notifier)
+installed (`brew install terminal-notifier`), clicking the banner reveals the
+file in Finder; the plain macOS banner has no click action. Encrypted
 files are opened with this machine's own device key on the way down; nothing
 is buffered, so a 1 GB recording streams straight to disk. `agent.command`
 attachments are unaffected: they still go to `~/.zeph/attachments/<pushId>/`
