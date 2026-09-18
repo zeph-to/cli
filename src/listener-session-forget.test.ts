@@ -17,7 +17,14 @@ const FIELD_SEP = '␟';
 /** tmux sessions that exist right now. */
 let liveSessions: string[] = [];
 
+/** True when tmux cannot be run at all — `spawnSync` answers with an error and
+ *  a null status, which is not the same fact as "no such session". */
+let tmuxUnrunnable = false;
+
 const fakeTmux = (args: readonly string[]) => {
+    if (tmuxUnrunnable) {
+        return { status: null, stdout: '', stderr: '', error: new Error('spawn tmux ENOENT') };
+    }
     const a = args[0] === '-S' ? args.slice(2) : args;
     if (a[0] === 'list-panes') {
         const rows = liveSessions
@@ -25,9 +32,10 @@ const fakeTmux = (args: readonly string[]) => {
             .join('\n');
         return { status: 0, stdout: rows + '\n', stderr: '' };
     }
-    if (a[0] === 'list-sessions') return { status: 0, stdout: '', stderr: '' };
-    if (a[0] === 'has-session') {
-        return { status: liveSessions.includes(a[2]) ? 0 : 1, stdout: '', stderr: '' };
+    if (a[0] === 'list-sessions') {
+        // The `-F` form is the liveness question; the bare one is socket discovery.
+        if (a.includes('-F')) return { status: 0, stdout: liveSessions.join('\n'), stderr: '' };
+        return { status: 0, stdout: '', stderr: '' };
     }
     return { status: 1, stdout: '', stderr: '' };
 };
@@ -79,6 +87,7 @@ describe('agent.session.forget.request — deleting a session this machine ran',
         vi.spyOn(console, 'log').mockImplementation(() => {});
         sent = [];
         liveSessions = [];
+        tmuxUnrunnable = false;
         rmSync(join(TMP, 'state'), { recursive: true, force: true });
     });
     afterEach(() => vi.restoreAllMocks());
@@ -183,6 +192,31 @@ describe('agent.session.forget.request — deleting a session this machine ran',
 
             expect(ask().reply).toMatchObject({ error: 'still_running' });
             expect(isKnownSession('zeph-api')).toBe(true);
+        });
+
+        // A delete is irreversible and takes the chat scrollback with it. When
+        // tmux cannot be run at all, "no such session" is not what happened —
+        // and refusing is the only answer that cannot destroy a live session's
+        // record on the strength of a question that failed.
+        it('refuses rather than deleting when tmux cannot be asked', () => {
+            remember();
+            tmuxUnrunnable = true;
+
+            expect(ask().reply).toMatchObject({ error: 'still_running' });
+            expect(isKnownSession('zeph-api')).toBe(true);
+        });
+
+        // Liveness is membership in the session list, so a name is only itself.
+        // Asking `has-session -t <name>` instead took a tmux TARGET, which
+        // matches by prefix when nothing matches exactly: with `zeph-api-2`
+        // running, the ended `zeph-api` was called still_running and could
+        // never be deleted.
+        it('forgets an ended session whose name is a prefix of a running one', () => {
+            remember();
+            liveSessions = ['zeph-api-2'];
+
+            expect(ask().reply).toMatchObject({ forgotten: true });
+            expect(isKnownSession('zeph-api')).toBe(false);
         });
     });
 });

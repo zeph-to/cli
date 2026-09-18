@@ -29,6 +29,30 @@ describe('notifyDesktop', () => {
         expect(r.calls[0].args[1]).toBe('display notification "x" with title "Zeph · say \\"hi\\"\\\\now.txt"');
     });
 
+    it('macOS with terminal-notifier: a click reveals the file, its path quoted for the shell', async () => {
+        const r = recorder();
+        const ok = await notifyDesktop(
+            { title: 'Zeph · a.png', body: 'from phone · ~/Downloads/Zeph', reveal: "/Users/me/Downloads/Zeph/it's $(touch /tmp/pwned).png" },
+            { platform: 'darwin', run: r.run, onPath: (c) => c === 'terminal-notifier' },
+        );
+        expect(ok).toBe(true);
+        expect(r.calls).toEqual([{
+            cmd: 'terminal-notifier',
+            args: [
+                '-title', 'Zeph · a.png',
+                '-message', 'from phone · ~/Downloads/Zeph',
+                '-execute', "open -R -- '/Users/me/Downloads/Zeph/it'\\''s $(touch /tmp/pwned).png'",
+            ],
+        }]);
+    });
+
+    it('macOS without terminal-notifier, or with nothing to reveal: the plain osascript banner', async () => {
+        const r = recorder();
+        await notifyDesktop({ title: 'T', body: 'b', reveal: '/x/a' }, { platform: 'darwin', run: r.run, onPath: () => false });
+        await notifyDesktop({ title: 'T', body: 'b' }, { platform: 'darwin', run: r.run, onPath: () => true });
+        expect(r.calls.map((c) => c.cmd)).toEqual(['osascript', 'osascript']);
+    });
+
     it('Linux: notify-send when it is on PATH, argv not shell', async () => {
         const r = recorder();
         const ok = await notifyDesktop({ title: 'T', body: '$(rm -rf ~)' }, { platform: 'linux', run: r.run, onPath: () => true });

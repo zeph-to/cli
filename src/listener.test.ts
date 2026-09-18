@@ -34,6 +34,7 @@ import {
     setPatternWatches,
     resetPatternWatches,
     historyLinesIn,
+    displayFolder,
 } from './listener.js';
 
 describe('checkRateLimit', () => {
@@ -277,7 +278,7 @@ describe('handlePush — type: file (ADR-0013 receive half)', () => {
     type Deps = NonNullable<Parameters<typeof handlePush>[1]>;
     const recorder = () => {
         const saved: string[] = [];
-        const notes: { title: string; body: string }[] = [];
+        const notes: { title: string; body: string; reveal?: string }[] = [];
         let injected = 0;
         const deps: Deps = {
             deviceId: () => ME,
@@ -300,11 +301,14 @@ describe('handlePush — type: file (ADR-0013 receive half)', () => {
         ...overrides,
     });
 
+    // The folder the recorder's saver writes to, as the banner body shows it.
+    const FOLDER = displayFolder('/home/u/Downloads/Zeph/shot.png');
+
     it('saves a file push addressed to this device and shows a banner naming the sender', async () => {
         const r = recorder();
         expect(await handlePush(filePush(), r.deps)).toBe(true);
         expect(r.saved).toEqual(['shot.png']);
-        expect(r.notes).toEqual([{ title: 'Zeph · shot.png', body: 'from [myapp] shot.png' }]);
+        expect(r.notes).toEqual([{ title: 'Zeph · shot.png', body: `from [myapp] shot.png · ${FOLDER}`, reveal: '/home/u/Downloads/Zeph/shot.png' }]);
         expect(r.injectedCount()).toBe(0);
     });
 
@@ -332,7 +336,7 @@ describe('handlePush — type: file (ADR-0013 receive half)', () => {
         expect(await handlePush(filePush({ isEncrypted: true, title: undefined, body: 'not-an-envelope', senderPublicKey: 'pk', deviceKeyMap: { [ME]: '{}' } }), r.deps)).toBe(true);
         expect(r.saved).toEqual(['shot.png']);
         // The title could not be opened: the banner falls back to the sender id, the file still lands.
-        expect(r.notes[0]).toEqual({ title: 'Zeph · shot.png', body: 'from dev_mcp_other_host' });
+        expect(r.notes[0]).toEqual({ title: 'Zeph · shot.png', body: `from dev_mcp_other_host · ${FOLDER}`, reveal: '/home/u/Downloads/Zeph/shot.png' });
     });
 
     it('a failed save is logged, no banner, returns false; other files in the push still land', async () => {
@@ -378,7 +382,7 @@ describe('handlePush — type: file (ADR-0013 receive half)', () => {
     it('the banner name falls back to the sender device id when there is no title', async () => {
         const r = recorder();
         await handlePush(filePush({ title: undefined }), r.deps);
-        expect(r.notes[0].body).toBe('from dev_mcp_other_host');
+        expect(r.notes[0].body).toBe(`from dev_mcp_other_host · ${FOLDER}`);
     });
 
     // Regression: the gate change for file pushes must not move agent.command.

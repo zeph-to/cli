@@ -5,8 +5,14 @@ import { accessSync, constants } from 'node:fs';
 /**
  * Desktop banner for a file that just landed (ADR-0013): macOS through
  * `osascript`, Linux through `notify-send` when it is on PATH, otherwise
- * nothing — the listener log line is the fallback everywhere. No click
- * action: the banner text carries the file name, that is the whole UI.
+ * nothing — the listener log line is the fallback everywhere.
+ *
+ * The banner names the file and the folder it is in, because "a file
+ * arrived" is only useful to someone who can then go and find it. On macOS
+ * a click reveals the file in Finder when `terminal-notifier` is on PATH
+ * (Homebrew; the service's PATH includes /opt/homebrew/bin). `osascript`
+ * cannot attach a click action, so without `terminal-notifier` the text is
+ * the whole UI.
  *
  * Best-effort by design. Never throws, never rejects; a failed banner
  * must not turn a delivered file into an error.
@@ -15,6 +21,8 @@ import { accessSync, constants } from 'node:fs';
 export interface DesktopNotification {
     title: string;
     body: string;
+    /** Absolute path a click should reveal in the file manager, where the notifier supports it. */
+    reveal?: string;
 }
 
 export interface DesktopNotifyDeps {
@@ -35,6 +43,9 @@ const commandOnPath = (cmd: string): boolean =>
         try { accessSync(join(dir, cmd), constants.X_OK); return true; } catch { return false; }
     });
 
+/** POSIX shell single-quoted literal: nothing is special inside it but `'` itself. */
+const shellQuote = (s: string): string => `'${s.split("'").join(`'\\''`)}'`;
+
 /** AppleScript string literal: only `\` and `"` need escaping inside double quotes. */
 const appleScriptString = (s: string): string => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 
@@ -51,6 +62,16 @@ export const notifyDesktop = async (
     const onPath = deps.onPath ?? commandOnPath;
     try {
         if (platform === 'darwin') {
+            if (note.reveal && onPath('terminal-notifier')) {
+                // `-execute` goes through a shell, so the path is quoted, and
+                // `--` keeps a name starting with '-' from reading as a flag.
+                await run('terminal-notifier', [
+                    '-title', note.title,
+                    '-message', note.body,
+                    '-execute', `open -R -- ${shellQuote(note.reveal)}`,
+                ]);
+                return true;
+            }
             const script = `display notification ${appleScriptString(note.body)} with title ${appleScriptString(note.title)}`;
             await run('osascript', ['-e', script]);
             return true;
