@@ -49,6 +49,7 @@ import {
     recallSession,
     rememberSessions,
     sessionDirectoryExists,
+    type SessionLiveness,
 } from './session-registry.js';
 import { foregroundAgentFor, matchAgentByPaneCommand, REMOTE_AGENTS, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 import {
@@ -524,7 +525,21 @@ const injectNamedKeys = (session: string, tokens: string[]): boolean => {
 };
 
 const stamp = (): string => new Date().toISOString().slice(11, 19);
-const log = (msg: string): void => console.log(`[${stamp()}] ${msg}`);
+/**
+ * The daemon's log is stdout, which its supervisor redirects to a file. A CLI
+ * command that borrows these helpers has no such redirect — `zeph forget` calls
+ * `sessionExists`, and socket discovery logs from there — so the chatter would
+ * land in that command's own output, and inside a `--json` line it would break
+ * the parse.
+ */
+let logSilenced = false;
+export const silenceListenerLog = (): void => {
+    logSilenced = true;
+};
+const log = (msg: string): void => {
+    if (logSilenced) return;
+    console.log(`[${stamp()}] ${msg}`);
+};
 
 // ─── tmux socket discovery ──────────────────────────────────────────
 
@@ -1701,7 +1716,17 @@ export const handleSessionForgetRequest = (
     if (isSubagentSessionName(sessionName)) return reply({ error: 'subagent_view_only' });
     if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return reply({ error: 'rate_limited' });
 
-    if (sessionExists(sessionName)) return reply({ error: 'still_running' });
+    // `unknown` — no tmux answered at all — is refused with the running answer
+    // rather than allowed through: the phone already renders that one, and the
+    // alternative is an irreversible delete (registry AND scrollback) justified
+    // by a question that failed to be asked. It says so in the log, because
+    // from the phone the two refusals are the same sentence.
+    const liveness = sessionLiveness(sessionName);
+    if (liveness === 'unknown') {
+        log(`✗ forget ${sessionName}: no tmux answered, so nothing was deleted`);
+        return reply({ error: 'still_running' });
+    }
+    if (liveness === 'running') return reply({ error: 'still_running' });
     const outcome = forgetSession(
         sessionName,
         typeof req.agentKind === 'string' ? req.agentKind : undefined,
@@ -1733,16 +1758,57 @@ export const handleSessionForgetRequest = (
  * the transcript map instead. Both maps are the same statement — the last sweep
  * saw this thing — and the split is which of the two the sweep could record.
  */
-/** Exported for the same reason as the resolver below: the subagent branch is
- *  the load-bearing one, and a test has to be able to reach it. */
-export const sessionExists = (name: string): boolean => {
-    if (isSubagentSessionName(name)) {
-        return targetsBySession.has(name) || subagentTranscriptsBySession.has(name);
-    }
-    return spawnSync('tmux', tmuxArgs(['has-session', '-t', name]), {
-        stdio: ['ignore', 'ignore', 'ignore'],
-    }).status === 0;
+/**
+ * Every session name the tmux server currently holds, or null when there was no
+ * server to ask — the binary is missing, or nothing answers on the socket this
+ * process resolved.
+ *
+ * Null is not an empty list. `has-session` cannot tell the two apart: against a
+ * socket with nobody behind it it exits 1 — the same answer it gives for a name
+ * that ended (measured 2026-09-18). That matters because socket discovery falls
+ * back to the default socket, and a cron or launchd process that cannot see the
+ * user's server would otherwise call every live session an ended one.
+ */
+export const liveSessionNames = (): string[] | null => {
+    const probe = spawnSync('tmux', tmuxArgs(['list-sessions', '-F', '#{session_name}']), {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    // A server with zero sessions does not exist — tmux exits with the last one
+    // — so a non-zero status here is always "no server answered", never "none".
+    if (probe.error || probe.status !== 0) return null;
+    return (probe.stdout ?? '').split('\n').map((line) => line.trim()).filter(Boolean);
 };
+
+/**
+ * The three-state answer, for callers that destroy something on "ended".
+ *
+ * "tmux says no such session" and "no tmux answered" are not the same fact, and
+ * only one of them means the session is over. Collapsing them lets a missing
+ * binary or a socket nobody is behind read as "everything has ended" — which,
+ * on the delete path, is an irreversible deletion justified by a failure to ask.
+ *
+ * Asking for the whole list rather than `has-session -t =<name>` is what makes
+ * the distinction available at all, and the name comparison is then exact by
+ * construction — a tmux TARGET falls back to prefix and fnmatch matching, so
+ * with `zeph-zeph-to` running an ended `zeph-zeph` used to answer "running".
+ */
+export const sessionLiveness = (name: string): SessionLiveness => {
+    if (isSubagentSessionName(name)) {
+        const known = targetsBySession.has(name) || subagentTranscriptsBySession.has(name);
+        return known ? 'running' : 'ended';
+    }
+    const names = liveSessionNames();
+    if (names === null) return 'unknown';
+    return names.includes(name) ? 'running' : 'ended';
+};
+
+/** Exported for the same reason as the resolver below: the subagent branch is
+ *  the load-bearing one, and a test has to be able to reach it.
+ *  Unknown means "not running" here, which is what its callers — resume,
+ *  exit, stream targeting — already do with a session they cannot find. The
+ *  paths that DELETE ask `sessionLiveness` instead and refuse on unknown. */
+export const sessionExists = (name: string): boolean => sessionLiveness(name) === 'running';
 
 // ─── Deep pull: scrollback above the live window ───────────────────
 //

@@ -28,9 +28,10 @@ const fakeTmux = (args: readonly string[]) => {
             .join('\n');
         return { status: 0, stdout: rows + '\n', stderr: '' };
     }
-    if (a[0] === 'list-sessions') return { status: 0, stdout: '', stderr: '' };
-    if (a[0] === 'has-session') {
-        return { status: liveSessions.includes(a[2]) ? 0 : 1, stdout: '', stderr: '' };
+    if (a[0] === 'list-sessions') {
+        // The `-F` form is the liveness question; the bare one is socket discovery.
+        if (a.includes('-F')) return { status: 0, stdout: liveSessions.join('\n'), stderr: '' };
+        return { status: 0, stdout: '', stderr: '' };
     }
     if (a[0] === 'new-session') {
         if (newSessionFails) return { status: 1, stdout: '', stderr: 'no server' };

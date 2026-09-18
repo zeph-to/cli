@@ -203,6 +203,60 @@ export const forgetSession = (name: string, agentKind?: string): ForgetOutcome =
     return removeTurnRing(name) ? 'forgotten' : 'scrollback_kept';
 };
 
+/**
+ * What the caller was able to find out about a name. `unknown` is not a
+ * synonym for ended: it is the terminal failing to answer at all — no tmux to
+ * run, or no server behind the socket it resolved — and a sweep that deletes on
+ * `ended` must not delete on that. Deciding this is the caller's job; this
+ * module owns the file, not the terminal.
+ */
+export type SessionLiveness = 'running' | 'ended' | 'unknown';
+
+/** What one sweep did. `scrollbackKept` is a subset of `forgotten`: the row is
+ *  gone either way, and these are the ones whose chat history stayed behind. */
+export type EndedSweep = {
+    forgotten: string[];
+    scrollbackKept: string[];
+    kept: string[];
+    unreachable: string[];
+};
+
+/**
+ * Forget every remembered name that no longer runs, and report each side.
+ *
+ * The unit is the NAME, not the run: `forgetSession(name)` takes every run of
+ * the name, and a name tmux still holds is one the next inventory sweep writes
+ * straight back — so a name with a live run is left alone, its ended runs
+ * included. Each name is judged, deleted and reported once, however many runs
+ * sit under it.
+ */
+export const forgetEnded = (
+    liveness: (name: string) => SessionLiveness,
+    now: number = Date.now(),
+): EndedSweep => {
+    const names = [...new Set(knownSessions(now).map((e) => e.name))];
+    const sweep: EndedSweep = { forgotten: [], scrollbackKept: [], kept: [], unreachable: [] };
+    for (const name of names) {
+        const state = liveness(name);
+        if (state === 'running') sweep.kept.push(name);
+        else if (state === 'unknown') sweep.unreachable.push(name);
+        else sweep.forgotten.push(name);
+    }
+    if (sweep.forgotten.length === 0) return sweep;
+
+    // One read and one write for the whole sweep. Calling `forgetSession` per
+    // name would rewrite the file once per name — N chances for the daemon's
+    // inventory sweep to write in between and put a deleted row back.
+    const doomed = new Set(sweep.forgotten);
+    writeAll(readAll().filter((e) => !doomed.has(e.name)));
+    // Every run of these names has gone, so — unlike `forgetSession`, which
+    // spares a ring another run still answers to — each ring goes with them.
+    for (const name of sweep.forgotten) {
+        if (!removeTurnRing(name)) sweep.scrollbackKept.push(name);
+    }
+    return sweep;
+};
+
 /** Whether the registry knows this name — the resume whitelist check. */
 export const isKnownSession = (name: string, now: number = Date.now()): boolean =>
     recallSession(name, now) !== null;
