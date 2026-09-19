@@ -50,17 +50,33 @@ export interface InventoryOffload {
 export const COLLECT_TIMEOUT_MS = 20_000;
 
 /**
- * Consecutive timed-out sweeps before the offload gives up on workers.
+ * Consecutive timed-out sweeps before the offload stops using workers.
  *
  * A sweep that overruns is terminated, and the next one starts a fresh worker
  * from nothing — so on a host where a cold sweep cannot finish inside the
  * timeout, retrying forever means the daemon never reports at all. Reporting
  * slowly beats not reporting, and in-thread is exactly "slowly". Three in a row
  * rather than one, so a single slow moment (a load spike, a machine waking) does
- * not cost the offload for the rest of the daemon's life; the streak resets on
- * any answered sweep.
+ * not cost the offload straight away; the streak resets on any answered sweep.
  */
 export const MAX_CONSECUTIVE_TIMEOUTS = 3;
+
+/**
+ * How long timed-out sweeps run in-thread before a worker is tried again.
+ *
+ * This used to be forever, which inverted the whole point of the offload: a
+ * load spike long enough to overrun three sweeps left the daemon running the
+ * blocking sweep on its own event loop for the rest of its life. Measured
+ * 2026-09-18 on this Mac — after the switch, a `setInterval(5_000)` fired at a
+ * median of 28.5 s, the WebSocket read loop went with it, and the heartbeat
+ * killed a healthy socket every 1-3 minutes (`.claude/20260918/DEBUG-09-55-00.md`).
+ *
+ * The load that overruns a sweep passes; the give-up must pass with it. Five
+ * minutes is long enough that a busy stretch is not spent respawning workers
+ * into the same wall, short enough that the degraded state is measured in
+ * minutes rather than days.
+ */
+export const IN_THREAD_COOLDOWN_MS = 5 * 60_000;
 
 /**
  * A live worker and the sweep ids it still owes an answer for.
@@ -86,13 +102,17 @@ export const startInventoryOffload = (
     workerPath: string = join(__dirname, 'inventory-worker.js'),
     /** Overridable so a test can exercise the timeout path without waiting 20s. */
     timeoutMs: number = COLLECT_TIMEOUT_MS,
+    /** Overridable for the same reason as `timeoutMs`. */
+    cooldownMs: number = IN_THREAD_COOLDOWN_MS,
 ): InventoryOffload => {
     let worker: Live | null = null;
     let closed = false;
     /** Set once a worker has answered; a failure before that is not transient. */
     let everReplied = false;
-    /** Set when the worker is given up on — sweeps run in-thread from then on. */
+    /** Set when workers are given up on for good — a worker that never worked. */
     let inThreadOnly = false;
+    /** While `Date.now()` is under this, timed-out sweeps run in-thread instead. */
+    let inThreadUntil = 0;
     let nextId = 0;
     /** Timed-out sweeps since the last answered one. */
     let consecutiveTimeouts = 0;
@@ -164,6 +184,18 @@ export const startInventoryOffload = (
 
     const collect = (): Promise<CollectResult> => {
         if (closed || inThreadOnly) return Promise.resolve(inThread());
+        if (inThreadUntil > 0) {
+            if (Date.now() < inThreadUntil) return Promise.resolve(inThread());
+            inThreadUntil = 0;
+            // One strike, not three. The first degrade spends three sweeps
+            // finding out the host is too slow, and each of those costs a whole
+            // `timeoutMs` with no inventory at all (the caller skips the cycle
+            // and gates the next sweep behind this one). Paying that again on
+            // every cooldown expiry, on a host that is still loaded, is the
+            // "not reporting" this module exists to avoid.
+            consecutiveTimeouts = MAX_CONSECUTIVE_TIMEOUTS - 1;
+            log('inventory: trying the worker again');
+        }
         worker ??= spawn();
         const live = worker;
         const id = ++nextId;
@@ -174,9 +206,10 @@ export const startInventoryOffload = (
                 // this worker's exit must not be reported as a failure.
                 live.owed.delete(id);
                 consecutiveTimeouts += 1;
-                if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS && !inThreadOnly) {
-                    inThreadOnly = true;
-                    log(`! inventory sweep timed out ${consecutiveTimeouts}× in a row — running the inventory in-thread from now on`);
+                if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS && !inThreadOnly && inThreadUntil === 0) {
+                    inThreadUntil = Date.now() + cooldownMs;
+                    const held = cooldownMs >= 60_000 ? `${Math.round(cooldownMs / 60_000)} min` : `${Math.round(cooldownMs / 1_000)}s`;
+                    log(`! inventory sweep timed out ${consecutiveTimeouts}× in a row — running the inventory in-thread for ${held}`);
                 }
                 reject(new Error(`inventory sweep exceeded ${timeoutMs / 1000}s`));
                 // A stuck worker is not coming back; the next call spawns a fresh one.

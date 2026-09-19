@@ -25,7 +25,7 @@ import { spawnSync } from 'child_process';
 import { createHash } from 'crypto';
 import { constants as fsConstants, copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { homedir, hostname, userInfo } from 'os';
-import { join, basename, isAbsolute, resolve, sep } from 'path';
+import { join, basename, dirname, isAbsolute, resolve, sep } from 'path';
 import WebSocket from 'ws';
 import { loadConfig, resolvedEnv, VERSION } from './config.js';
 import { legacyWsEnvNotice, resolveWsUrlDetailed } from './ws-url.js';
@@ -49,6 +49,7 @@ import {
     recallSession,
     rememberSessions,
     sessionDirectoryExists,
+    type SessionLiveness,
 } from './session-registry.js';
 import { foregroundAgentFor, matchAgentByPaneCommand, REMOTE_AGENTS, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 import {
@@ -96,7 +97,36 @@ const PING_INTERVAL_MS = 25_000;
 // kill cuts off is harmless: senders also require `isOnline`, which the dead
 // WebSocket no longer satisfies.
 const LAN_RETRACT_WAIT_MS = 2_500;
-const PONG_TIMEOUT_MS = 10_000;
+// How long the server may say nothing at all — any inbound frame counts, ack
+// or pong — before the socket is presumed dead. Not "how slow may a pong be":
+// the watchdog measures silence since the last frame, not a deadline it armed.
+//
+// It was 10 s, which a working socket loses on a busy link: a listener
+// carrying live-mirror frames (30 KB each) alongside its own reports was
+// measured on 2026-09-18 delivering a message to the server 9 s after
+// sending it, and its ack 12 s after. The client then killed a connection
+// that was merely late, reconnected, restarted the streams, and did it
+// again every 1-3 minutes. 30 s lets a whole ping cycle be missed.
+const PONG_TIMEOUT_MS = 30_000;
+// How often the event-loop stall meter samples itself, and how much of a
+// silence has to be this thread's own absence before the silence stops being
+// evidence about the socket.
+//
+// The watchdog runs on the thread that also reads inbound frames, so a blocked
+// thread cannot tell a dead socket from its own blindness — and left to itself
+// it reads its own blindness as the socket's death. Measured 2026-09-18: a
+// blocking inventory sweep held this thread long enough that a
+// `setInterval(5_000)` fired at a median of 28.5 s, and the heartbeat tore down
+// a healthy connection every 1-3 minutes
+// (`.claude/20260918/DEBUG-09-55-00.md`). The meter is what lets the watchdog
+// subtract itself from the measurement; WS_STALL_TIMEOUT_MS below is the
+// ceiling past which even a blocked thread stops being an excuse.
+const LOOP_SAMPLE_MS = 1_000;
+const PONG_BLOCKED_GRACE_MS = PONG_TIMEOUT_MS / 3;
+// How often the heartbeat asks whether the socket is still worth keeping.
+// Short enough that a dead socket dies near PONG_TIMEOUT_MS rather than a
+// check interval later.
+const HEARTBEAT_CHECK_MS = 5_000;
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
 const RECONNECT_JITTER_RATIO = 0.15;
@@ -112,6 +142,39 @@ const WS_CONNECT_TIMEOUT_MS = 20_000;
 // peer never replies. macOS App Nap / Wi-Fi handoff / VPN flap all
 // surface this way. Force-terminate so the reconnect loop runs.
 const WS_STALL_TIMEOUT_MS = 90_000;
+
+/** What the heartbeat concludes from one look at the socket. */
+export type HeartbeatVerdict = 'alive' | 'dead' | 'blocked';
+
+/**
+ * Is this socket still worth keeping, given how long the server has said
+ * nothing (`silentMs`) and how long this thread was unavailable to hear it
+ * (`blockedMs`)?
+ *
+ * Both questions are needed because only one of them is about the socket. The
+ * deadline used to be a per-ping `setTimeout`, which asked neither: it was
+ * cancelled by the next ping before it could ever fire on a quiet link, so a
+ * genuinely dead socket slipped past it, while a thread blocked long enough to
+ * delay its own ping fired it against a connection that was fine. Making the
+ * judgment a function of silence and of the judge's own availability is what
+ * lets the fast path (`dead` at PONG_TIMEOUT_MS) stay real while a stalled
+ * daemon is still forgiven up to the wall-clock ceiling.
+ *
+ * `blocked` is not a reprieve without end: past WS_STALL_TIMEOUT_MS the socket
+ * dies whatever this thread was doing, because at that point we cannot tell the
+ * two apart and a reconnect is cheap.
+ */
+export const heartbeatVerdict = (
+    silentMs: number,
+    blockedMs: number,
+    pongTimeoutMs: number = PONG_TIMEOUT_MS,
+    stallTimeoutMs: number = WS_STALL_TIMEOUT_MS,
+    blockedGraceMs: number = PONG_BLOCKED_GRACE_MS,
+): HeartbeatVerdict => {
+    if (silentMs > stallTimeoutMs) return 'dead';
+    if (silentMs <= pongTimeoutMs) return 'alive';
+    return blockedMs >= blockedGraceMs ? 'blocked' : 'dead';
+};
 
 // How often the listener POLLS its local tmux session inventory (and
 // immediately on $connect). Cheap — tmux runs locally, so a change is
@@ -524,7 +587,21 @@ const injectNamedKeys = (session: string, tokens: string[]): boolean => {
 };
 
 const stamp = (): string => new Date().toISOString().slice(11, 19);
-const log = (msg: string): void => console.log(`[${stamp()}] ${msg}`);
+/**
+ * The daemon's log is stdout, which its supervisor redirects to a file. A CLI
+ * command that borrows these helpers has no such redirect — `zeph forget` calls
+ * `sessionExists`, and socket discovery logs from there — so the chatter would
+ * land in that command's own output, and inside a `--json` line it would break
+ * the parse.
+ */
+let logSilenced = false;
+export const silenceListenerLog = (): void => {
+    logSilenced = true;
+};
+const log = (msg: string): void => {
+    if (logSilenced) return;
+    console.log(`[${stamp()}] ${msg}`);
+};
 
 // ─── tmux socket discovery ──────────────────────────────────────────
 
@@ -1701,7 +1778,17 @@ export const handleSessionForgetRequest = (
     if (isSubagentSessionName(sessionName)) return reply({ error: 'subagent_view_only' });
     if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return reply({ error: 'rate_limited' });
 
-    if (sessionExists(sessionName)) return reply({ error: 'still_running' });
+    // `unknown` — no tmux answered at all — is refused with the running answer
+    // rather than allowed through: the phone already renders that one, and the
+    // alternative is an irreversible delete (registry AND scrollback) justified
+    // by a question that failed to be asked. It says so in the log, because
+    // from the phone the two refusals are the same sentence.
+    const liveness = sessionLiveness(sessionName);
+    if (liveness === 'unknown') {
+        log(`✗ forget ${sessionName}: no tmux answered, so nothing was deleted`);
+        return reply({ error: 'still_running' });
+    }
+    if (liveness === 'running') return reply({ error: 'still_running' });
     const outcome = forgetSession(
         sessionName,
         typeof req.agentKind === 'string' ? req.agentKind : undefined,
@@ -1733,16 +1820,57 @@ export const handleSessionForgetRequest = (
  * the transcript map instead. Both maps are the same statement — the last sweep
  * saw this thing — and the split is which of the two the sweep could record.
  */
-/** Exported for the same reason as the resolver below: the subagent branch is
- *  the load-bearing one, and a test has to be able to reach it. */
-export const sessionExists = (name: string): boolean => {
-    if (isSubagentSessionName(name)) {
-        return targetsBySession.has(name) || subagentTranscriptsBySession.has(name);
-    }
-    return spawnSync('tmux', tmuxArgs(['has-session', '-t', name]), {
-        stdio: ['ignore', 'ignore', 'ignore'],
-    }).status === 0;
+/**
+ * Every session name the tmux server currently holds, or null when there was no
+ * server to ask — the binary is missing, or nothing answers on the socket this
+ * process resolved.
+ *
+ * Null is not an empty list. `has-session` cannot tell the two apart: against a
+ * socket with nobody behind it it exits 1 — the same answer it gives for a name
+ * that ended (measured 2026-09-18). That matters because socket discovery falls
+ * back to the default socket, and a cron or launchd process that cannot see the
+ * user's server would otherwise call every live session an ended one.
+ */
+export const liveSessionNames = (): string[] | null => {
+    const probe = spawnSync('tmux', tmuxArgs(['list-sessions', '-F', '#{session_name}']), {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    // A server with zero sessions does not exist — tmux exits with the last one
+    // — so a non-zero status here is always "no server answered", never "none".
+    if (probe.error || probe.status !== 0) return null;
+    return (probe.stdout ?? '').split('\n').map((line) => line.trim()).filter(Boolean);
 };
+
+/**
+ * The three-state answer, for callers that destroy something on "ended".
+ *
+ * "tmux says no such session" and "no tmux answered" are not the same fact, and
+ * only one of them means the session is over. Collapsing them lets a missing
+ * binary or a socket nobody is behind read as "everything has ended" — which,
+ * on the delete path, is an irreversible deletion justified by a failure to ask.
+ *
+ * Asking for the whole list rather than `has-session -t =<name>` is what makes
+ * the distinction available at all, and the name comparison is then exact by
+ * construction — a tmux TARGET falls back to prefix and fnmatch matching, so
+ * with `zeph-zeph-to` running an ended `zeph-zeph` used to answer "running".
+ */
+export const sessionLiveness = (name: string): SessionLiveness => {
+    if (isSubagentSessionName(name)) {
+        const known = targetsBySession.has(name) || subagentTranscriptsBySession.has(name);
+        return known ? 'running' : 'ended';
+    }
+    const names = liveSessionNames();
+    if (names === null) return 'unknown';
+    return names.includes(name) ? 'running' : 'ended';
+};
+
+/** Exported for the same reason as the resolver below: the subagent branch is
+ *  the load-bearing one, and a test has to be able to reach it.
+ *  Unknown means "not running" here, which is what its callers — resume,
+ *  exit, stream targeting — already do with a session they cannot find. The
+ *  paths that DELETE ask `sessionLiveness` instead and refuse on unknown. */
+export const sessionExists = (name: string): boolean => sessionLiveness(name) === 'running';
 
 // ─── Deep pull: scrollback above the live window ───────────────────
 //
@@ -4078,6 +4206,16 @@ const describeSender = async (push: PushItem, me: string): Promise<string> => {
 };
 
 /**
+ * The folder a saved file is in, as a person would type it: the home prefix
+ * shown as `~`. The title already carries the name — the one the file was
+ * actually saved under, ` (2)` included — so the body only has to say where.
+ */
+export const displayFolder = (dest: string, home: string = homedir()): string => {
+    const dir = dirname(dest);
+    return dir === home || dir.startsWith(home + sep) ? `~${dir.slice(home.length)}` : dir;
+};
+
+/**
  * Save every attachment of a `type: 'file'` push addressed to this machine.
  * Returns true when at least one file landed. Pushes for another device,
  * and this device's own sends (never wrapped for the sender — MCP and
@@ -4099,7 +4237,7 @@ const handleFilePush = async (push: PushItem, deps: HandlePushDeps): Promise<boo
         // `notify` is an injection point; one that throws or rejects must
         // not become an unhandled rejection, nor read as a failed save.
         void Promise.resolve()
-            .then(() => notify({ title: `Zeph · ${basename(dest)}`, body: from }))
+            .then(() => notify({ title: `Zeph · ${basename(dest)}`, body: `${from} · ${displayFolder(dest)}`, reveal: dest }))
             .catch((err: unknown) => log(`! banner failed — ${err instanceof Error ? err.message : String(err)}`));
     };
     for (const f of files) {
@@ -4398,10 +4536,19 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
         const sock = ws;
 
         let pingTimer: NodeJS.Timeout | null = null;
-        let pongTimer: NodeJS.Timeout | null = null;
         let sessionsTimer: NodeJS.Timeout | null = null;
         let connectTimer: NodeJS.Timeout | null = null;
         let stallTimer: NodeJS.Timeout | null = null;
+        let loopMeterTimer: NodeJS.Timeout | null = null;
+        // Milliseconds this thread was unavailable, and the reading taken when
+        // the outstanding ping went out. The meter runs on the blocked thread
+        // on purpose: its own lateness is the measurement.
+        let loopStallMs = 0;
+        let loopSampleAt = Date.now();
+        // Reading taken the last time the server was heard from, so the
+        // watchdog can ask how much of THIS silence was our own deafness.
+        let loopStallAtLastTraffic = 0;
+        let blockedSilenceLogged = false;
         // Updated on every server-acked round-trip (ack / pong). The
         // stall watchdog terminates the WS if this stays stale too long,
         // which lets the reconnect loop recover from half-open sockets
@@ -4410,11 +4557,11 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
 
         const cleanup = (): void => {
             if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
-            if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; }
             if (sessionsTimer) { clearInterval(sessionsTimer); sessionsTimer = null; }
             if (commandsTimer) { clearInterval(commandsTimer); commandsTimer = null; }
             if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
             if (stallTimer) { clearInterval(stallTimer); stallTimer = null; }
+            if (loopMeterTimer) { clearInterval(loopMeterTimer); loopMeterTimer = null; }
         };
 
         // If the WS doesn't reach OPEN within the timeout, kill it.
@@ -4566,34 +4713,45 @@ const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             void reportCommands();
             commandsTimer = setInterval(reportCommands, COMMAND_SCAN_INTERVAL_MS);
 
+            loopSampleAt = Date.now();
+            loopMeterTimer = setInterval(() => {
+                const now = Date.now();
+                loopStallMs += Math.max(0, now - loopSampleAt - LOOP_SAMPLE_MS);
+                loopSampleAt = now;
+            }, LOOP_SAMPLE_MS);
+
+            // Traffic, so that silence means something: an idle link would
+            // otherwise look identical to a dead one.
             pingTimer = setInterval(() => {
                 if (sock.readyState !== WebSocket.OPEN) return;
                 sock.send(JSON.stringify({ type: 'ping' }));
-                pongTimer = setTimeout(() => {
-                    log('! pong timeout — forcing reconnect');
-                    sock.terminate();
-                }, PONG_TIMEOUT_MS);
             }, PING_INTERVAL_MS);
 
-            // Independent stall watchdog. If we go > WS_STALL_TIMEOUT_MS
-            // without any server message landing — ack, pong, anything —
-            // the socket is effectively half-open. ping/pong should catch
-            // most of this but a sleeping laptop can pause the JS timer
-            // such that pongTimer is checked AFTER the suspension and
-            // appears 'recently scheduled'. The watchdog uses wall-clock
-            // delta vs lastRoundTripAt so it's resilient to that.
+            // The one watchdog. It reads wall-clock silence rather than a timer
+            // it armed itself, so a suspended laptop — which pauses every JS
+            // timer, including this one — is judged on how long it was actually
+            // away and not on when the callback happened to run.
             stallTimer = setInterval(() => {
                 if (sock.readyState !== WebSocket.OPEN) return;
-                if (Date.now() - lastRoundTripAt > WS_STALL_TIMEOUT_MS) {
-                    log(`! no server traffic for ${Math.round((Date.now() - lastRoundTripAt) / 1000)}s — terminating`);
-                    sock.terminate();
+                const silent = Date.now() - lastRoundTripAt;
+                const verdict = heartbeatVerdict(silent, loopStallMs - loopStallAtLastTraffic);
+                if (verdict === 'alive') return;
+                if (verdict === 'blocked') {
+                    if (!blockedSilenceLogged) {
+                        blockedSilenceLogged = true;
+                        log(`server quiet ${Math.round(silent / 1000)}s while this thread was blocked — leaving the socket alone`);
+                    }
+                    return;
                 }
-            }, 15_000);
+                log(`! no server traffic for ${Math.round(silent / 1000)}s — terminating`);
+                sock.terminate();
+            }, HEARTBEAT_CHECK_MS);
         });
 
         sock.on('message', (raw) => {
-            if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; }
             lastRoundTripAt = Date.now();
+            loopStallAtLastTraffic = loopStallMs;
+            blockedSilenceLogged = false;
             let msg: unknown;
             try {
                 msg = JSON.parse(raw.toString('utf-8'));

@@ -26,6 +26,7 @@ const {
     isKnownSession,
     knownSessionsPath,
     forgetSession,
+    forgetEnded,
     MAX_KNOWN_SESSIONS,
     KNOWN_SESSION_TTL_MS,
 } = await import('./session-registry.js');
@@ -200,6 +201,88 @@ describe('forgetSession', () => {
         } finally {
             chmodSync(turnRingDir(), 0o700);
         }
+    });
+});
+
+/**
+ * A registry row outlives the tmux session that put it there: nothing deletes
+ * it until the phone deletes the row or the 30 days run out, so a machine that
+ * runs agents under a fresh name per task collects rows for sessions that ended
+ * weeks ago. This is the sweep that answers that — and it judges by NAME, since
+ * a name that is still running is one `rememberSessions` writes straight back.
+ */
+describe('forgetEnded', () => {
+    const allEnded = () => 'ended' as const;
+    const empty = { forgotten: [], scrollbackKept: [], kept: [], unreachable: [] };
+
+    it('drops every name tmux no longer has, naming each one once', () => {
+        rememberSessions([live(), live({ name: 'zeph-web', cwd: '/Users/tak/work/web' })], T0);
+        // A second run under a name already listed: the name is reported and
+        // deleted once, not once per run.
+        rememberSessions([live({ agentKind: 'pi' })], T0 + 1000);
+
+        const result = forgetEnded(allEnded, T0 + 1000);
+
+        expect(result.forgotten.sort()).toEqual(['zeph-api', 'zeph-web']);
+        expect(result.kept).toEqual([]);
+        expect(knownSessions(T0 + 1000)).toEqual([]);
+    });
+
+    it('keeps the names that are still running', () => {
+        rememberSessions([live(), live({ name: 'zeph-web', cwd: '/Users/tak/work/web' })], T0);
+
+        const result = forgetEnded((name) => (name === 'zeph-web' ? 'running' : 'ended'), T0);
+
+        expect(result.forgotten).toEqual(['zeph-api']);
+        expect(result.kept).toEqual(['zeph-web']);
+        expect(knownSessions(T0).map((e) => e.name)).toEqual(['zeph-web']);
+    });
+
+    it('spares the ended run of a name another agent still holds', () => {
+        // Judged by name, not by run: `forgetSession(name)` takes every run of
+        // the name, and the live one would be written straight back anyway.
+        rememberSessions([live({ agentKind: 'pi' })], T0);
+        rememberSessions([live({ agentKind: 'claude' })], T0 + 1000);
+
+        const result = forgetEnded(() => 'running', T0 + 1000);
+
+        expect(result.forgotten).toEqual([]);
+        expect(result.kept).toEqual(['zeph-api']);
+        expect(knownSessions(T0 + 1000)).toHaveLength(2);
+    });
+
+    // "tmux could not be asked" is not "the session ended". Deleting on it
+    // would take a live session's record and its chat history on the strength
+    // of a failed question.
+    it('leaves a name alone when the caller could not find out', () => {
+        rememberSessions([live(), live({ name: 'zeph-web', cwd: '/Users/tak/work/web' })], T0);
+
+        const result = forgetEnded((name) => (name === 'zeph-api' ? 'unknown' : 'ended'), T0);
+
+        expect(result.unreachable).toEqual(['zeph-api']);
+        expect(result.forgotten).toEqual(['zeph-web']);
+        expect(knownSessions(T0).map((e) => e.name)).toEqual(['zeph-api']);
+    });
+
+    it('names the sessions whose scrollback would not delete', () => {
+        rememberSessions([live()], T0);
+        appendTurnRing('zeph-api', [{ kind: 'text', text: 'a week of prompts' }]);
+        chmodSync(turnRingDir(), 0o500);
+
+        try {
+            const result = forgetEnded(allEnded, T0);
+
+            // The row is gone either way — but a sweep that answers a flat
+            // "forgotten" hides where a week of prompts still is.
+            expect(result.forgotten).toEqual(['zeph-api']);
+            expect(result.scrollbackKept).toEqual(['zeph-api']);
+        } finally {
+            chmodSync(turnRingDir(), 0o700);
+        }
+    });
+
+    it('reports an empty registry as nothing to do', () => {
+        expect(forgetEnded(allEnded, T0)).toEqual(empty);
     });
 });
 

@@ -11,7 +11,11 @@ import { handleCheckUpdate } from './check-update.js';
 import { handleAsk } from './ask.js';
 import { handleAgentSession, splitAgentOptions } from './wrapper.js';
 import { handleMcp } from './mcp.js';
-import { handleListener, computeListenerDeviceId } from './listener.js';
+import {
+  computeListenerDeviceId, handleListener, isSubagentSessionName, liveSessionNames, sessionLiveness,
+  silenceListenerLog,
+} from './listener.js';
+import { forgetEnded, forgetSession, type SessionLiveness } from './session-registry.js';
 import { detectProjectDir, loadConfig, resolvedEnv, VERSION } from './config.js';
 import {
   autoPushMode, decidePush, GATE_DEFAULTS, isMuted, NONREADONLY_COUNT_FLAG, normalizeMarker,
@@ -92,6 +96,10 @@ Commands:
   dismiss <id>    Dismiss a push notification (or --all)
   rename <name>   Set this agent session's display name in the app
                   (run inside a zeph cc session; --clear resets it)
+  forget <name>   Drop an ended session from this machine's record, so it
+                  leaves the app's past list. Refuses a running session
+                  (kill it first). --ended forgets every remembered
+                  session tmux no longer has
   test            Send a test notification to verify setup
 ${usageAgentLines()}
                   (reattaches a detached session of that project when
@@ -270,6 +278,109 @@ const handleRename = async (args: Record<string, string | boolean>): Promise<num
   } catch (err) {
     return handleError(err, isJson);
   }
+};
+
+/**
+ * `zeph forget <session>` — drop an ended session from this machine's record,
+ * which is what takes it out of the app's past list (and out of the resume
+ * whitelist, the same pair the phone's row-delete means).
+ *
+ * `--ended` does it for every remembered name tmux no longer has: a machine
+ * that launches agents under a fresh name per task collects rows nothing ever
+ * deletes, and naming each one by hand is not the answer to fifty of them.
+ *
+ * The order mirrors the listener's own delete handler (`listener.ts:1701-1721`)
+ * so the two ways to forget a session cannot disagree about what is allowed.
+ */
+const handleForget = (args: Record<string, string | boolean>): number => {
+  const isJson = args.json === true;
+  // The tmux socket discovery under `sessionLiveness` logs for a daemon with a
+  // redirected stdout, not for this command. A person reading the output wants
+  // those lines — a failed probe is the only explanation for an "unknown" — but
+  // in a --json line they break the parse.
+  if (isJson) silenceListenerLog();
+  const name = typeof args._arg1 === 'string' ? args._arg1 : '';
+  const sweeping = args.ended === true;
+
+  if (name && sweeping) {
+    printError('Usage: zeph forget <session>  (or --ended, not both)', isJson);
+    return 2;
+  }
+  if (sweeping) return forgetEveryEndedSession(isJson);
+  if (!name) {
+    printError('Usage: zeph forget <session>  (or --ended to drop every session tmux no longer has)', isJson);
+    return 2;
+  }
+
+  // A subagent pane has no registry row — the sweep never remembers panes — so
+  // "never seen" would be a true answer to the wrong question.
+  if (isSubagentSessionName(name)) {
+    printError(`${name} is a subagent pane — those have no record to forget`, isJson);
+    return 1;
+  }
+  const state = sessionLiveness(name);
+  if (state === 'running') {
+    printError(`${name} is still running — 'tmux kill-session -t ${name}' first`, isJson);
+    return 1;
+  }
+  // Not the same as "it ended": tmux answered nothing. Deleting on that would
+  // take a live session's record and chat history on the strength of a failed
+  // question.
+  if (state === 'unknown') {
+    printError(`could not ask tmux whether ${name} is running — nothing was forgotten`, isJson);
+    return 1;
+  }
+
+  const outcome = forgetSession(name);
+  if (outcome === 'unknown') {
+    printError(`${name}: never seen on this machine`, isJson);
+    return 1;
+  }
+  if (isJson) printJson({ session: name, status: outcome });
+  else if (outcome === 'scrollback_kept') {
+    console.log(`Forgot ${name} — dropped from the record, but its chat scrollback would not delete`);
+  } else {
+    console.log(`Forgot ${name}`);
+  }
+  return 0;
+};
+
+const forgetEveryEndedSession = (isJson: boolean): number => {
+  // One question for the whole sweep, asked before anything is deleted: a
+  // per-name probe would let tmux go away halfway through and turn the rest of
+  // the registry into "ended".
+  const running = liveSessionNames();
+  if (running === null) {
+    printError('no tmux server answered — nothing was forgotten', isJson);
+    return 1;
+  }
+  const live = new Set(running);
+  // A subagent pane is not in that list and never will be: panes are mapped by
+  // the daemon's sweep, and this process has no such map. Unknown is the honest
+  // answer, and it is the one that leaves the row alone — a guard against a
+  // pane name reaching the registry, not something today's registry contains
+  // (`listener.ts`: the sweep never remembers panes), so the lines below that
+  // report it stay unprinted until that changes.
+  const liveness = (name: string): SessionLiveness => {
+    if (isSubagentSessionName(name)) return 'unknown';
+    return live.has(name) ? 'running' : 'ended';
+  };
+
+  const sweep = forgetEnded(liveness);
+  if (isJson) {
+    printJson(sweep);
+    return 0;
+  }
+  const { forgotten, scrollbackKept, kept, unreachable } = sweep;
+  for (const name of forgotten) {
+    const note = scrollbackKept.includes(name) ? ' — chat scrollback would not delete' : '';
+    console.log(`Forgot ${name}${note}`);
+  }
+  for (const name of unreachable) console.log(`Left ${name} alone — could not tell whether it is running`);
+  const tail = unreachable.length > 0 ? `, left ${unreachable.length} undecided` : '';
+  if (forgotten.length === 0) console.log(`Nothing to forget — ${kept.length} running${tail}`);
+  else console.log(`Forgot ${forgotten.length} ended session(s), kept ${kept.length} running${tail}`);
+  return 0;
 };
 
 /** Parse a gate count flag; garbage input falls back to the default (never accidentally silences). */
@@ -534,6 +645,8 @@ const main = async (): Promise<number> => {
       return handleDismiss(args);
     case 'rename':
       return handleRename(args);
+    case 'forget':
+      return handleForget(args);
     case 'test':
       return handleTest(args);
     case 'mcp':

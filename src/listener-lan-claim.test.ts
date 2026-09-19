@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { claimLanFile, gcAttachments, handlePush } from './listener.js';
+import { claimLanFile, displayFolder, gcAttachments, handlePush } from './listener.js';
 
 // The last step of a local transfer: the receiver left the decrypted file
 // in the landing zone, the push record arrives over the WebSocket, and the
@@ -79,14 +79,14 @@ describe('gcAttachments — landing zone', () => {
 
 describe('handlePush — lanDeliveredTo', () => {
     const deps = (claim: (f: { fileName: string; transferId?: string }) => Promise<string | null>) => {
-        const notes: { title: string; body: string }[] = [];
+        const notes: { title: string; body: string; reveal?: string }[] = [];
         return {
             notes,
             deps: {
                 deviceId: () => 'dev_me',
                 claimLanFile: claim,
                 saveFile: async () => { throw new Error('S3 must not be touched for a LAN file'); },
-                notify: async (n: { title: string; body: string }) => { notes.push(n); return true; },
+                notify: async (n: { title: string; body: string; reveal?: string }) => { notes.push(n); return true; },
             },
         };
     };
@@ -98,7 +98,13 @@ describe('handlePush — lanDeliveredTo', () => {
     it('delivered to this device: claims it, banner, true', async () => {
         const d = deps(async (f) => `/home/u/Downloads/Zeph/${f.fileName}`);
         expect(await handlePush(push('dev_me'), d.deps)).toBe(true);
-        expect(d.notes).toEqual([{ title: 'Zeph · big.mov', body: 'from [app] big.mov' }]);
+        // The banner says where the file is and a click can take you there:
+        // the title is the name it was saved under, the body the folder.
+        expect(d.notes).toEqual([{
+            title: 'Zeph · big.mov',
+            body: `from [app] big.mov · ${displayFolder('/home/u/Downloads/Zeph/big.mov')}`,
+            reveal: '/home/u/Downloads/Zeph/big.mov',
+        }]);
     });
 
     it('not in the landing zone (orphan swept, or duplicated push.new): logged, no banner, false', async () => {
@@ -117,5 +123,16 @@ describe('handlePush — lanDeliveredTo', () => {
     it('a claim that throws is logged and does not fail the push handler', async () => {
         const d = deps(async () => { throw new Error('EACCES'); });
         await expect(handlePush(push('dev_me'), d.deps)).resolves.toBe(false);
+    });
+});
+
+describe('displayFolder', () => {
+    it('shows the home prefix as ~', () => {
+        expect(displayFolder('/Users/me/Downloads/Zeph/a (2).txt', '/Users/me')).toBe('~/Downloads/Zeph');
+    });
+
+    it('leaves a folder outside home, or one that only shares its prefix, as it is', () => {
+        expect(displayFolder('/Volumes/x/a.txt', '/Users/me')).toBe('/Volumes/x');
+        expect(displayFolder('/Users/meg/a.txt', '/Users/me')).toBe('/Users/meg');
     });
 });

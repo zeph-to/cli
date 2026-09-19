@@ -151,7 +151,8 @@ garbage-collected — the user's folder, not the daemon's cache (that is `~/.zep
 `agent.command` only, 24 h sweep). Bytes stream S3 → `node:crypto` AES-256-GCM decrypt → disk
 (`file-crypto.ts` holds back the trailing 16-byte tag WebCrypto appends; same wire format as
 `libs/crypto` `encryptFile`); the per-file key comes out of this device's `deviceKeyMap` slot
-(`crypto.ts` `unwrapDeviceKey`). A banner (`osascript` / `notify-send` / none) names the file
-and the sender's push title. `handlePush` routes `type: 'file'` here before the `agent.command`
+(`crypto.ts` `unwrapDeviceKey`). A banner (`terminal-notifier` / `osascript` / `notify-send` / none) names the
+file as saved, the sender's push title and the folder (`~/Downloads/Zeph`); on macOS with
+`terminal-notifier`, a click reveals the file in Finder. `handlePush` routes `type: 'file'` here before the `agent.command`
 gates, which are unchanged; an attachment with `lanDeliveredTo` = this device is claimed from the
 Landing Zone instead of fetched.

@@ -592,6 +592,10 @@ zeph dismiss --all
 zeph rename "Prod deploy"
 zeph rename --clear                # reset to the default name
 
+# Drop an ended session from this machine's record (it leaves the app's past list)
+zeph forget zeph-myapp-20260914-PLAN-11-32-44-pi
+zeph forget --ended                # every session tmux no longer has
+
 # Test connection
 zeph test
 
@@ -623,6 +627,7 @@ zeph notify --title "Hello" --json
 | `list` | List recent push notifications |
 | `dismiss <id>` | Dismiss a push (or `--all`) |
 | `rename <name>` | Set the current agent session's display name in the app — run inside a `zeph cc` session (`--clear` resets). Auto-detects the tmux session + this machine's listener device id, so the alias lands on the right device |
+| `forget <session>` | Drop an ended session from this machine's record, so it leaves the app's past list (and the resume whitelist — the same thing deleting the row on the phone does). Refuses a session that is still running: kill it first. `--ended` forgets every remembered session tmux no longer has, which is what a machine that launches agents under a fresh name per task eventually needs |
 | `test` | Verify connection and API key |
 | `cc` · `codex` · `gemini` | Run the agent in a `zeph-<project>` tmux session — reattaches a detached session of that project (newest suffix first) when there is one, else auto-suffixes `-2`, `-3`, …. Auto-spawns the background listener on first invocation so the phone picker just works. Trailing args pass through to the agent (`zeph cc --resume "..."`). On node 22.15+ the wrapper hands its process to tmux rather than waiting on it, so a running session shows no `zeph cc` of its own in `ps` — older runtimes and Windows keep the waiting wrapper `--detach` / `--label <x>` (front of the args) create without attaching / pin the name — see "Run agents through the wrapper" above. |
 | `mcp` | Run the MCP server on stdio, in this process. What agent MCP configs launch — `zeph install` registers it and you never type it. Replaces the old `npx -y @zeph-to/mcp-server` registration, which left an `npm exec` launcher resident alongside the server for the life of the session. `@zeph-to/mcp-server` ships as a dependency now, so it updates with the CLI rather than being re-fetched by `npx` on every launch — `zeph check-update` reports the version you actually have |
@@ -661,7 +666,11 @@ which project + branch finished without writing per-IDE wrappers. Pass
 | `--no-keep-awake` | Don't hold the Mac awake on AC power (macOS). Lasting form: `"keepAwake": false` in `~/.zeph/config.json` |
 
 The listener reconnects with exponential backoff + jitter (1 s → 30 s
-cap). Heartbeat is ping every 25 s with a 10 s pong timeout. On an
+cap). It pings every 25 s and drops the socket after 30 s of total
+silence — any inbound frame counts, ack or pong. That 30 s is waived
+while the daemon's own event loop is blocked, because a thread that is
+not listening cannot tell a dead socket from its own deafness; 90 s of
+wall-clock silence terminates the socket either way. On an
 authentication failure close (4001/4002/4003) the listener exits with
 code 3 instead of looping forever — fix the key and restart.
 
@@ -678,7 +687,11 @@ taking the relay.
 `zeph notify --file`, the phone's share sheet) is saved to `~/Downloads/Zeph/`
 under its own name — `name (2).ext` when that name is taken, never
 overwritten, never cleaned up — and a desktop banner (`Zeph · <file>` over
-the push's title, e.g. `[myproject] shot.png`) says it landed. Encrypted
+the push's title and the folder, e.g. `[myproject] shot.png · ~/Downloads/Zeph`)
+says where it landed. The name in the banner is the one it was saved under, so
+a `(2)` shows up there. With [`terminal-notifier`](https://github.com/julienXX/terminal-notifier)
+installed (`brew install terminal-notifier`), clicking the banner reveals the
+file in Finder; the plain macOS banner has no click action. Encrypted
 files are opened with this machine's own device key on the way down; nothing
 is buffered, so a 1 GB recording streams straight to disk. `agent.command`
 attachments are unaffected: they still go to `~/.zeph/attachments/<pushId>/`

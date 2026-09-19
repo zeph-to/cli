@@ -26,8 +26,16 @@ const inThread = () => IN_THREAD as never;
 /** Long enough for a worker to boot, short enough to not stall the suite. */
 const TIMEOUT = 300;
 
-const degraded = (log: ReturnType<typeof vi.fn>): boolean =>
+/**
+ * The two degraded states this module now distinguishes, and the reason they
+ * get separate matchers: a helper matching both would pass whether the give-up
+ * were a cooldown or permanent, which is the whole difference.
+ */
+const gaveUp = (log: ReturnType<typeof vi.fn>): boolean =>
     log.mock.calls.some((c) => /in-thread from now on/.test(String(c[0])));
+const cooledDown = (log: ReturnType<typeof vi.fn>): boolean =>
+    log.mock.calls.some((c) => /in-thread for \d+ ?(min|s)/.test(String(c[0])));
+const degraded = (log: ReturnType<typeof vi.fn>): boolean => gaveUp(log) || cooledDown(log);
 
 describe('inventory offload — a timed-out worker is not a failed worker', () => {
     it('keeps using workers after a sweep times out and the next one starts', async () => {
@@ -57,7 +65,7 @@ describe('inventory offload — a timed-out worker is not a failed worker', () =
         const offload = startInventoryOffload(inThread, log, join(FIXTURES, 'dies.cjs'), TIMEOUT);
         try {
             expect(await offload.collect()).toBe(IN_THREAD);
-            expect(degraded(log)).toBe(true);
+            expect(gaveUp(log)).toBe(true);
         } finally {
             offload.close();
         }
@@ -108,7 +116,10 @@ describe('inventory offload — repeated timeouts degrade on purpose', () => {
             }
             // The daemon reports again from here, slowly, instead of not at all.
             expect(await offload.collect()).toBe(IN_THREAD);
-            expect(degraded(log)).toBe(true);
+            // A cooldown, not a verdict: timing out is a statement about the
+            // host right now, and the host is allowed to get better.
+            expect(cooledDown(log)).toBe(true);
+            expect(gaveUp(log)).toBe(false);
             expect(log.mock.calls.some((c) => /timed out/.test(String(c[0])))).toBe(true);
         } finally {
             offload.close();
@@ -139,6 +150,57 @@ describe('inventory offload — repeated timeouts degrade on purpose', () => {
             offload.close();
             delete process.env.ZEPH_TEST_MARKER;
             rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    /**
+     * The give-up is a cooldown, not a verdict. A load spike long enough to
+     * overrun three sweeps used to cost the offload for the life of the daemon,
+     * which put the blocking sweep back on the event loop the worker exists to
+     * protect — measured 2026-09-18 as a 5 s timer firing at a median of 28.5 s
+     * and a WebSocket torn down every 1-3 minutes.
+     */
+    it('goes back to the worker once the cooldown passes', async () => {
+        const log = vi.fn();
+        const dir = mkdtempSync(join(tmpdir(), 'zeph-offload-'));
+        const marker = join(dir, 'answer');
+        process.env.ZEPH_TEST_MARKER = marker;
+        const cooldown = 150;
+        const offload = startInventoryOffload(inThread, log, join(FIXTURES, 'marker.cjs'), TIMEOUT, cooldown);
+        try {
+            for (let i = 0; i < MAX_CONSECUTIVE_TIMEOUTS; i++) {
+                await expect(offload.collect()).rejects.toThrow(/exceeded/);
+            }
+            expect(await offload.collect()).toBe(IN_THREAD);
+            expect(cooledDown(log)).toBe(true);
+            // The spike passes. So must the give-up.
+            writeFileSync(marker, '');
+            await new Promise((resolve) => setTimeout(resolve, cooldown + 50));
+            expect((await offload.collect()).sessions.map((s) => s.name)).toEqual(['zeph-from-worker']);
+        } finally {
+            offload.close();
+            delete process.env.ZEPH_TEST_MARKER;
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it('re-enters the cooldown on one timeout while the host is still slow', async () => {
+        const log = vi.fn();
+        const cooldown = 150;
+        const offload = startInventoryOffload(inThread, log, join(FIXTURES, 'hangs.cjs'), TIMEOUT, cooldown);
+        try {
+            for (let i = 0; i < MAX_CONSECUTIVE_TIMEOUTS; i++) {
+                await expect(offload.collect()).rejects.toThrow(/exceeded/);
+            }
+            expect(await offload.collect()).toBe(IN_THREAD);
+            await new Promise((resolve) => setTimeout(resolve, cooldown + 50));
+            // One probe sweep is the whole price of finding out. Spending three
+            // again would be three full timeouts with no inventory at all, on a
+            // host that has already shown it cannot finish one.
+            await expect(offload.collect()).rejects.toThrow(/exceeded/);
+            expect(await offload.collect()).toBe(IN_THREAD);
+        } finally {
+            offload.close();
         }
     });
 });
