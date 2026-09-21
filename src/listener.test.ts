@@ -138,6 +138,24 @@ describe('handlePush', () => {
         expect(injected).toBe(false);
     });
 
+    // Two of one user's machines routinely run a session with the same tmux
+    // name (same project checked out on both). push.new fans out to every
+    // listener, so a command addressed to the other machine must not be typed
+    // into this machine's same-named session.
+    it('ignores an agent.command addressed to another device', async () => {
+        let injected = false;
+        const ok = await handlePush(
+            agentCmd({ targetDeviceId: 'dev_listener_other' }),
+            baseDeps({
+                deviceId: () => 'dev_listener_me',
+                paneCommand: () => 'claude',
+                inject: () => { injected = true; return true; },
+            }),
+        );
+        expect(ok).toBe(false);
+        expect(injected).toBe(false);
+    });
+
     it('injects when session exists and pane runs an agent', async () => {
         let calledWith: { session: string; text: string } | null = null;
         const ok = await handlePush(

@@ -4347,6 +4347,12 @@ export const handlePush = async (
         return false;
     }
     if (push.type !== 'agent.command' || !push.agentSessionName) return false;
+    // push.new fans out to every listener of the user, and two of their
+    // machines routinely run a session with the same tmux name (same project
+    // checked out on both). Only the addressed machine types the command;
+    // the other would otherwise inject it into its own same-named session.
+    const me = deps.deviceId?.() ?? computeListenerDeviceId();
+    if (push.targetDeviceId && push.targetDeviceId !== me) return false;
 
     // Key event (Esc / arrows / Enter) — no body, no attachments. Lets the
     // phone escape a full-screen modal (e.g. after `/usage`) that swallows
