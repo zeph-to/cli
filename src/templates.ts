@@ -45,7 +45,7 @@ import { ZEPH_CORE_HOOK_DRIVEN, ZEPH_CORE_RULE_ONLY } from './zeph-core.generate
 //
 // `--auto` applies the shared push-gate before sending (see src/gate.ts):
 // a caller that names no turn counts still pushes (gate defaults assume real
-// work), and the /zeph-quiet | /zeph-loud dial works for every hook-driven
+// work), and the /zeph-mode quiet | /zeph-mode loud dial works for every hook-driven
 // agent. The two drop-in artifacts do name counts — see `turnFacts` below.
 //
 // `--pushmode-default normal` is what keeps the first half of that true. The
@@ -53,7 +53,7 @@ import { ZEPH_CORE_HOOK_DRIVEN, ZEPH_CORE_RULE_ONLY } from './zeph-core.generate
 // `high` Push Signal marker through — a marker these hooks have no way to
 // emit — or a turn the user was away for (presence.ts). Without the flag they
 // would install and then stay silent whenever the user is at the terminal.
-// The user's own dial still outranks it, so /zeph-quiet keeps working here.
+// The user's own dial still outranks it, so /zeph-mode quiet keeps working here.
 //
 // Older installed `zeph` versions parse both flags as unknown booleans and
 // ignore them — graceful backward compatibility, and for `--pushmode-default`

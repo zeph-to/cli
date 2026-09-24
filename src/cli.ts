@@ -145,11 +145,11 @@ Notify options:
   --device <id>      Target device ID
   --session <id>     AI session ID (or set ZEPH_SESSION_ID env)
   --auto             Apply the push gate before sending (honors the
-                     /zeph-quiet | /zeph-loud dial; silent exit when gated)
+                     /zeph-mode quiet|loud dial; silent exit when gated)
   --pushmode-default <m>
                      Mode --auto assumes when the project has no dial
                      (quiet|normal|loud) [default: quiet]. A dial set with
-                     /zeph-quiet | /zeph-loud | /zeph-normal always wins
+                     /zeph-mode quiet|normal|loud always wins
   --marker <m>       Push Signal marker for --auto (skip|push|high)
   --tools <n>        Turn tool count for --auto [default: assume real work]
   --nonreadonly <n>  Non-read-only tool count for --auto
@@ -417,7 +417,7 @@ const handleNotify = async (args: Record<string, string | boolean>): Promise<num
 
   // --auto: apply the shared push-gate before sending. Inputs default to
   // GATE_DEFAULTS ("assume real work") so dumb hooks keep their historical
-  // always-push behavior in normal mode, while the /zeph-quiet | /zeph-loud
+  // always-push behavior in normal mode, while the /zeph-mode quiet | /zeph-mode loud
   // dial now works for every hook-driven agent. Gated-out → silent success.
   // With no dial the mode falls back to --pushmode-default, then to quiet.
   // Quiet still pushes when the user has left the terminal (presence.ts).
