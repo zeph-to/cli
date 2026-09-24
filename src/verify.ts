@@ -199,7 +199,7 @@ export const handleVerify = async (args: Record<string, string | boolean>): Prom
     record(apiKey ? 'ZEPH_API_KEY is set' : 'ZEPH_API_KEY not set (env or ~/.zeph/config.json)',
         apiKey ? 'pass' : 'fail');
     record(hookId
-        ? 'ZEPH_HOOK_ID is set (two-way zeph_ask/prompt/input enabled)'
+        ? 'ZEPH_HOOK_ID is set (two-way zeph_ask enabled)'
         : 'ZEPH_HOOK_ID not set (notify-only — set it for remote control)',
         hookId ? 'pass' : 'warn');
 

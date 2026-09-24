@@ -31,7 +31,7 @@ export interface GateInput {
   toolCount: number;
   /** Tools that are NOT read-only (Read/Grep/Glob). */
   nonReadonlyCount: number;
-  /** A zeph_ask/zeph_prompt already notified this turn. */
+  /** A zeph_ask already notified this turn. */
   alreadyAsked: boolean;
   marker: GateMarker;
   pushMode: GatePushMode;
@@ -111,7 +111,7 @@ const ownedByCurrentUser = (path: string): boolean => {
 /**
  * Resolve a state file: current location first, then user-owned legacy /tmp,
  * then — for `pushmode` only — the machine-wide default written by
- * `/zeph-quiet --global`. Mirrors plugin/hooks/gate.sh zeph_state_present,
+ * `/zeph-mode quiet --global`. Mirrors plugin/hooks/gate.sh zeph_state_present,
  * including the deliberate absence of a global mute (see the comment there).
  */
 const findStateFile = (kind: 'muted' | 'pushmode', hash: string): string | null => {
@@ -245,7 +245,7 @@ export const clearRemoteActive = (dir: string): void => {
   }
 };
 
-/** True when the user ran /zeph-mute for this project. */
+/** True when the user ran /zeph-mode mute for this project. */
 export const isMuted = (dir: string): boolean => {
   const hash = projectHash(dir);
   return hash !== null && findStateFile('muted', hash) !== null;
@@ -277,7 +277,7 @@ export const TOOL_COUNT_FLAG = 'tools';
 export const NONREADONLY_COUNT_FLAG = 'nonreadonly';
 
 /**
- * The user's session push-mode dial (/zeph-quiet | /zeph-loud | /zeph-normal).
+ * The user's session push-mode dial (/zeph-mode quiet | /zeph-mode loud | /zeph-mode normal).
  *
  * Three failure shapes, three answers — "no dial" is the only one that gets
  * the quiet default:
@@ -312,7 +312,7 @@ export const readPushMode = (
  *
  * The dial outranks the flag deliberately. The flag exists so an agent whose
  * hook cannot participate in the heuristic still pushes out of the box; if it
- * outranked the dial, `/zeph-quiet` would silently do nothing for that agent.
+ * outranked the dial, `/zeph-mode quiet` would silently do nothing for that agent.
  *
  * A flag value that isn't one of the three modes resolves to `normal`, not to
  * the quiet default — same rule as a garbled dial file. A caller that passes

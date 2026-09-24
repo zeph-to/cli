@@ -51,9 +51,9 @@ agent — `zeph cc` is the phone-control bridge, not the notification
 switch. In Claude Code the routine per-turn push starts off (`quiet` is
 the default) — while you're at the terminal; once you've stepped away, a
 finished turn still pushes ([Quiet while away](#quiet-while-away)).
-`/zeph-normal` turns it on for a project, `/zeph-loud`
-pushes on every turn, `/zeph-mute` silences a project entirely, and
-`/zeph-status` shows what's in effect. See
+`/zeph-mode normal` turns it on for a project, `/zeph-mode loud`
+pushes on every turn, `/zeph-mode mute` silences a project entirely, and
+`/zeph-mode` shows what's in effect. See
 [Mute & push mode](#mute--push-mode).
 
 `~/.zeph/config.json` is the single source of truth — the CLI, the MCP
@@ -97,7 +97,7 @@ To **drive an agent session from your phone**, see
   <img src="https://zeph.to/readme/ask-phone.png" alt="A Zeph hook on the phone: a question with tappable answer buttons and a text field" width="300">
 </p>
 
-The MCP tools `zeph_ask` / `zeph_prompt` / `zeph_input` wait on a fixed
+The MCP tool `zeph_ask` waits on a fixed
 timeout (120–600 s). Once that window closes the
 session becomes unaddressable from the phone, even though it's still
 running. The `zeph listener` daemon fixes this by keeping a persistent
@@ -645,7 +645,7 @@ zeph notify --title "Hello" --json
 | `--priority <p>` | Priority: `low`, `normal`, `high`, `urgent` |
 | `--device <id>` | Target device ID |
 | `--session <id>` | AI session ID so the push threads into that session's chat (or `ZEPH_SESSION_ID` env) |
-| `--auto` | Apply the push gate before sending — honors the `/zeph-quiet` / `/zeph-loud` push-mode dial, per project or machine-wide (`--global`); gated-out exits silently with code 0 |
+| `--auto` | Apply the push gate before sending — honors the `/zeph-mode quiet` / `/zeph-mode loud` push-mode dial, per project or machine-wide (`--global`); gated-out exits silently with code 0 |
 | `--pushmode-default <m>` | Mode `--auto` assumes when the project has no dial: `quiet` (built-in), `normal`, `loud`. A dial the user set always wins |
 | `--marker <m>` | Push Signal marker for `--auto`: `skip`, `push`, `high` |
 | `--tools <n>`, `--nonreadonly <n>` | Turn tool counts feeding `--auto`'s heuristic (defaults assume real work) |
@@ -733,7 +733,7 @@ a time, 1 GB each at most.
 
 Both live as state files under `${XDG_STATE_HOME:-~/.local/state}/zeph`,
 keyed by a `cksum` hash of the project directory. Claude Code's
-`/zeph-mute` / `/zeph-quiet` / `/zeph-loud` / `/zeph-normal` write them;
+`/zeph-mode mute` / `/zeph-mode quiet` / `/zeph-mode loud` / `/zeph-mode normal` write them;
 the CLI reads them (mute on every `notify`, push mode on `--auto`).
 
 Notifications are silently skipped when a mute file exists for the
@@ -743,7 +743,7 @@ current project:
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/zeph"
 HASH=$(printf '%s' "$PROJECT_DIR" | cksum | cut -d' ' -f1)
 
-# Mute (created by /zeph-mute in the Claude Code plugin)
+# Mute (created by /zeph-mode mute in the Claude Code plugin)
 mkdir -p "$STATE_DIR" && touch "$STATE_DIR/muted-$HASH"
 
 # Unmute
@@ -755,7 +755,7 @@ this order — first hit wins:
 
 | Order | File | Set by |
 |-------|------|--------|
-| 1 | `$STATE_DIR/pushmode-<hash>` | `/zeph-quiet` · `/zeph-loud` · `/zeph-normal` |
+| 1 | `$STATE_DIR/pushmode-<hash>` | `/zeph-mode quiet` · `/zeph-mode loud` · `/zeph-mode normal` |
 | 2 | `/tmp/zeph-pushmode-<hash>` | older versions (honored only when you own the file) |
 | 3 | `$STATE_DIR/pushmode-default` | the `--global` form of any dial — the machine-wide default |
 | 4 | `--pushmode-default <mode>` | the calling hook (the installed ones pass `normal`) |
@@ -763,7 +763,7 @@ this order — first hit wins:
 
 **Row 5 changed**: an install with no dial anywhere used to be `normal`.
 It is now `quiet`, so upgrading turns the routine per-turn push off until
-you run `/zeph-normal`. Row 4 is why the hooks this CLI installs are
+you run `/zeph-mode normal`. Row 4 is why the hooks this CLI installs are
 unaffected: they name `normal` themselves, since a hook that supplies no
 `high` marker would be silent under `quiet` whenever you're at the terminal,
 rather than merely quieter. Row 4 sits *below* the state files on purpose — the flag
@@ -775,13 +775,13 @@ work. The Pi extension and the OpenCode plugin do see those events, so
 they pass real `--tools` / `--nonreadonly` counts and go quiet where the
 others cannot: a turn with no tool calls, a turn with exactly one (a
 lone edit included — the gate wants two), and a turn whose calls were
-all reads. `/zeph-loud` still pushes on all of them.
+all reads. `/zeph-mode loud` still pushes on all of them.
 
 The Pi extension also pushes when pi is **waiting on you**: any blocking
 extension dialog — a bash guard's Run/Abort, an ask-user tool, a
 `ctx.ui.confirm` — that is still open 10 seconds after it appeared sends a
 `high` push ("pi asks: <project>", body = the dialog title or the guarded
-bash command). `high` gets through `quiet`; only `/zeph-mute` stops it.
+bash command). `high` gets through `quiet`; only `/zeph-mode mute` stops it.
 Answering inside the 10 seconds sends nothing. It is the pi twin of the
 Claude Code plugin's AskUserQuestion push, driven by pi's
 `ui_prompt_start` / `ui_prompt_end` events. Only dialogs that open while a

@@ -491,7 +491,7 @@ const collectCredentials = async (
 
   // headless / timeout → manual paste
   const apiKey = (await promptInput('  API Key (from app > Settings > API Keys): ')) || undefined;
-  const hookInput = await promptInput('  Hook ID (optional, for prompt/input): ');
+  const hookInput = await promptInput('  Hook ID (optional, for zeph_ask): ');
   return { apiKey, hookId: hookInput || undefined, baseUrl: existing.baseUrl };
 };
 
@@ -680,9 +680,9 @@ export const handleInstall = async (args: Record<string, string | boolean>): Pro
   console.log('  In Claude Code the default is QUIET: you get pushed when the agent');
   console.log('  asks you something and when a session finishes, not on every turn.');
   console.log('  Dial it any time:');
-  console.log('    /zeph-normal           push on every turn that did real work');
-  console.log('    /zeph-loud             push on every turn');
-  console.log('    /zeph-mute             full silence, current project');
-  console.log('    /zeph-status           show what is in effect\n');
+  console.log('    /zeph-mode normal      push on every turn that did real work');
+  console.log('    /zeph-mode loud        push on every turn');
+  console.log('    /zeph-mode mute        full silence, current project');
+  console.log('    /zeph-mode             show what is in effect\n');
   return 0;
 };

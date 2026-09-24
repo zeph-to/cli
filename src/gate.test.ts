@@ -215,7 +215,7 @@ describe('gate.ts: project state helpers', () => {
 
     it("autoPushMode lets the user's dial beat the flag", () => {
         // The whole priority rule: the flag only names a default. A dial is an
-        // expression of intent and always wins, or /zeph-quiet would be a lie
+        // expression of intent and always wins, or /zeph-mode quiet would be a lie
         // for every hook-driven agent.
         writeFileSync(join(TMP, 'state', 'zeph', `pushmode-${projectHash(TMP)}`), 'quiet');
         expect(autoPushMode(TMP, 'loud')).toBe('quiet');

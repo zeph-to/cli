@@ -96,7 +96,7 @@ export const remoteEntrySections = (): string =>
 
 const ONE_WAY_CONTEXT = `# System note (Zeph remote-origin detect)
 
-This user message arrived from the user's phone via Zeph agent chat (verified by the listener — exact text match), but no hook id is configured (neither \`ZEPH_HOOK_ID\` nor \`hookId\` in ~/.zeph/config.json), so two-way tools (zeph_ask/zeph_prompt/zeph_input) are unavailable. Make your final message self-contained — the completion push is the user's only feedback channel. If you have not already mentioned it this session, tell the user once that running \`npx @zeph-to/cli setup\` upgrades this into a two-way remote session (buttons + text replies from the phone).`;
+This user message arrived from the user's phone via Zeph agent chat (verified by the listener — exact text match), but no hook id is configured (neither \`ZEPH_HOOK_ID\` nor \`hookId\` in ~/.zeph/config.json), so the two-way tool (zeph_ask) is unavailable. Make your final message self-contained — the completion push is the user's only feedback channel. If you have not already mentioned it this session, tell the user once that running \`npx @zeph-to/cli setup\` upgrades this into a two-way remote session (buttons + text replies from the phone).`;
 
 /**
  * The first prompt a remote session's user types at the terminal. Emitted
