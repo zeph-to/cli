@@ -784,10 +784,24 @@ const findTmuxSocket = (): string | null => {
         log(`tmux: ZEPH_TMUX_SOCKET=${override} probe failed, falling back to auto-discovery`);
     }
 
+    // Default first — succeeds when the shell that launched us shares
+    // tmux's view, and costs one tmux call. It must run before the scans
+    // below: `findTmuxViaProcess` runs one `lsof` per tmux process (every
+    // `tmux new -A` client, not just the server), which took 11–19s+ with 14
+    // sessions on a loaded daemon — longer than a fresh inventory worker's
+    // whole 20s budget.
+    if (probeTmuxSocket(null)) {
+        cachedSocketPath = null; // null means "use default"
+        cacheValid = true;
+        if (!warnedNoServer) log('tmux: default socket OK');
+        warnedNoServer = false;
+        return null;
+    }
+
     const uid = userInfo().uid;
     const candidates: string[] = [];
 
-    // Process-based discovery first — it's the only path that handles
+    // Process-based discovery next — it's the only path that handles
     // stale-socket-file cases (macOS /tmp cleanup) and unusual socket
     // locations the heuristic walks would miss.
     candidates.push(...findTmuxViaProcess());
@@ -803,17 +817,6 @@ const findTmuxSocket = (): string | null => {
 
     const seen = new Set<string>();
     const unique = candidates.filter((p) => (seen.has(p) ? false : (seen.add(p), true)));
-
-    // Default first — succeeds when the shell that launched us shares
-    // tmux's view. We deliberately don't cache this success; on the
-    // first call though it's enough.
-    if (probeTmuxSocket(null)) {
-        cachedSocketPath = null; // null means "use default"
-        cacheValid = true;
-        if (!warnedNoServer) log('tmux: default socket OK');
-        warnedNoServer = false;
-        return null;
-    }
 
     for (const path of unique) {
         if (!existsSync(path)) continue;
