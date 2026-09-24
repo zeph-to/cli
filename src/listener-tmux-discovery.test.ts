@@ -11,6 +11,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // phone to sit on "Waiting for the live stream…".
 let defaultSocketUp = true;
 let customSocket = '';
+let namedSocket = '';
+let deadSocket = '';
+const liveSockets = new Set<string>();
 const spawnCalls: { cmd: string; args: string[] }[] = [];
 vi.mock('child_process', async (importOriginal) => {
     const actual = await importOriginal<typeof import('child_process')>();
@@ -19,7 +22,7 @@ vi.mock('child_process', async (importOriginal) => {
         spawnSync: (cmd: string, args: string[]) => {
             spawnCalls.push({ cmd, args });
             if (cmd === 'tmux' && args[0] === '-S' && args[2] === 'list-sessions') {
-                return { status: args[1] === customSocket ? 0 : 1, stdout: '', stderr: '' };
+                return { status: liveSockets.has(args[1]) ? 0 : 1, stdout: '', stderr: '' };
             }
             if (cmd === 'tmux' && args[0] === 'list-sessions') {
                 return defaultSocketUp
@@ -27,9 +30,18 @@ vi.mock('child_process', async (importOriginal) => {
                     : { status: 1, stdout: '', stderr: 'no server running' };
             }
             if (cmd === 'ps' && args[0] === '-A') {
-                return { status: 0, stdout: `  4242 ${userInfo().username} tmux new -A -s zeph-a claude\n`, stderr: '' };
+                const me = userInfo().username;
+                return {
+                    status: 0,
+                    stdout: [4242, 4243, 4244].map((pid) => `  ${pid} ${me} tmux new -A -s zeph-${pid} claude\n`).join(''),
+                    stderr: '',
+                };
             }
-            if (cmd === 'lsof') return { status: 0, stdout: `p4242\nn${customSocket}\n`, stderr: '' };
+            if (cmd === 'lsof') {
+                // Each tmux process holds its own socket; the first one's is dead.
+                const socket = args[1] === '4242' ? deadSocket : customSocket;
+                return { status: 0, stdout: `p${args[1]}\nn${socket}\n`, stderr: '' };
+            }
             return { status: 1, stdout: '', stderr: 'no server' };
         },
     };
@@ -42,6 +54,13 @@ process.env.XDG_STATE_HOME = join(TMP, 'state');
 mkdirSync(join(TMP, `tmux-${userInfo().uid}`));
 customSocket = join(TMP, `tmux-${userInfo().uid}`, 'custom');
 writeFileSync(customSocket, '');
+deadSocket = join(TMP, `tmux-${userInfo().uid}`, 'dead');
+writeFileSync(deadSocket, '');
+// Where `tmux -L work` puts its socket: beside `default` in the per-user dir.
+process.env.TMUX_TMPDIR = join(TMP, 'tmpdir');
+mkdirSync(join(TMP, 'tmpdir', `tmux-${userInfo().uid}`), { recursive: true });
+namedSocket = join(TMP, 'tmpdir', `tmux-${userInfo().uid}`, 'work');
+writeFileSync(namedSocket, '');
 
 const { collectSessionsVerbose, invalidateTmuxSocketCache } = await import('./listener.js');
 
@@ -51,6 +70,7 @@ const listPanes = () => spawnCalls.find((c) => c.cmd === 'tmux' && c.args.includ
 describe('tmux socket discovery', () => {
     beforeEach(() => {
         spawnCalls.length = 0;
+        liveSockets.clear();
         invalidateTmuxSocketCache();
     });
 
@@ -62,10 +82,21 @@ describe('tmux socket discovery', () => {
         expect(listPanes()?.args[0]).toBe('list-panes');
     });
 
-    it('still falls back to process discovery when the default socket is down', () => {
+    it('finds a `tmux -L` socket from the socket dir without scanning processes', () => {
         defaultSocketUp = false;
+        liveSockets.add(namedSocket);
         collectSessionsVerbose();
-        expect(calls('lsof')).toBe(1);
+        expect(calls('lsof')).toBe(0);
+        expect(listPanes()?.args.slice(0, 2)).toEqual(['-S', namedSocket]);
+    });
+
+    it('falls back to process discovery last, stopping at the first live socket', () => {
+        defaultSocketUp = false;
+        liveSockets.add(customSocket);
+        collectSessionsVerbose();
+        // Three tmux processes: the first socket is dead, the second answers,
+        // so the third is never scanned.
+        expect(calls('lsof')).toBe(2);
         expect(listPanes()?.args.slice(0, 2)).toEqual(['-S', customSocket]);
     });
 });

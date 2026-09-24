@@ -489,10 +489,12 @@ You'll get the same logs you'd otherwise tail from `listener.log`.
 ### Custom tmux sockets
 
 The listener auto-discovers the tmux socket — it probes the default
-socket first and stops there when it answers. Only when it does not, it
-asks `lsof` which socket each running tmux process holds (so stale socket
-files don't trip discovery), then walks per-user `$TMPDIR` paths (macOS
-`/var/folders/.../T/`) and `/tmp/tmux-<uid>/`. If your tmux
+socket first and stops there when it answers. Otherwise it probes every
+socket file in the per-user `tmux-<uid>/` dirs (`$TMUX_TMPDIR`/`$TMPDIR`,
+macOS `/var/folders/.../T/`, `/tmp/`), which is where `tmux -L <name>`
+puts its socket. Only when none answers does it ask `lsof` which socket
+each running tmux process holds — the slow path, which also covers a
+`-S` path outside those dirs. If your tmux
 uses `tmux -L <name>` or a non-standard `-S <path>`, set the override
 explicitly:
 
