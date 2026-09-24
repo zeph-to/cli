@@ -326,7 +326,14 @@ const readPsSnapshot = ttlMemo(SNAPSHOT_TTL_MS, (): ProcTable | null => {
     // pgid/tpgid/comm ride along for the subagent detection (foreground
     // process group), so the extra panes cost zero new spawns — one `ps`
     // per report cycle is still the whole table (KB precedent).
-    const r = spawnSync('ps', ['-axo', 'pid=,ppid=,pgid=,tpgid=,lstart=,comm='], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+    // LC_ALL=C pins lstart to the 5-token English form parseProcTable cuts on:
+    // under ko_KR it came out as 4 or 7 tokens, the comm was misread, and no pi
+    // subagent pane was ever reported.
+    const r = spawnSync('ps', ['-axo', 'pid=,ppid=,pgid=,tpgid=,lstart=,comm='], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        env: { ...process.env, LC_ALL: 'C' },
+    });
     return r.status === 0 ? parseProcTable(r.stdout ?? '') : null;
 });
 
