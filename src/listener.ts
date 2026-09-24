@@ -689,13 +689,17 @@ const listSocketsIn = (dir: string): string[] => {
  * the path — but for now we only return paths that still exist on disk
  * so tmux's connect logic isn't confused. If the path is gone, the user
  * has to `tmux kill-server` + restart anyway.
+ *
+ * Returns the first path `isLive` accepts, and stops there: every tmux
+ * process — each `tmux new -A` client, not only the server — costs one
+ * `lsof`, seconds apiece on a loaded daemon.
  */
-const findTmuxViaProcess = (): string[] => {
+const findTmuxViaProcess = (isLive: (path: string) => boolean): string | undefined => {
     const username = userInfo().username;
     const ps = spawnSync('ps', ['-A', '-o', 'pid=,user=,command='], {
         encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'],
     });
-    if (ps.status !== 0) return [];
+    if (ps.status !== 0) return undefined;
 
     const tmuxPids: string[] = [];
     for (const line of (ps.stdout ?? '').split('\n')) {
@@ -709,9 +713,6 @@ const findTmuxViaProcess = (): string[] => {
         if (!/(^|[^\w-])tmux($|[:\s])/.test(cmd)) continue;
         tmuxPids.push(pid);
     }
-    if (tmuxPids.length === 0) return [];
-
-    const found = new Set<string>();
     for (const pid of tmuxPids) {
         const lsof = spawnSync('lsof', ['-p', pid, '-Fn'], {
             encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'],
@@ -723,11 +724,11 @@ const findTmuxViaProcess = (): string[] => {
             if (!lline.startsWith('n')) continue;
             const path = lline.slice(1);
             if (!/\/tmux-\d+\//.test(path)) continue;
-            if (path.endsWith(' (deleted)') || path.includes('(deleted)')) continue;
-            if (existsSync(path)) found.add(path);
+            if (path.includes('(deleted)')) continue;
+            if (isLive(path)) return path;
         }
     }
-    return [...found];
+    return undefined;
 };
 
 /** Walk `/var/folders` for user-owned `tmux-<uid>/*` socket files. Each
@@ -786,7 +787,7 @@ const findTmuxSocket = (): string | null => {
 
     // Default first — succeeds when the shell that launched us shares
     // tmux's view, and costs one tmux call. It must run before the scans
-    // below: `findTmuxViaProcess` runs one `lsof` per tmux process (every
+    // below: `findTmuxViaProcess` runs up to one `lsof` per tmux process (every
     // `tmux new -A` client, not just the server), which took 11–19s+ with 14
     // sessions on a loaded daemon — longer than a fresh inventory worker's
     // whole 20s budget.
@@ -799,35 +800,34 @@ const findTmuxSocket = (): string | null => {
     }
 
     const uid = userInfo().uid;
-    const candidates: string[] = [];
+    const probed = new Set<string>();
+    const isLive = (path: string): boolean => {
+        if (probed.has(path)) return false;
+        probed.add(path);
+        return existsSync(path) && probeTmuxSocket(path);
+    };
 
-    // Process-based discovery next — it's the only path that handles
-    // stale-socket-file cases (macOS /tmp cleanup) and unusual socket
-    // locations the heuristic walks would miss.
-    candidates.push(...findTmuxViaProcess());
-
-    // Include every socket file we find in any `tmux-<uid>/` dir — the
-    // user might have `-L <name>` configured rather than the default
-    // socket name.
+    // Every socket file in any `tmux-<uid>/` dir next — `tmux -L <name>`
+    // puts its socket beside `default`, so one probe per file finds it.
     const envDir = process.env.TMUX_TMPDIR || process.env.TMPDIR;
-    if (envDir) candidates.push(...listSocketsIn(`${envDir.replace(/\/+$/, '')}/tmux-${uid}`));
-    candidates.push(...walkVarFolders(uid));
-    candidates.push(...listSocketsIn(`/tmp/tmux-${uid}`));
-    candidates.push(...listSocketsIn(`/private/tmp/tmux-${uid}`));
+    const files = [
+        ...(envDir ? listSocketsIn(`${envDir.replace(/\/+$/, '')}/tmux-${uid}`) : []),
+        ...walkVarFolders(uid),
+        ...listSocketsIn(`/tmp/tmux-${uid}`),
+        ...listSocketsIn(`/private/tmp/tmux-${uid}`),
+    ];
 
-    const seen = new Set<string>();
-    const unique = candidates.filter((p) => (seen.has(p) ? false : (seen.add(p), true)));
-
-    for (const path of unique) {
-        if (!existsSync(path)) continue;
-        if (probeTmuxSocket(path)) {
-            cachedSocketPath = path;
-            cacheValid = true;
-            log(`tmux socket → ${path}`);
-            warnedNoServer = false;
-            return path;
-        }
+    // Process-based discovery last — it is the only path that finds a `-S`
+    // path the walks never look in, but it is also the one that costs seconds.
+    const live = files.find(isLive) ?? findTmuxViaProcess(isLive);
+    if (live) {
+        cachedSocketPath = live;
+        cacheValid = true;
+        log(`tmux socket → ${live}`);
+        warnedNoServer = false;
+        return live;
     }
+    const unique = [...probed];
 
     // No live tmux yet. Log the full probe report once, then stay quiet
     // until something works — otherwise the user gets a 4-line dump
