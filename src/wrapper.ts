@@ -13,7 +13,7 @@ import { execFileSync, spawn, spawnSync } from 'child_process';
 import { basename } from 'path';
 import { resolveCommand } from './agents.js';
 import { isNewer } from './check-update.js';
-import { PROJECT_DIR_ENV_VARS, resolvedEnv, VERSION } from './config.js';
+import { checkoutOf, groupOf, PROJECT_DIR_ENV_VARS, resolvedEnv, SESSION_LABEL_OPTION, SESSION_PROJECT_OPTION, VERSION } from './config.js';
 import {
     LISTENER_LOG_FILE,
     runningListenerPid,
@@ -48,6 +48,23 @@ export const detectProjectDir = (): string => {
 
 /** Resolve a project name for the tmux session: env > git root > cwd basename. */
 export const detectProjectName = (): string => safeBasename(detectProjectDir());
+
+/**
+ * tmux commands, chained after `new`, that tell the listener which project
+ * the session belongs to when its name does not say so: a `--label` tail and a
+ * worktree's directory name both read as part of the project otherwise, and
+ * each opened a card of its own. Nothing when the name already says it all, so
+ * a plain family session is reported exactly as before. The rule is config
+ * `groupOf`, which the listener also applies to sessions started without these.
+ */
+export const sessionSidecarArgs = (session: string, projectDir: string, label?: string): string[] => {
+    const checkout = checkoutOf(projectDir);
+    const group = label
+        ? { project: checkout?.key ?? safeBasename(projectDir), label }
+        : groupOf(session.slice('zeph-'.length), checkout);
+    if (!group) return [];
+    return [';', 'set-option', SESSION_PROJECT_OPTION, group.project, ';', 'set-option', SESSION_LABEL_OPTION, group.label];
+};
 
 /** `zeph-<project>` — the canonical tmux session base name. */
 export const tmuxSessionName = (project: string): string => `zeph-${project}`;
@@ -274,11 +291,12 @@ export const targetForAgent = (
     // runs there. `-c`: the agent's cwd must be the directory the session is
     // NAMED for — a launcher sitting in a subdirectory or another worktree
     // would otherwise get a session named for one tree running in another.
+    const sidecar = sessionSidecarArgs(session, projectDir, opts.label);
     if (opts.detach) {
-        return { kind: 'tmux-detached', cmd: 'tmux', args: ['new', '-d', '-s', session, '-c', projectDir, shellCmd], session };
+        return { kind: 'tmux-detached', cmd: 'tmux', args: ['new', '-d', '-s', session, '-c', projectDir, shellCmd, ...sidecar], session };
     }
     // `tmux new -A`: attach if the named session exists, else create it.
-    return { kind: 'tmux-new', cmd: 'tmux', args: ['new', '-A', '-s', session, shellCmd], session };
+    return { kind: 'tmux-new', cmd: 'tmux', args: ['new', '-A', '-s', session, shellCmd, ...sidecar], session };
 };
 
 // ── Background listener auto-start ────────────────────────────────────

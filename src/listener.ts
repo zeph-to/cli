@@ -27,7 +27,7 @@ import { constants as fsConstants, copyFileSync, existsSync, linkSync, mkdirSync
 import { homedir, hostname, userInfo } from 'os';
 import { join, basename, dirname, isAbsolute, resolve, sep } from 'path';
 import WebSocket from 'ws';
-import { loadConfig, resolvedEnv, VERSION } from './config.js';
+import { checkoutOf, groupOf, loadConfig, resolvedEnv, SESSION_LABEL_OPTION, SESSION_PROJECT_OPTION, VERSION, type Checkout } from './config.js';
 import { legacyWsEnvNotice, resolveWsUrlDetailed } from './ws-url.js';
 import {
     clearListenerRuntime,
@@ -868,18 +868,37 @@ const tmuxArgs = (args: string[]): string[] => {
 
 /**
  * Parse a `zeph-*` tmux session name into `{project, label}`. The wrapper
- * emits `zeph-<project>` and, with `--label <x>`, `zeph-<project>-<x>` — no
- * sidecar, so the whole tail is the project either way (a labelled session
- * shows as its own row, which is what a plan-named implementer wants). A
- * sidecar (`@zeph_session_label`) would let the phone fold it under the
- * project; nothing writes one yet.
+ * emits `zeph-<project>` and, with `--label <x>`, `zeph-<project>-<x>`; the
+ * name alone cannot tell where the project ends, so the whole tail is the
+ * project. A labelled or worktree session also carries the answer in session
+ * options (`@zeph_project`, `@zeph_session_label` — wrapper
+ * `sessionSidecarArgs`), which win: the phone groups cards by project, and
+ * the tail would open a card per label and per worktree.
  */
-export const parseSessionName = (name: string): { project: string; label: string | null } | null => {
+export const parseSessionName = (
+    name: string,
+    sidecar: { project?: string; label?: string } = {},
+): { project: string; label: string | null } | null => {
     if (!name.startsWith('zeph-')) return null;
     const rest = name.slice('zeph-'.length);
     if (!rest) return null;
-    return { project: rest, label: null };
+    return { project: sidecar.project || rest, label: sidecar.label || null };
 };
+
+/**
+ * `checkoutOf` per pane cwd, remembered for the life of the sweep worker —
+ * a directory's repo does not change under a running session, and the sweep
+ * sees the same few cwds every cycle. Outside-git answers are kept too, or
+ * every non-repo session would cost a git spawn per sweep. Size = distinct
+ * pane cwds ever seen, which tracks sessions started, not time.
+ */
+const checkoutCache = new Map<string, Checkout | null>();
+const checkoutOfCached = (cwd: string): Checkout | null => {
+    if (!checkoutCache.has(cwd)) checkoutCache.set(cwd, checkoutOf(cwd));
+    return checkoutCache.get(cwd) ?? null;
+};
+/** Test seam: how many directories have been looked up. */
+export const __checkoutCacheSize = (): number => checkoutCache.size;
 
 interface PaneInfo {
     currentCommand: string | null;
@@ -1576,10 +1595,16 @@ export const handleSessionResumeRequest = (
 
     // argv, never a shell string: the binary comes from the agent table and the
     // directory from our own record, and neither is concatenated into anything
-    // a shell would re-parse.
+    // a shell would re-parse. A recorded label means the session carried
+    // sidecar options (wrapper `sessionSidecarArgs`) or the sweep inferred them
+    // from its checkout (config `groupOf`); a new tmux session starts without
+    // them, so they go on or it returns in a card of its own.
+    const sidecar = known.label && known.project
+        ? [';', 'set-option', SESSION_PROJECT_OPTION, known.project, ';', 'set-option', SESSION_LABEL_OPTION, known.label]
+        : [];
     const started = spawnSync(
         'tmux',
-        tmuxArgs(['new-session', '-d', '-s', sessionName, '-c', known.cwd, agent.binary]),
+        tmuxArgs(['new-session', '-d', '-s', sessionName, '-c', known.cwd, agent.binary, ...sidecar]),
         { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
     );
     if (started.status !== 0) {
@@ -3436,7 +3461,7 @@ export const collectSessionsVerbose = (): CollectResult => {
     // per-session display-message) would multiply with split panes; the worker
     // thread keeps the one blocking sweep off the event loop.
     const list = spawnSync('tmux', tmuxArgs(['list-panes', '-a', '-F',
-        `#{session_name}${FIELD_SEP}#{session_attached}${FIELD_SEP}#{session_created}${FIELD_SEP}#{session_activity}${FIELD_SEP}#{window_index}${FIELD_SEP}#{pane_index}${FIELD_SEP}#{pane_id}${FIELD_SEP}#{pane_current_command}${FIELD_SEP}#{pane_start_command}${FIELD_SEP}#{pane_current_path}${FIELD_SEP}#{pane_pid}${FIELD_SEP}#{@zeph_pane_label}`]), {
+        `#{session_name}${FIELD_SEP}#{session_attached}${FIELD_SEP}#{session_created}${FIELD_SEP}#{session_activity}${FIELD_SEP}#{window_index}${FIELD_SEP}#{pane_index}${FIELD_SEP}#{pane_id}${FIELD_SEP}#{pane_current_command}${FIELD_SEP}#{pane_start_command}${FIELD_SEP}#{pane_current_path}${FIELD_SEP}#{pane_pid}${FIELD_SEP}#{@zeph_pane_label}${FIELD_SEP}#{@zeph_project}${FIELD_SEP}#{@zeph_session_label}`]), {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -3464,17 +3489,17 @@ export const collectSessionsVerbose = (): CollectResult => {
 
     const sessions: AgentSession[] = [];
     const rejected: Array<{ name: string; reason: string }> = [];
-    /** 12 fields per row; a mismatch is the mangled-separator failure the
+    /** 14 fields per row; a mismatch is the mangled-separator failure the
      *  sanity log above exists for — skip the row loudly, never misparse it. */
-    const PANE_FIELDS = 12;
+    const PANE_FIELDS = 14;
     interface PaneRow { paneId: string; win: number; idx: number; label: string; info: PaneInfo }
-    interface PaneGroup { attached: boolean; created?: string; activity?: string; panes: PaneRow[] }
+    interface PaneGroup { attached: boolean; created?: string; activity?: string; project?: string; label?: string; panes: PaneRow[] }
     const groups = new Map<string, PaneGroup>();
     let malformed = 0;
     for (const line of rawLines) {
         const f = line.split(FIELD_SEP);
         if (f.length !== PANE_FIELDS) { malformed += 1; continue; }
-        const [name, attached, created, activity, win, idx, paneId, current, start, path, pid, label] = f;
+        const [name, attached, created, activity, win, idx, paneId, current, start, path, pid, label, project, sessionLabel] = f;
         if (!parseSessionName(name)) {
             // Not noisy enough to log every plain tmux session here —
             // would clutter the verbose output on machines with many
@@ -3497,7 +3522,7 @@ export const collectSessionsVerbose = (): CollectResult => {
                 panePid: numeric(pid) === Number.MAX_SAFE_INTEGER ? null : numeric(pid),
             },
         };
-        const group = groups.get(name) ?? { attached: attached === '1', created, activity, panes: [] };
+        const group = groups.get(name) ?? { attached: attached === '1', created, activity, project, label: sessionLabel, panes: [] };
         group.panes.push(row);
         groups.set(name, group);
     }
@@ -3511,8 +3536,6 @@ export const collectSessionsVerbose = (): CollectResult => {
     const targets: Record<string, string> = {};
     const subagentTranscripts: Record<string, string> = {};
     for (const [name, group] of groups) {
-        const parsed = parseSessionName(name);
-        if (!parsed) continue; // unreachable — groups only holds parsed names
         // Main pane = the lowest (window, pane) index that runs an agent.
         // pi-interactive-subagents splits `-d` to the RIGHT of the parent, so
         // the parent keeps the lower index; a manual left split would take the
@@ -3533,6 +3556,13 @@ export const collectSessionsVerbose = (): CollectResult => {
             continue;
         }
         const info = main.row.info;
+        // No session options (started before the wrapper wrote them, or by an
+        // older one): the pane's checkout says what the name cannot.
+        const inferred = !group.project && info.currentPath
+            ? groupOf(name.slice('zeph-'.length), checkoutOfCached(info.currentPath))
+            : null;
+        const parsed = parseSessionName(name, inferred ?? group);
+        if (!parsed) continue; // unreachable — groups only holds parsed names
         const agentSessionId = info.currentPath
             ? (main.agent.resolveSessionId?.(info.currentPath, info.panePid ?? undefined) ?? null)
             : null;

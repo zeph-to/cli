@@ -22,7 +22,7 @@ const fakeTmux = (args: readonly string[]) => {
     // One pane per session, pinned id `%<index>` — what the sweep records in
     // its targets map, so display/capture/send calls arrive with pane ids.
     if (a[0] === 'list-panes') {
-        const rows = SESSIONS.map((n, i) => [n, '0', '1700000000', '1700000000', '0', '0', `%${i}`, 'node', 'claude', '/tmp/proj', '1234', ''].join(FIELD_SEP));
+        const rows = SESSIONS.map((n, i) => [n, '0', '1700000000', '1700000000', '0', '0', `%${i}`, 'node', 'claude', '/tmp/proj', '1234', '', '', ''].join(FIELD_SEP));
         return { status: 0, stdout: rows.join('\n') + '\n', stderr: '' };
     }
     if (a[0] === 'list-sessions') return { status: 0, stdout: '', stderr: '' };

@@ -3,6 +3,7 @@ import { createHash } from 'crypto';
 import { mkdirSync, mkdtempSync, existsSync, readFileSync, rmSync, utimesSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { groupOf } from './config.js';
 import { projectHash } from './gate.js';
 import {
     parseSessionName,
@@ -673,8 +674,16 @@ describe('parseSessionName', () => {
         expect(parseSessionName('zeph-encl')).toEqual({ project: 'encl', label: null });
     });
 
-    it('keeps dashes inside the project name (Phase 1: no label parsing yet)', () => {
+    it('keeps dashes inside the project name when no session options say otherwise', () => {
         expect(parseSessionName('zeph-my-cool-app')).toEqual({ project: 'my-cool-app', label: null });
+    });
+
+    // wrapper `sessionSidecarArgs`: a label or worktree tail would otherwise open a card of its own.
+    it('prefers the session options the wrapper set over the name', () => {
+        expect(parseSessionName('zeph-ko-qmd-20260924-PLAN-1-pi', { project: 'ko-qmd', label: '20260924-PLAN-1-pi' }))
+            .toEqual({ project: 'ko-qmd', label: '20260924-PLAN-1-pi' });
+        // tmux prints an unset option as empty — that is "no sidecar".
+        expect(parseSessionName('zeph-encl', { project: '', label: '' })).toEqual({ project: 'encl', label: null });
     });
 
     it('returns null for non-zeph-prefixed names', () => {
@@ -682,6 +691,37 @@ describe('parseSessionName', () => {
         expect(parseSessionName('zeph')).toBeNull();   // no dash, no project
         expect(parseSessionName('zeph-')).toBeNull();  // empty project
         expect(parseSessionName('')).toBeNull();
+    });
+});
+
+// The one rule both the wrapper's session options and the listener's
+// correction of sessions started without them follow (config `groupOf`).
+describe('groupOf', () => {
+    const main = { key: 'ko-qmd', linked: false };
+    const linked = { key: 'ko-qmd', linked: true };
+
+    it('splits a tail that starts with the repo name into project and label', () => {
+        expect(groupOf('ko-qmd-20260924-PLAN-1-pi', main)).toEqual({ project: 'ko-qmd', label: '20260924-PLAN-1-pi' });
+        expect(groupOf('ko-qmd-wt-x', linked)).toEqual({ project: 'ko-qmd', label: 'wt-x' });
+    });
+
+    // `-2`, `-3` is the wrapper's family counter — the phone shows it as `#2`.
+    it('leaves the project name and its family counter alone in the main checkout', () => {
+        expect(groupOf('ko-qmd', main)).toBeNull();
+        expect(groupOf('ko-qmd-2', main)).toBeNull();
+    });
+
+    it('groups a linked worktree under its repo whatever the session is called', () => {
+        expect(groupOf('feature-y', linked)).toEqual({ project: 'ko-qmd', label: 'feature-y' });
+        expect(groupOf('ko-qmd-wt-x-2', linked)).toEqual({ project: 'ko-qmd', label: 'wt-x-2' });
+    });
+
+    it('leaves a main-checkout session named for some other directory alone', () => {
+        expect(groupOf('zeph-to', main)).toBeNull();
+    });
+
+    it('leaves a session outside git alone', () => {
+        expect(groupOf('ko-qmd-plan-pi', null)).toBeNull();
     });
 });
 

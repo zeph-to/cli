@@ -50,7 +50,7 @@ const fakeTmux = (args: readonly string[]) => {
     const a = args[0] === '-S' ? args.slice(2) : args;
     if (a[0] === 'list-panes') {
         const row = [PANE.session, '0', '1700000000', '1700000000', '0', String(PANE.idx),
-            PANE.paneId, PANE.current, PANE.start, PANE_CWD, String(PANE.pid), ''].join(FIELD_SEP);
+            PANE.paneId, PANE.current, PANE.start, PANE_CWD, String(PANE.pid), '', '', ''].join(FIELD_SEP);
         return { status: 0, stdout: `${row}\n`, stderr: '' };
     }
     if (a[0] === 'capture-pane') return { status: 0, stdout: 'pane text\n', stderr: '' };

@@ -1,6 +1,7 @@
+import { execFileSync } from 'child_process';
 import { readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs';
 import { homedir } from 'os';
-import { join } from 'path';
+import { basename, dirname, isAbsolute, join } from 'path';
 
 export const CONFIG_DIR = join(homedir(), '.zeph');
 export const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
@@ -27,6 +28,73 @@ export const resolvedEnv = (key: string, env: NodeJS.ProcessEnv = process.env): 
  */
 export const resolveHookId = (env: NodeJS.ProcessEnv = process.env): string | undefined =>
   resolvedEnv('ZEPH_HOOK_ID', env) || loadConfig().hookId;
+
+/** tmux session options the listener reads before falling back to parsing the name (listener `parseSessionName`). */
+export const SESSION_PROJECT_OPTION = '@zeph_project';
+export const SESSION_LABEL_OPTION = '@zeph_session_label';
+
+/** The repo a directory belongs to: `key` names the main checkout, `linked` says the directory is in a linked worktree. */
+export interface Checkout {
+  key: string;
+  linked: boolean;
+}
+
+/** `git rev-parse` for `checkoutOf`, swappable in tests. */
+const revParse = (dir: string): string => execFileSync(
+  'git',
+  ['-C', dir, 'rev-parse', '--path-format=absolute', '--show-toplevel', '--git-common-dir', '--git-dir'],
+  { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 },
+);
+
+/**
+ * Which checkout `dir` is in, from one `git rev-parse`; null outside git.
+ *
+ * Inside a linked worktree `--show-toplevel` is the worktree itself, so its
+ * name is not the repo's. The common dir is `<main checkout>/.git` from every
+ * worktree, and differs from the git dir only in a linked one. A common dir not
+ * named `.git` (bare-repo layout, submodule, `--separate-git-dir`) has no
+ * checkout to be named for, so the toplevel's own name stands and nothing is
+ * called linked — those worktrees keep reading as their own projects.
+ *
+ * Anything but three absolute paths is "outside git": a git too old for
+ * `--path-format` echoes it back as an unknown flag and exits 0, which would
+ * otherwise shift every answer by one and name the repo `--path-format=absolute`.
+ *
+ * The timeout is for the listener's sweep worker, which calls this for every
+ * new pane cwd: a repo on a hung network mount must cost one sweep a moment,
+ * not stop inventory. A timeout reads as "outside git" — nothing is regrouped.
+ */
+export const checkoutOf = (dir: string, run: (dir: string) => string = revParse): Checkout | null => {
+  let lines: string[];
+  try {
+    lines = run(dir).trim().split('\n');
+  } catch {
+    return null;
+  }
+  if (lines.length !== 3 || !lines.every(isAbsolute)) return null;
+  const [top, common, gitDir] = lines;
+  if (basename(common) !== '.git') return { key: basename(top), linked: false };
+  const key = basename(dirname(common));
+  return key ? { key, linked: common !== gitDir } : null;
+};
+
+/**
+ * The project and label a `zeph-<tail>` session groups under, when its name
+ * does not say so — null when it does (the whole tail is the project).
+ *
+ * The one rule behind both the wrapper's session options and the listener's
+ * correction of sessions started without them, so the two never disagree.
+ * A tail starting `<repo>-` splits there, unless the rest is the wrapper's
+ * `-2`/`-3` family counter. Any session in a linked worktree belongs to its
+ * repo, whatever the worktree is called.
+ */
+export const groupOf = (tail: string, checkout: Checkout | null): { project: string; label: string } | null => {
+  if (!checkout) return null;
+  const { key, linked } = checkout;
+  const rest = tail.startsWith(`${key}-`) ? tail.slice(key.length + 1) : '';
+  if (rest && !/^\d+$/.test(rest)) return { project: key, label: rest };
+  return linked ? { project: key, label: tail } : null;
+};
 
 // Per-agent project-dir env vars, in precedence order. Deliberately NOT part
 // of the remote-agent registry: Cursor/Windsurf carry project-dir envs but

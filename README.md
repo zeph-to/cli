@@ -301,6 +301,15 @@ block here.
    zeph pi --detach --label 20260914-PLAN-11-32-44-pi -n 20260914-PLAN-11-32-44 '/skill:02-implement .claude/20260914/PLAN-11-32-44.md'
    ```
 
+   A labelled session, and any session started in a linked git worktree,
+   still shows on the phone under its project — the main checkout's name —
+   with the label (or the worktree's session name) beside it. The wrapper
+   records both as tmux session options (`@zeph_project`,
+   `@zeph_session_label`) because the session name alone cannot say where
+   the project ends. A session started without them (before this, or by an
+   older CLI) is grouped by the listener from its pane's checkout instead,
+   so upgrading the listener is enough — no session restart.
+
    `zeph cursor` runs **`cursor-agent`**, Cursor's terminal agent — a
    separate install from the Cursor IDE (the bare `cursor` on your PATH
    is the editor launcher, which exits immediately and can't be driven).
