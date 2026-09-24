@@ -1,4 +1,5 @@
-import { mkdtempSync } from 'fs';
+import { execFileSync } from 'child_process';
+import { mkdtempSync, realpathSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
@@ -34,6 +35,11 @@ interface FakePane {
     pid: number;
     /** 12th sweep field — @zeph_pane_label, set by the subagent itself. */
     label?: string;
+    /** 10th — pane_current_path; `/tmp/proj` (outside git) unless a test needs a checkout. */
+    path?: string;
+    /** 13th/14th — the wrapper's @zeph_project / @zeph_session_label session options. */
+    project?: string;
+    sessionLabel?: string;
 }
 
 /** The subagent detection fixture, in `ps -axo pid=,ppid=,pgid=,tpgid=,lstart=,comm=` shape:
@@ -76,7 +82,7 @@ const fakeTmux = (args: readonly string[]) => {
             .sort((x, y) => x.idx - y.idx)
             .map((p) =>
                 [p.session, '0', '1700000000', '1700000000', '0', String(p.idx),
-                    p.paneId, p.current, p.start, '/tmp/proj', String(p.pid), p.label ?? ''].join(FIELD_SEP));
+                    p.paneId, p.current, p.start, p.path ?? '/tmp/proj', String(p.pid), p.label ?? '', p.project ?? '', p.sessionLabel ?? ''].join(FIELD_SEP));
         return { status: 0, stdout: rows.join('\n') + '\n', stderr: '' };
     }
     if (a[0] === 'list-sessions') return { status: 0, stdout: '', stderr: '' };
@@ -170,6 +176,41 @@ describe('subagent panes — sweep, view-only, addressing', () => {
         expect(result.targets['zeph-a.9']).toBe('%9');
         const main = result.sessions.find((s) => s.name === 'zeph-a');
         expect(main?.parentName).toBeUndefined();
+    });
+
+    // The wrapper's session options name the card, for the session and every subagent pane of it.
+    it('takes project and label from the session options when the wrapper set them', () => {
+        for (const p of panes) Object.assign(p, { project: 'repo', sessionLabel: 'a' });
+        const result = sweep();
+        const main = result.sessions.find((s) => s.name === 'zeph-a');
+        expect(main).toMatchObject({ project: 'repo', label: 'a' });
+        expect(result.sessions.filter((s) => s.parentName).every((s) => s.project === 'repo')).toBe(true);
+    });
+
+    // A session started before the wrapper set those options (or by an older
+    // one) is still grouped: its pane cwd names the checkout. Real git, since
+    // what `rev-parse` answers inside a repo is the whole question.
+    it('groups a session without session options by the checkout its pane runs in', () => {
+        const repo = join(realpathSync(TMP), 'ko-qmd');
+        execFileSync('git', ['init', '-q', repo]);
+        for (const p of panes) Object.assign(p, { session: 'zeph-ko-qmd-plan-pi', path: repo });
+        const cached = listener.__checkoutCacheSize();
+        const result = sweep();
+        expect(result.sessions.find((s) => s.name === 'zeph-ko-qmd-plan-pi')).toMatchObject({ project: 'ko-qmd', label: 'plan-pi' });
+        expect(result.sessions.filter((s) => s.parentName).every((s) => s.project === 'ko-qmd')).toBe(true);
+        // One lookup per directory, however many sweeps see it.
+        sweep();
+        expect(listener.__checkoutCacheSize()).toBe(cached + 1);
+    });
+
+    it('groups a session in a linked worktree under the repo, whatever the worktree is called', () => {
+        const repo = join(realpathSync(TMP), 'wt-repo');
+        const wt = join(realpathSync(TMP), 'feature-x');
+        execFileSync('git', ['init', '-q', repo]);
+        execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'i']);
+        execFileSync('git', ['-C', repo, 'worktree', 'add', '-q', wt, '-b', 'x']);
+        for (const p of panes) Object.assign(p, { session: 'zeph-feature-x', path: wt });
+        expect(sweep().sessions.find((s) => s.name === 'zeph-feature-x')).toMatchObject({ project: 'wt-repo', label: 'feature-x' });
     });
 
     it('a pane at its login-shell prompt is never a subagent', () => {

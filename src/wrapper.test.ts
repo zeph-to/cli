@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { detectProjectDir, detectProjectName, handOffExec, sanitizeLabel, splitAgentOptions, targetForAgent, tmuxSessionName } from './wrapper.js';
+import { execFileSync } from 'child_process';
+import { mkdtempSync, realpathSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { checkoutOf } from './config.js';
+import { detectProjectDir, detectProjectName, handOffExec, sanitizeLabel, sessionSidecarArgs, splitAgentOptions, targetForAgent, tmuxSessionName } from './wrapper.js';
 import type { ProcessHandOff } from './wrapper.js';
 
 // TMUX is in here for two reasons: targetForAgent branches on it, and a
@@ -112,7 +117,8 @@ describe('targetForAgent', () => {
         const { kind, cmd, args } = targetForAgent('pi', ['/skill:02-implement a.md'], 'pi', { detach: true, label: 'impl' });
         expect(kind).toBe('tmux-detached');
         expect(cmd).toBe('tmux');
-        expect(args).toEqual(['new', '-d', '-s', 'zeph-pi-config-impl', '-c', '/work/pi-config', "pi '/skill:02-implement a.md'"]);
+        expect(args).toEqual(['new', '-d', '-s', 'zeph-pi-config-impl', '-c', '/work/pi-config', "pi '/skill:02-implement a.md'",
+            ';', 'set-option', '@zeph_project', 'pi-config', ';', 'set-option', '@zeph_session_label', 'impl']);
     });
 
     // `new -d` only creates, so the reuse candidate `findAvailableSession`
@@ -143,6 +149,88 @@ describe('targetForAgent', () => {
         process.env.TMUX = '/private/tmp/tmux-501/default,43544,87';
         process.env.CLAUDE_PROJECT_DIR = '/work/pi-config';
         expect(targetForAgent('pi', [], 'pi', { detach: true, label: 'impl' }).kind).toBe('tmux-detached');
+    });
+});
+
+// A real repo and a linked worktree: what `git rev-parse` answers inside one
+// is the whole question, and a stub would only restate the assumption.
+describe('checkoutOf / sessionSidecarArgs', () => {
+    let tmp: string;
+    let main: string;
+    let wt: string;
+    let loose: string;
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-C', cwd, ...args], { stdio: 'ignore' });
+
+    beforeEach(() => {
+        tmp = realpathSync(mkdtempSync(join(tmpdir(), 'zeph-wt-')));
+        main = join(tmp, 'ko-qmd');
+        wt = join(tmp, 'ko-qmd-wt-feat-x');
+        // Claude Code's own worktrees live under the repo and are not named for it.
+        loose = join(main, '.claude', 'worktrees', 'feature-y');
+        execFileSync('git', ['init', '-q', main]);
+        git(main, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'init');
+        git(main, 'worktree', 'add', '-q', wt, '-b', 'feat/x');
+        git(main, 'worktree', 'add', '-q', loose, '-b', 'feat/y');
+    });
+
+    afterEach(() => rmSync(tmp, { recursive: true, force: true }));
+
+    it('names every checkout of a repo for its main checkout, and says which are linked', () => {
+        expect(checkoutOf(main)).toEqual({ key: 'ko-qmd', linked: false });
+        expect(checkoutOf(wt)).toEqual({ key: 'ko-qmd', linked: true });
+        expect(checkoutOf(loose)).toEqual({ key: 'ko-qmd', linked: true });
+        expect(checkoutOf(join(wt, '.git', '..'))).toEqual({ key: 'ko-qmd', linked: true });
+    });
+
+    // A git without `--path-format` echoes the unknown flag
+    // back as a line and exits 0, shifting every answer by one.
+    it('is null when git answers with anything but three absolute paths', () => {
+        const echoed = (answer: string) => () => answer;
+        expect(checkoutOf(main, echoed(`--path-format=absolute\n${main}\n.git\n.git\n`))).toBeNull();
+        expect(checkoutOf(main, echoed(`${main}\n.git\n.git\n`))).toBeNull();
+        expect(checkoutOf(main, echoed(''))).toBeNull();
+    });
+
+    // A bare-repo layout or a submodule has no `.git` checkout to be named
+    // for; its worktrees stand as their own projects, as before.
+    it('does not call a worktree linked when the repo has no main checkout', () => {
+        const bare = join(tmp, 'repo.git');
+        const bareWt = join(tmp, 'bare-wt');
+        execFileSync('git', ['clone', '-q', '--bare', main, bare]);
+        git(bare, 'worktree', 'add', '-q', bareWt, '-b', 'feat/z');
+        expect(checkoutOf(bareWt)).toEqual({ key: 'bare-wt', linked: false });
+        expect(sessionSidecarArgs('zeph-bare-wt', bareWt)).toEqual([]);
+    });
+
+    it('is null outside git', () => {
+        expect(checkoutOf(tmp)).toBeNull();
+        expect(checkoutOf(join(tmp, 'missing'))).toBeNull();
+    });
+
+    it('a worktree session named for its repo groups under it with the rest as the label', () => {
+        expect(sessionSidecarArgs('zeph-ko-qmd-wt-feat-x', wt)).toEqual(
+            [';', 'set-option', '@zeph_project', 'ko-qmd', ';', 'set-option', '@zeph_session_label', 'wt-feat-x']);
+    });
+
+    it('a worktree session with a name of its own groups under the repo with that name as the label', () => {
+        expect(sessionSidecarArgs('zeph-feature-y', loose)).toEqual(
+            [';', 'set-option', '@zeph_project', 'ko-qmd', ';', 'set-option', '@zeph_session_label', 'feature-y']);
+    });
+
+    it('a labelled session groups under its project', () => {
+        expect(sessionSidecarArgs('zeph-ko-qmd-wt-feat-x-plan-pi', wt, 'plan-pi')).toEqual(
+            [';', 'set-option', '@zeph_project', 'ko-qmd', ';', 'set-option', '@zeph_session_label', 'plan-pi']);
+        expect(sessionSidecarArgs('zeph-ko-qmd-plan-pi', main, 'plan-pi')).toEqual(
+            [';', 'set-option', '@zeph_project', 'ko-qmd', ';', 'set-option', '@zeph_session_label', 'plan-pi']);
+        expect(sessionSidecarArgs('zeph-loose-plan-pi', join(tmp, 'loose'), 'plan-pi')).toEqual(
+            [';', 'set-option', '@zeph_project', 'loose', ';', 'set-option', '@zeph_session_label', 'plan-pi']);
+    });
+
+    // The name already says it all; no options keeps these sessions reported exactly as before.
+    it('adds nothing for a plain session in the main checkout or outside git', () => {
+        expect(sessionSidecarArgs('zeph-ko-qmd-2', main)).toEqual([]);
+        expect(sessionSidecarArgs('zeph-ko-qmd', main)).toEqual([]);
+        expect(sessionSidecarArgs('zeph-scratch', join(tmp, 'scratch'))).toEqual([]);
     });
 });
 

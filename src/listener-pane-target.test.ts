@@ -46,7 +46,7 @@ const fakeTmux = (args: readonly string[]) => {
     if (a[0] === 'list-panes') {
         const rows = panes.map((p) =>
             [p.session, '0', '1700000000', '1700000000', String(p.win), String(p.idx),
-                p.paneId, p.current, p.start, p.path, String(p.pid), p.label ?? ''].join(FIELD_SEP));
+                p.paneId, p.current, p.start, p.path, String(p.pid), p.label ?? '', '', ''].join(FIELD_SEP));
         return { status: 0, stdout: rows.join('\n') + '\n', stderr: '' };
     }
     // Socket discovery probes (bare `list-sessions`) and the diag dump.

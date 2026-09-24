@@ -24,7 +24,7 @@ const fakeTmux = (args: readonly string[]) => {
     tmuxCalls.push([...a]);
     if (a[0] === 'list-panes') {
         const rows = liveSessions
-            .map((n, i) => [n, '0', '1700000000', '1700000000', '0', '0', `%${i}`, 'node', 'claude', '/tmp/proj', '1234', ''].join(FIELD_SEP))
+            .map((n, i) => [n, '0', '1700000000', '1700000000', '0', '0', `%${i}`, 'node', 'claude', '/tmp/proj', '1234', '', '', ''].join(FIELD_SEP))
             .join('\n');
         return { status: 0, stdout: rows + '\n', stderr: '' };
     }
@@ -137,6 +137,19 @@ describe('agent.session.resume.request — starting a session that ended', () =>
                 sessionName: 'zeph-api',
                 resumed: true,
             });
+        });
+
+        // A labelled or worktree session lived with sidecar options; a fresh
+        // tmux session has none, so without them it would come back in a card of its own.
+        it('puts the recorded project and label back on a labelled session', () => {
+            remember({ name: 'zeph-api', project: 'api-main', label: 'api' });
+
+            ask();
+
+            expect(newSessions()).toEqual([
+                ['new-session', '-d', '-s', 'zeph-api', '-c', PROJECT_DIR, 'claude',
+                    ';', 'set-option', '@zeph_project', 'api-main', ';', 'set-option', '@zeph_session_label', 'api'],
+            ]);
         });
 
         // The registry IS the whitelist. A name this machine never wrote down
