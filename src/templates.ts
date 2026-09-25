@@ -137,12 +137,15 @@ errors/blockers.`;
 // Copilot, Cline, Aider, OpenCode). The shared core scopes Rules 1/2/8/9 to REMOTE
 // and tells a NORMAL session it owes no `zeph_ask`. That is right where a
 // hook can announce the phone message that starts REMOTE; here nothing can,
-// and the only remaining entry is a `zeph_ask` answer that is not Done-like.
+// and the only remaining entry is a `zeph_ask` answer reporting REMOTE.
 // So this preamble restores the one obligation the core dropped: after
 // substantial work, end with `zeph_ask` — with `actions` — so the user has a
 // button to tap that puts them in the driver's seat. Everything else the core
 // says about NORMAL still holds (no ask on trivial turns, questions may go
-// to the local picker, no `zeph_ask` just to mark a turn finished).
+// to the local picker, no `zeph_ask` just to mark a turn finished). The one
+// turn it must not ask on is a send-and-exit answer: carrying out that last
+// instruction is substantial work, and asking would re-open the loop the
+// user just closed.
 //
 // This overrides the core's Rule 2 NORMAL clause for these agents. It is a
 // per-agent preamble, not a fork of the core, for the reason the core's
@@ -151,14 +154,17 @@ const REMOTE_ENTRY_NO_HOOK = `## Entering REMOTE without a prompt hook
 
 This agent has no prompt-submit hook, so nothing can tell you when a
 message arrived from the user's phone. The ONLY way this session enters
-REMOTE is a \`zeph_ask\` answer that is not a Done-like button. So — and
+REMOTE is a \`zeph_ask\` answer reporting \`zephState: "REMOTE"\`. So — and
 this overrides the "In NORMAL, end with nothing" clause below —
 **after substantial work in NORMAL, end the response with \`zeph_ask\`**:
 2–4 \`actions\` carrying the next-step candidates plus a Done-like
 \`fallback\`, \`timeout\` 300–600 s. "Substantial" = file changes, commits,
 builds, tests, deploys, destructive ops, milestone completions. Skip it on
 trivial turns (read-only exploration, a mid-step in an approved plan, a
-typo-sized fix). Once the answer reports \`zephState: "REMOTE"\`, sticky REMOTE
+typo-sized fix). One exception: an answer sent with the phone's "send and
+exit" reports \`zephState: "NORMAL"\` with a \`value\` that is the user's final
+instruction — carry it out and end without \`zeph_ask\`, however substantial
+the work. Once the answer reports \`zephState: "REMOTE"\`, sticky REMOTE
 mode takes over.`;
 
 // Tool-access preamble — pi only.
@@ -194,7 +200,7 @@ const REMOTE_STUB = `### What starts REMOTE
 
 The user sending a message from their phone starts sticky REMOTE — the prompt-submit hook says so on that turn and supplies the contract in full. A \`zeph_ask\` result reporting \`zephState: "REMOTE"\` starts it mid-turn.
 
-From that response on: end EVERY response with \`zeph_ask\` (2–4 \`actions\` plus a Done-like \`fallback\`, \`timeout\` 300–600s), route button-friendly questions through it instead of \`AskUserQuestion\`, and never end on a plain-text question — until the user exits with a Done-like button, a free-text wrap-up you read as one (emit \`<!-- zeph: exit -->\` once), or a prompt they type at the terminal.`;
+From that response on: end EVERY response with \`zeph_ask\` (2–4 \`actions\` plus a Done-like \`fallback\`, \`timeout\` 300–600s), route button-friendly questions through it instead of \`AskUserQuestion\`, and never end on a plain-text question — until the user exits with a Done-like button, the phone's "send and exit" (a result with a \`value\` and \`zephState: "NORMAL"\` — their final instruction: carry it out, no \`zeph_ask\`), a free-text wrap-up you read as one (emit \`<!-- zeph: exit -->\` once), or a prompt they type at the terminal.`;
 
 const PROMPT_HOOK_CORE = [
   `## NORMAL — the user is at the terminal
