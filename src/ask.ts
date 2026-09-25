@@ -18,6 +18,7 @@
  */
 import { loadConfig, resolvedEnv, resolveHookId } from './config.js';
 import { agentSessionContext } from './agent-session.js';
+import { clearRemoteActive, touchRemoteActive } from './gate.js';
 
 /** Server-side hook trigger + event read. Kept narrow on purpose — this
  *  module needs two routes, not an API client. */
@@ -53,6 +54,13 @@ export interface AskOptions {
      */
     agentDeviceId?: string;
     agentSessionName?: string;
+    /**
+     * Lets the phone offer "send and exit" on this ask. Only an agent's own
+     * `zeph_ask` stand-in sets it (pi's rules pass `--accepts-exit`); an
+     * approval gate has no mode to end, so it never offers the button and a
+     * stray `exitRemote` on its answer is dropped.
+     */
+    acceptsExit?: boolean;
 }
 
 /** Injected so the poll loop is testable without a clock or a network. */
@@ -64,7 +72,7 @@ export interface AskDeps {
 
 export type AskOutcome =
     | { readonly answered: true; readonly actionId: string }
-    | { readonly answered: true; readonly value: string }
+    | { readonly answered: true; readonly value: string; readonly exitRemote?: true }
     | { readonly answered: false; readonly error?: string };
 
 /**
@@ -93,7 +101,7 @@ const errorMessage = (err: unknown): string =>
     err instanceof Error ? err.message : String(err);
 
 interface ApiShape {
-    data?: { eventId?: string; response?: { actionId?: string; value?: string } | null };
+    data?: { eventId?: string; response?: { actionId?: string; value?: string; exitRemote?: boolean } | null };
     error?: { message?: string };
 }
 
@@ -140,6 +148,7 @@ export const requestApproval = async (opts: AskOptions, deps: AskDeps): Promise<
             hookType: 'combo',
             agentDeviceId: opts.agentDeviceId,
             agentSessionName: opts.agentSessionName,
+            ...(opts.acceptsExit ? { acceptsExit: true } : {}),
         });
         const id = trigger.data?.eventId;
         if (!id) return { answered: false, error: 'no eventId in trigger response' };
@@ -154,6 +163,11 @@ export const requestApproval = async (opts: AskOptions, deps: AskDeps): Promise<
             const event = await callApi(deps, opts, 'GET', EVENT_PATH(opts.hookId, eventId));
             const response = event.data?.response;
             if (response?.actionId) return { answered: true, actionId: response.actionId };
+            // An exit is an answer even with no text — the web blocks an empty
+            // one, the server does not.
+            if (opts.acceptsExit && response?.exitRemote === true) {
+                return { answered: true, value: response.value ?? '', exitRemote: true };
+            }
             if (response?.value) return { answered: true, value: response.value };
         } catch {
             // One failed poll is not an answer and not a refusal — the user may
@@ -166,6 +180,37 @@ export const requestApproval = async (opts: AskOptions, deps: AskDeps): Promise<
     return { answered: false };
 };
 
+/** Action ids that end a remote session, case-insensitive — mcp-server remote-state.ts SESSION_EXIT_IDS. */
+const SESSION_EXIT_IDS = ['done', 'stop', 'exit'];
+
+/**
+ * What an ask outcome does to sticky REMOTE — mcp-server's
+ * `remoteTransitionFor`, for the outcomes this command can produce. A
+ * Done-like button or a send-and-exit answer ends it; any other answer enters
+ * or refreshes it. An unanswered ask changes nothing: there is no fallback id
+ * here to resolve to, and silence is not a user action.
+ */
+export const remoteTransition = (outcome: AskOutcome): 'enter' | 'exit' | 'keep' => {
+    if (!outcome.answered) return 'keep';
+    if ('actionId' in outcome) {
+        return SESSION_EXIT_IDS.includes(outcome.actionId.trim().toLowerCase()) ? 'exit' : 'enter';
+    }
+    return outcome.exitRemote ? 'exit' : 'enter';
+};
+
+const settleRemote = (outcome: AskOutcome, dir: string): { zephState?: 'REMOTE' | 'NORMAL' } => {
+    switch (remoteTransition(outcome)) {
+        case 'exit':
+            clearRemoteActive(dir);
+            return { zephState: 'NORMAL' };
+        case 'enter':
+            touchRemoteActive(dir);
+            return { zephState: 'REMOTE' };
+        case 'keep':
+            return {};
+    }
+};
+
 /** Wall-clock deps for real use. */
 export const liveDeps = (): AskDeps => ({
     fetchFn: fetch,
@@ -174,7 +219,7 @@ export const liveDeps = (): AskDeps => ({
 });
 
 /**
- * `zeph ask --title … [--body …] [--actions id:Label,…] [--timeout 60]`
+ * `zeph ask --title … [--body …] [--actions id:Label,…] [--timeout 60] [--accepts-exit]`
  *
  * Prints one JSON object and nothing else, so a hook can pipe it straight into
  * `jq`. Exit code 0 means answered, 1 means not — a shell caller that only
@@ -199,6 +244,7 @@ export const handleAsk = async (args: Record<string, string | boolean>): Promise
     }
 
     const timeoutSeconds = Number(args.timeout ?? 60);
+    const acceptsExit = args['accepts-exit'] === true;
     const outcome = await requestApproval(
         {
             apiKey,
@@ -209,10 +255,19 @@ export const handleAsk = async (args: Record<string, string | boolean>): Promise
             actions: parseActions(args.actions as string | undefined),
             timeoutSeconds: Number.isFinite(timeoutSeconds) && timeoutSeconds > 0 ? timeoutSeconds : 60,
             ...(agentSessionContext() ?? {}),
+            acceptsExit,
         },
         liveDeps(),
     );
 
-    process.stdout.write(JSON.stringify(outcome) + '\n');
+    // The agent's own ask settles REMOTE as mcp-server's zeph_ask does and
+    // reports it in the same `zephState` field; an approval gate leaves the
+    // mode alone. Keyed by the cwd, the twin of the `ctx.cwd` the pi
+    // extension hands `remote-hook pi` — pi's bash tool runs every command
+    // there. Not detectProjectDir(): a CLAUDE_PROJECT_DIR leaked into a pi
+    // launched from Claude Code would key another project's file.
+    const settled = acceptsExit ? settleRemote(outcome, process.cwd()) : {};
+    // `exitRemote` is the server's flag; the rules read `zephState`.
+    process.stdout.write(JSON.stringify({ ...outcome, exitRemote: undefined, ...settled }) + '\n');
     return outcome.answered ? 0 : 1;
 };

@@ -63,6 +63,9 @@ Commands:
                   (--title, --body, --actions id:Label,…, --timeout secs)
                   Prints one JSON line; exit 0 answered, 1 not. Built for
                   hooks, which cannot call the MCP zeph_ask tool.
+                  --accepts-exit marks an agent's own ask: the phone may
+                  "send and exit", and the answer settles REMOTE and
+                  reports zephState like MCP zeph_ask (gates leave it off)
   send <target> <message…>
                   Type a message into another agent session, on this
                   machine or another (target = <deviceId>:<session> key,

@@ -268,13 +268,15 @@ describe('templates.ts: pi extension + opencode plugin artifacts', () => {
         const { PI_RULE } = await import('./templates.js');
         const section = PI_RULE.split('## Zeph tools via the CLI')[1]!.split('\n## ')[0]!;
         const flags = [...new Set([...section.matchAll(/--([a-z][a-z-]*)/g)].map((m) => m[1]))];
-        expect(flags).toEqual(expect.arrayContaining(['title', 'actions', 'timeout']));
+        expect(flags).toEqual(expect.arrayContaining(['title', 'actions', 'timeout', 'accepts-exit']));
         // pi has no MCP fallback — a flag renamed in the CLI would strand it
         // silently, so pin every named flag to the CLI's own arg parsing.
         const dir = dirname(fileURLToPath(import.meta.url));
         const cliSrc = readFileSync(join(dir, 'ask.ts'), 'utf-8') + readFileSync(join(dir, 'cli.ts'), 'utf-8');
         for (const flag of flags) {
-            expect(cliSrc, `--${flag} is not parsed by the CLI`).toContain(`args.${flag}`);
+            // A hyphenated flag can only be read in bracket form (`args['api-key']`).
+            const read = flag.includes('-') ? `args['${flag}']` : `args.${flag}`;
+            expect(cliSrc, `--${flag} is not parsed by the CLI`).toContain(read);
         }
     });
 });
