@@ -172,8 +172,8 @@ const PI_TOOL_ACCESS = `## Zeph tools via the CLI (no MCP)
 
 Pi has no MCP, so where these rules name a zeph_* tool, run the zeph CLI with your bash tool instead:
 
-- zeph_ask    → \`zeph ask --title "…" --body "…" --actions "id:Label,id2:Label2" --timeout 300\`
-  Blocks until answered; prints one JSON line. \`answered: false\` (timeout / unreachable) is a Done-like outcome — treat it as NORMAL.
+- zeph_ask    → \`zeph ask --title "…" --body "…" --actions "id:Label,id2:Label2" --timeout 300 --accepts-exit\`
+  Blocks until answered; prints one JSON line. \`--accepts-exit\` makes it the MCP tool's twin: the phone may offer "send and exit", and an answer carries \`zephState\` — \`NORMAL\` after a Done-like button or a send-and-exit (its \`value\` is the user's final instruction: carry it out, no \`zeph ask\`), \`REMOTE\` after any other answer. \`answered: false\` (timeout / unreachable) is a Done-like outcome — treat it as NORMAL.
 - zeph_notify → \`zeph notify --title "…" --body "…" [--priority high]\`
 - zeph_agent_send → \`zeph send <target key> - <<'EOF'\`, the message on the lines after, then \`EOF\` (quoted, so the shell runs nothing in it)
 - AskUserQuestion → pi's own terminal prompt.`;
