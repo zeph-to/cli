@@ -1,4 +1,5 @@
 import { agentSessionContext } from './agent-session.js';
+import type { AgentTargetDevice } from './agent-target.js';
 import type { ZephOptions, NotifyPayload, NotifyResult, ListParams, ListResult, PushItem, DismissOneResult, DismissAllResult, ApiErrorResponse, UploadRequestResult } from './types.js';
 import { ZephError, AuthenticationError, QuotaExceededError } from './errors.js';
 import { initCrypto, getKeyPair, disableCrypto, selectRecipients, encryptPushBodyForDevices, encryptFileForDevices, type DeviceRecipient } from './crypto.js';
@@ -258,6 +259,30 @@ export class ZephHook {
       { alias },
     );
     return { deviceId: res.data.deviceId };
+  }
+
+  /** The account's devices, with the agent sessions each listener reports. */
+  async listDevices(): Promise<AgentTargetDevice[]> {
+    const json = await this.request<{ data?: AgentTargetDevice[] }>('GET', '/devices');
+    // A missing list is a bad response, not an account with no devices — the
+    // latter would read as "unknown target" and hide the real failure.
+    if (!Array.isArray(json.data)) throw new ZephError('Server returned no device list', 'INVALID_RESPONSE', 500);
+    return json.data;
+  }
+
+  /**
+   * Type `body` into the tmux session `agentSessionName` on `targetDeviceId`.
+   *
+   * Plaintext, never through `notify`'s encryption: the listener drops an
+   * encrypted agent.command (listener.ts `handlePush`). No `agentDeviceId`
+   * either — the server groups by `agentDeviceId ?? targetDeviceId`, so it
+   * would file the push under a chat that is not the target's.
+   */
+  async sendAgentCommand(payload: { targetDeviceId: string; agentSessionName: string; body: string }): Promise<{ pushId: string }> {
+    const json = await this.request<{ data?: { pushId?: string } }>('POST', '/pushes/send', { type: 'agent.command', ...payload });
+    const pushId = json.data?.pushId;
+    if (!pushId) throw new ZephError('Server returned no pushId', 'INVALID_RESPONSE', 500);
+    return { pushId };
   }
 
   private async request<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {

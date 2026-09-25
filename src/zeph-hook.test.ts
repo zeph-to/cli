@@ -248,6 +248,59 @@ describe('ZephHook.renameAgentSession', () => {
     });
 });
 
+// The listener drops an encrypted agent.command; an agentDeviceId would file
+// the push under a chat that is not the target's.
+describe('ZephHook.sendAgentCommand', () => {
+    it('POSTs a plaintext agent.command with only the target and body', async () => {
+        sequenceResponses([{ ok: true, json: { data: { pushId: 'push_1' } } }]);
+        const { ZephHook } = await loadHookModule();
+        const hook = new ZephHook({ apiKey: 'ak', baseUrl: 'https://api.example.com/v1' });
+
+        const res = await hook.sendAgentCommand({ targetDeviceId: 'dev_linux', agentSessionName: 'zeph-api', body: '[from cli@mbp] hi' });
+
+        expect(res.pushId).toBe('push_1');
+        expect(lastCalls).toHaveLength(1);
+        expect(lastCalls[0].url).toBe('https://api.example.com/v1/pushes/send');
+        expect(JSON.parse(String(lastCalls[0].init?.body))).toEqual({
+            type: 'agent.command',
+            targetDeviceId: 'dev_linux',
+            agentSessionName: 'zeph-api',
+            body: '[from cli@mbp] hi',
+        });
+    });
+
+    it('fails loudly when the server answers without a pushId', async () => {
+        sequenceResponses([{ ok: true, json: { data: {} } }]);
+        const { ZephHook } = await loadHookModule();
+        const hook = new ZephHook({ apiKey: 'ak', baseUrl: 'https://api.example.com/v1' });
+
+        await expect(hook.sendAgentCommand({ targetDeviceId: 'd', agentSessionName: 's', body: 'b' })).rejects.toThrow('no pushId');
+    });
+});
+
+describe('ZephHook.listDevices', () => {
+    it('GETs the device list', async () => {
+        sequenceResponses([{ ok: true, json: { data: [{ deviceId: 'dev_linux', agentSessions: [{ name: 'zeph-api' }] }] } }]);
+        const { ZephHook } = await loadHookModule();
+        const hook = new ZephHook({ apiKey: 'ak', baseUrl: 'https://api.example.com/v1' });
+
+        const devices = await hook.listDevices();
+
+        expect(devices.map((d) => d.deviceId)).toEqual(['dev_linux']);
+        expect(lastCalls[0].url).toBe('https://api.example.com/v1/devices');
+        expect(lastCalls[0].init?.method).toBe('GET');
+    });
+
+    // "No devices" would surface as an unknown target and hide the real failure.
+    it('fails loudly when the response has no list', async () => {
+        sequenceResponses([{ ok: true, json: {} }]);
+        const { ZephHook } = await loadHookModule();
+        const hook = new ZephHook({ apiKey: 'ak', baseUrl: 'https://api.example.com/v1' });
+
+        await expect(hook.listDevices()).rejects.toThrow('no device list');
+    });
+});
+
 // E2E is Pro-only (ADR-0008). A process that initialized crypto while the
 // account was Pro only learns about a downgrade when the send is refused with
 // 403 PRO_REQUIRED — the push must still go out, as plaintext.

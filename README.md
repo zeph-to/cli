@@ -606,6 +606,13 @@ zeph dismiss --all
 zeph rename "Prod deploy"
 zeph rename --clear                # reset to the default name
 
+# Type a message into another agent session, here or on another PC
+zeph send dev_listener_ab12cd34:zeph-api "Build is green — rerun the e2e suite"
+zeph send zeph-api "…"             # a name/alias works when it names one session
+zeph send zeph-api - <<'EOF'       # a long message on stdin; the quoted heredoc expands nothing
+Build is green. `npm test` passed.
+EOF
+
 # Drop an ended session from this machine's record (it leaves the app's past list)
 zeph forget zeph-myapp-20260914-PLAN-11-32-44-pi
 zeph forget --ended                # every session tmux no longer has
@@ -641,6 +648,7 @@ zeph notify --title "Hello" --json
 | `list` | List recent push notifications |
 | `dismiss <id>` | Dismiss a push (or `--all`) |
 | `rename <name>` | Set the current agent session's display name in the app — run inside a `zeph cc` session (`--clear` resets). Auto-detects the tmux session + this machine's listener device id, so the alias lands on the right device |
+| `send <target> <message…>` | Type a message into another agent session — on this machine or another — as if the user sent it from the phone; it shows in that session's chat and puts it in remote mode. `target` is the `<deviceId>:<session>` key or a name/alias that names exactly one session (a name two machines share is refused, with both keys listed, and so is a session on a machine that is offline — its listener would never type it). The receiver reads `[from <your alias or tmux name>@<machine> · reply: <your key>]` first; outside tmux it is `[from cli@<host>]`, and from a tmux session the listener does not report, or from a subagent, it is `[from <session name>@<host>]` — neither carries a reply key. The CLI twin of the MCP `zeph_agent_send`, for agents without MCP (pi). Global flags (`--key`, `--base-url`) go before `send`; everything after the target is the message, verbatim, and a `--key` or `--base-url` placed there is refused (exit 2) rather than typed into the other session. A `-` as the message reads it from stdin: write it on a quoted heredoc (`<<'EOF'`), since inside double quotes the shell would run backticks or `$(…)` in it. The body is plaintext even with E2E on — keep secrets out. Exit 0 sent, 2 usage, 1 failed, 3 no API key |
 | `forget <session>` | Drop an ended session from this machine's record, so it leaves the app's past list (and the resume whitelist — the same thing deleting the row on the phone does). Refuses a session that is still running: kill it first. `--ended` forgets every remembered session tmux no longer has, which is what a machine that launches agents under a fresh name per task eventually needs |
 | `test` | Verify connection and API key |
 | `cc` · `codex` · `gemini` | Run the agent in a `zeph-<project>` tmux session — reattaches a detached session of that project (newest suffix first) when there is one, else auto-suffixes `-2`, `-3`, …. Auto-spawns the background listener on first invocation so the phone picker just works. Trailing args pass through to the agent (`zeph cc --resume "..."`). On node 22.15+ the wrapper hands its process to tmux rather than waiting on it, so a running session shows no `zeph cc` of its own in `ps` — older runtimes and Windows keep the waiting wrapper `--detach` / `--label <x>` (front of the args) create without attaching / pin the name — see "Run agents through the wrapper" above. |

@@ -9,6 +9,8 @@ import { handleUninstall } from './uninstall.js';
 import { handleVerify } from './verify.js';
 import { handleCheckUpdate } from './check-update.js';
 import { handleAsk } from './ask.js';
+import { parseCliArgv } from './args.js';
+import { liveSendDeps, parseSendArgs, runSend, sendReadsStdin } from './send.js';
 import { handleAgentSession, splitAgentOptions } from './wrapper.js';
 import { handleMcp } from './mcp.js';
 import {
@@ -39,37 +41,6 @@ const detectBranchAndProject = (): { branch?: string; project: string } => {
   return { branch, project };
 };
 
-// ── Arg Parser ──────────────────────────────────────────────────
-
-const parseArgs = (argv: string[]): Record<string, string | boolean> => {
-  const result: Record<string, string | boolean> = {};
-  const positional: string[] = [];
-  const args = argv.slice(2);
-
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (!arg.startsWith('--')) {
-      positional.push(arg);
-      continue;
-    }
-
-    const key = arg.slice(2);
-    const next = args[i + 1];
-
-    if (!next || next.startsWith('--')) {
-      result[key] = true;
-    } else {
-      result[key] = next;
-      i++;
-    }
-  }
-
-  result._command = positional[0] ?? '';
-  result._arg1 = positional[1] ?? '';
-
-  return result;
-};
-
 // ── Output ──────────────────────────────────────────────────────
 
 /** One usage line per registered remote agent — generated so help text can't drift from the table. */
@@ -92,6 +63,17 @@ Commands:
                   (--title, --body, --actions id:Label,…, --timeout secs)
                   Prints one JSON line; exit 0 answered, 1 not. Built for
                   hooks, which cannot call the MCP zeph_ask tool.
+  send <target> <message…>
+                  Type a message into another agent session, on this
+                  machine or another (target = <deviceId>:<session> key,
+                  or a name/alias naming one session). The receiver reads
+                  [from <you>@<host> · reply: <your key>] first (no reply
+                  key outside tmux or from a session the listener does
+                  not report). Global flags go before 'send'; everything
+                  after the target is the message, verbatim. A '-' there
+                  reads the message from stdin — a quoted heredoc
+                  (<<'EOF') keeps backticks and $(…) as text.
+                  Exit 0 sent, 2 usage, 1 failed (3 no API key)
   list            List recent push notifications
   dismiss <id>    Dismiss a push notification (or --all)
   rename <name>   Set this agent session's display name in the app
@@ -389,6 +371,12 @@ const gateCount = (raw: string | boolean | undefined, fallback: number): number 
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 };
 
+const readStdin = async (): Promise<string> => {
+  let stdin = '';
+  for await (const chunk of process.stdin) stdin += chunk;
+  return stdin;
+};
+
 /**
  * Internal — invoked by the Gemini/Codex prompt-submit hooks that
  * `zeph setup` registers, never typed by users (hence absent from help).
@@ -400,9 +388,7 @@ const handleRemoteHook = async (args: Record<string, string | boolean>): Promise
   const agent = args._arg1 as string;
   if (!isRemoteHookAgent(agent)) return 0;
   try {
-    let stdin = '';
-    for await (const chunk of process.stdin) stdin += chunk;
-    const out = runRemoteHook(agent, stdin);
+    const out = runRemoteHook(agent, await readStdin());
     if (out) console.log(out);
   } catch {
     /* never block a prompt */
@@ -597,7 +583,7 @@ const collectPassthrough = (argv: string[], cmd: string): string[] => {
 // ── Main ────────────────────────────────────────────────────────
 
 const main = async (): Promise<number> => {
-  const args = parseArgs(process.argv);
+  const { args, sendArgv } = parseCliArgv(process.argv);
   const command = args._command as string;
 
   if (args.version === true) {
@@ -639,6 +625,16 @@ const main = async (): Promise<number> => {
       return handleNotify(args);
     case 'ask':
       return handleAsk(args);
+    case 'send': {
+      const send = parseSendArgs(sendArgv, sendReadsStdin(sendArgv) ? await readStdin() : undefined);
+      if ('error' in send) {
+        console.error(send.error);
+        return 2;
+      }
+      const hook = createHook(args);
+      if (!hook) return 3;
+      return runSend(send, liveSendDeps(hook));
+    }
     case 'list':
       return handleList(args);
     case 'dismiss':
