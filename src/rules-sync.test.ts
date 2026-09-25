@@ -95,6 +95,9 @@ describe('rules-sync: prompt-hook agents carry the NORMAL branch only', () => {
             for (const heading of REMOTE_ONLY) expect(rule).not.toContain(heading);
             for (const heading of NORMAL) expect(rule).toContain(heading);
             expect(rule).toContain('You owe no `zeph_ask`');
+            // A session that enters REMOTE mid-turn has only this stub's exits.
+            expect(rule).toContain('the phone\'s "send and exit"');
+            expect(rule).toContain('final instruction: carry it out, no `zeph_ask`');
         }
     });
 
@@ -107,6 +110,17 @@ describe('rules-sync: prompt-hook agents carry the NORMAL branch only', () => {
         const tmpl = await import('./templates.js');
         for (const rule of [tmpl.CURSOR_RULE, tmpl.OPENCODE_RULE, tmpl.CLINE_RULE]) {
             for (const heading of REMOTE_ONLY) expect(rule).toContain(heading);
+        }
+    });
+
+    // Their preamble orders a zeph_ask after substantial work in NORMAL, and
+    // carrying out a send-and-exit instruction is substantial work — without
+    // the exception the preamble would re-open the loop the user just left.
+    it('agents without the hook exempt send-and-exit from the preamble ask', async () => {
+        const tmpl = await import('./templates.js');
+        for (const rule of [tmpl.CURSOR_RULE, tmpl.WINDSURF_RULE, tmpl.COPILOT_RULE, tmpl.CLINE_RULE, tmpl.AIDER_RULE, tmpl.OPENCODE_RULE]) {
+            // The preamble is hard-wrapped, so match on collapsed whitespace.
+            expect(rule.replace(/\s+/g, ' ')).toContain('end without `zeph_ask`, however substantial the work');
         }
     });
 });
