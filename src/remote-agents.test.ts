@@ -293,6 +293,29 @@ describe('parseProcTable', () => {
     });
 });
 
+describe('ps snapshot under a non-English locale', () => {
+    // A listener started with LANG=ko_KR.UTF-8 got `목  9/24 21:00:39 2026`
+    // (4 tokens) or `2026년  9월 24일 목요일 21시 03분 05초` (7) for lstart,
+    // so the 5-token cut swallowed or left behind the comm and no pi
+    // subagent pane was ever reported (measured 2026-09-24, takui-MacBookPro).
+    const saved = { LANG: process.env.LANG, LC_ALL: process.env.LC_ALL, LC_TIME: process.env.LC_TIME };
+    afterEach(() => {
+        for (const [k, v] of Object.entries(saved)) {
+            if (v === undefined) delete process.env[k];
+            else process.env[k] = v;
+        }
+    });
+
+    it('still reads start times when the listener runs in ko_KR', async () => {
+        process.env.LANG = 'ko_KR.UTF-8';
+        process.env.LC_ALL = 'ko_KR.UTF-8';
+        process.env.LC_TIME = 'ko_KR.UTF-8';
+        vi.resetModules();
+        const { psStartTimes } = await import('./remote-agents.js');
+        expect(Number.isFinite(psStartTimes().get(process.pid))).toBe(true);
+    });
+});
+
 describe('foregroundAgentFor — subagent pane detection', () => {
     // A subagent pane's tmux view: pane_pid is the login zsh, but the tty's
     // foreground group is the bash→pi script's group (measured 15:25). A plain
