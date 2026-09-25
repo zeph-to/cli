@@ -175,6 +175,7 @@ Pi has no MCP, so where these rules name a zeph_* tool, run the zeph CLI with yo
 - zeph_ask    → \`zeph ask --title "…" --body "…" --actions "id:Label,id2:Label2" --timeout 300\`
   Blocks until answered; prints one JSON line. \`answered: false\` (timeout / unreachable) is a Done-like outcome — treat it as NORMAL.
 - zeph_notify → \`zeph notify --title "…" --body "…" [--priority high]\`
+- zeph_agent_send → \`zeph send <target key> - <<'EOF'\`, the message on the lines after, then \`EOF\` (quoted, so the shell runs nothing in it)
 - AskUserQuestion → pi's own terminal prompt.`;
 
 // Push Signal preamble — pi only. The shared core has no Push Signal section:
