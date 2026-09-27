@@ -331,6 +331,18 @@ block here.
    zeph sh --detach     # create it, print its name, exit
    ```
 
+   **The mirror fits a detached session to the phone.** A pane is as wide
+   as the terminal that last drew it, so a desktop's prompt rules and
+   right-aligned clocks fold in two on a phone. While the phone watches a
+   session no terminal is attached to (a `zeph sh --detach` shell, or an
+   agent whose terminal you closed), the listener resizes its window to the
+   phone's width and gives the old width back when the phone leaves. An
+   attached session keeps its size: shrinking it would shrink your desktop
+   terminal, so the phone wraps those rows instead. A window split into
+   panes is never resized, and one a terminal attaches to while the phone
+   watches is handed back within a renew (5 s). A listener that died while
+   a window was fitted restores it the next time it starts.
+
    `zeph cursor` runs **`cursor-agent`**, Cursor's terminal agent — a
    separate install from the Cursor IDE (the bare `cursor` on your PATH
    is the editor launcher, which exits immediately and can't be driven).
