@@ -617,6 +617,14 @@ describe('resolveKeys', () => {
         expect(resolveKeys(['CTRL-R', ' ctrl-l '])).toEqual(['C-r', 'C-l']);
     });
 
+    it('maps the one letter key a phone needs: r to retry after a permission prompt', () => {
+        expect(resolveKeys(['r'])).toEqual(['r']);
+        expect(resolveKeys([' R '])).toEqual(['r']);
+        // Naming one letter does not open the rest of the keyboard.
+        expect(resolveKeys(['y'])).toBeNull();
+        expect(resolveKeys(['n'])).toBeNull();
+    });
+
     it('still refuses every control key that was not named', () => {
         // Naming three does not open the send-keys key-name syntax: the map
         // knows only what was put in it. `ctrl-d` is left out deliberately —

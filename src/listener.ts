@@ -573,6 +573,11 @@ const ALLOWED_KEYS = new Map<string, string>([
     ['ctrl-c', 'C-c'],
     ['ctrl-r', 'C-r'],
     ['ctrl-l', 'C-l'],
+    // One letter, under the same rule: `r` retries after a permission prompt
+    // is allowed. Typed in the composer it arrives with an Enter attached;
+    // this sends the bare key. Letters are otherwise absent — naming `r` does
+    // not open the keyboard to `y`/`n`.
+    ['r', 'r'],
 ]);
 
 /**
