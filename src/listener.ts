@@ -88,6 +88,7 @@ import { startLanReceiver } from './lan-receiver.js';
 import { createLanTransfer, type LanTransfer } from './lan-transfer.js';
 import { createDeviceKeyRegistration, type DeviceKeyRegistration } from './device-presence.js';
 import { PAYLOAD_LIMIT_BYTES, scanAgentCommands, type AgentCommandCatalog, type ScanResult } from './command-scan.js';
+import { createPaneFitter, releaseStaleFits } from './pane-fit.js';
 
 const PING_INTERVAL_MS = 25_000;
 // Shutdown cap for releasing the local-transfer port. The retract itself is
@@ -885,6 +886,14 @@ const tmuxArgs = (args: string[]): string[] => {
     const sock = findTmuxSocket();
     return sock ? ['-S', sock, ...args] : args;
 };
+
+const runTmux = (args: string[]): { status: number | null; stdout: string } => {
+    const r = spawnSync('tmux', tmuxArgs(args), { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+    return { status: r.status, stdout: r.stdout ?? '' };
+};
+
+/** Sizes a watched detached window to its viewer (pane-fit.ts). */
+const paneFitter = createPaneFitter(runTmux);
 
 // ─── Session inventory ──────────────────────────────────────────────
 
@@ -2317,6 +2326,12 @@ export interface StreamControl {
      * renew protocol keep the 5-minute orphan guard (see STREAM_LEASE_MS).
      */
     renew?: boolean;
+    /**
+     * How many terminal columns the viewer shows (on start and every renew).
+     * A detached, unsplit window is resized to it while watched — see
+     * pane-fit.ts. Absent from viewers that predate it: nothing is resized.
+     */
+    cols?: number;
 }
 
 // ~2.5 fps idle ceiling. Cadence + diff-gating + the per-second send budget
@@ -2600,7 +2615,13 @@ const noteStreamInput = (sessionName: string): void => {
     entry.wake();
 };
 
-export const stopStream = (sessionName: string): void => {
+/**
+ * `keepFit` is for the restart inside a start: the same viewer is subscribing
+ * again, and handing the window back only to shrink it a moment later would
+ * make the program redraw twice.
+ */
+export const stopStream = (sessionName: string, { keepFit = false }: { keepFit?: boolean } = {}): void => {
+    if (!keepFit) paneFitter.release(sessionName);
     const entry = activeStreams.get(sessionName);
     if (!entry) return;
     clearTimeout(entry.timer);
@@ -2821,6 +2842,10 @@ export const handleStreamControl = (
             // reach here: there is nothing in this message a relay could read
             // that it did not already route.
             send({ subtype: 'agent.stream.renew.ok', sessionName: req.sessionName });
+            // After the answer: the viewer may have rotated, and a client may
+            // have attached since the last renew.
+            const renewTarget = tmuxTargetFor(req.sessionName);
+            if (renewTarget !== null) paneFitter.fit(req.sessionName, renewTarget, req.cols);
             return true;
         }
         // Addressed to us but we hold no such stream: it was reaped (lost
@@ -2839,15 +2864,18 @@ export const handleStreamControl = (
         send(streamErrorFrame(sessionName, 'unknown_session'));
         return true;
     }
-    stopStream(sessionName); // idempotent restart (frees this session's slot first)
+    stopStream(sessionName, { keepFit: true }); // idempotent restart (frees this session's slot first)
     // Concurrency guard AFTER the restart-stop: re-subscribing to an already
     // active session doesn't count against the cap, only a genuinely new one
     // does. Refuse the new stream instead of adding to the shared-throttle load.
     if (isStreamCapReached(activeStreams.size) && !evictStalestStream(Date.now())) {
         log(`⧉ stream ${sessionName}: refused — ${activeStreams.size}/${MAX_CONCURRENT_STREAMS} streams already active on this listener`);
         send(streamErrorFrame(sessionName, 'stream_limit'));
+        paneFitter.release(sessionName);
         return true;
     }
+    const fitTarget = tmuxTargetFor(sessionName);
+    if (fitTarget !== null) paneFitter.fit(sessionName, fitTarget, req.cols);
     let lastContent: string | null = null;
     // The cursor's last reported place, as `line,col`. Part of the diff-gate
     // because moving the cursor is a change the CAPTURE cannot show: an arrow
@@ -5251,6 +5279,8 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     log(`zeph listener starting — v${VERSION} — ${wsUrl}`);
     log(`device=${computeListenerDeviceId()} host=${hostname()} pid=${process.pid}`);
     log("Waiting for 'agent.command' pushes from the phone picker. Ctrl-C to stop.");
+    const staleFits = releaseStaleFits(runTmux);
+    if (staleFits > 0) log(`⧉ gave back ${staleFits} window(s) a previous listener had fitted to a phone`);
 
     // Idle sleep kills the socket; "Wake for network access" does not bring it
     // back (see keep-awake.ts). Flag beats config; the default is on.
