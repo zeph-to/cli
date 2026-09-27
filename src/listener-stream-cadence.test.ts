@@ -21,7 +21,7 @@ const fakeTmux = (args: readonly string[]) => {
     // Drop the optional `-S <socket>` prefix tmuxArgs() prepends.
     const a = args[0] === '-S' ? args.slice(2) : args;
     if (a[0] === 'list-panes') {
-        const rows = SESSIONS.map((n, i) => [n, '0', '1700000000', '1700000000', '0', '0', `%${i}`, 'node', 'claude', '/tmp/proj', '1234', '', '', ''].join(FIELD_SEP));
+        const rows = SESSIONS.map((n, i) => [n, '0', '1700000000', '1700000000', '0', '0', `%${i}`, 'node', 'claude', '/tmp/proj', '1234', '', '', '', ''].join(FIELD_SEP));
         return { status: 0, stdout: rows.join('\n') + '\n', stderr: '' };
     }
     if (a[0] === 'list-sessions') return { status: 0, stdout: '', stderr: '' };
@@ -29,7 +29,7 @@ const fakeTmux = (args: readonly string[]) => {
         const target = a[a.indexOf('-t') + 1];
         const session = SESSIONS[Number(target.slice(1))] ?? target;
         // Inject guard's two-field probe: command + owning session.
-        if (a[4]?.includes('#{session_name}')) return { status: 0, stdout: ['node', session].join(FIELD_SEP), stderr: '' };
+        if (a[4]?.includes('#{session_name}')) return { status: 0, stdout: ['node', session, ''].join(FIELD_SEP), stderr: '' };
         if (a[4] === '#{pane_current_command}') return { status: 0, stdout: 'node', stderr: '' };
         // Unset by default, which fails to parse — the same "pane reports no
         // cursor" path every other test in this file runs on.
@@ -75,6 +75,9 @@ const {
     MAX_FRAMES_PER_SEC,
     MAX_CONCURRENT_STREAMS,
 } = await import('./listener.js');
+
+/** A pane-guard probe answer: the foreground command, unmarked unless a test marks it (`@zeph_shell`). */
+const pane = (command: string | null, shellMarked = false) => (command === null ? null : { command, shellMarked });
 
 describe('streamCadence — how fast the next capture comes', () => {
     it('runs at the idle cadence when no input has ever landed', () => {
@@ -346,7 +349,7 @@ describe('capture chain — cadence around a keystroke', () => {
         // chain that no lease is behind.
         await handlePush(
             { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-a', keys: ['down'] },
-            { paneCommand: () => 'claude', sendKeys: () => true, rateLimit: () => true },
+            { paneProbe: () => pane('claude'), sendKeys: () => true, rateLimit: () => true },
         );
         await vi.advanceTimersByTimeAsync(BURST_WINDOW_MS);
         expect(tickTimes()).toHaveLength(afterStop);
@@ -362,7 +365,7 @@ describe('capture chain — cadence around a keystroke', () => {
         const before = tickTimes().length;
         await handlePush(
             { pushId: '2', type: 'agent.command', agentSessionName: 'zeph-b', keys: ['down'] },
-            { paneCommand: () => 'claude', sendKeys: () => true, rateLimit: () => true },
+            { paneProbe: () => pane('claude'), sendKeys: () => true, rateLimit: () => true },
         );
         await vi.advanceTimersByTimeAsync(BURST_INTERVAL_MS);
         expect(tickTimes().length).toBe(before + 1);

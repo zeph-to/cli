@@ -82,7 +82,7 @@ const fakeTmux = (args: readonly string[]) => {
             .sort((x, y) => x.idx - y.idx)
             .map((p) =>
                 [p.session, '0', '1700000000', '1700000000', '0', String(p.idx),
-                    p.paneId, p.current, p.start, p.path ?? '/tmp/proj', String(p.pid), p.label ?? '', p.project ?? '', p.sessionLabel ?? ''].join(FIELD_SEP));
+                    p.paneId, p.current, p.start, p.path ?? '/tmp/proj', String(p.pid), p.label ?? '', p.project ?? '', p.sessionLabel ?? '', ''].join(FIELD_SEP));
         return { status: 0, stdout: rows.join('\n') + '\n', stderr: '' };
     }
     if (a[0] === 'list-sessions') return { status: 0, stdout: '', stderr: '' };
@@ -92,7 +92,7 @@ const fakeTmux = (args: readonly string[]) => {
         const p = paneByIdOrSession(t);
         if (!p) return { status: 1, stdout: '', stderr: "can't find pane" };
         if (fmt.includes('#{session_name}')) {
-            return { status: 0, stdout: [p.current, p.session].join(FIELD_SEP), stderr: '' };
+            return { status: 0, stdout: [p.current, p.session, ''].join(FIELD_SEP), stderr: '' };
         }
         if (fmt.includes('#{pane_pid}')) {
             return { status: 0, stdout: [p.current, p.start, '/tmp/proj', String(p.pid)].join(FIELD_SEP), stderr: '' };

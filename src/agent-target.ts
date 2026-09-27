@@ -9,6 +9,8 @@ export interface AgentTargetDevice {
     label?: string | null;
     providerSessionName?: string | null;
     parentName?: string;
+    /** What runs in the session: an agent kind, or `shell` for a `zeph sh` session. */
+    agentKind?: string;
   }[];
   agentSessionAliases?: Record<string, string>;
 }
@@ -45,11 +47,18 @@ interface Candidate extends AgentTarget {
   offline: boolean;
 }
 
-// Subagents are view-only (no input), so they are never a target.
+/**
+ * Whether an agent may type into this session. Subagents are view-only (no
+ * input). A `zeph sh` session is a real shell: an agent typing into it would
+ * run commands on that machine, on another PC as easily as on its own.
+ */
+export const isAgentTarget = (s: { parentName?: string; agentKind?: string }): boolean =>
+  !s.parentName && s.agentKind !== 'shell';
+
 const candidatesOf = (devices: AgentTargetDevice[]): Candidate[] =>
   devices.flatMap((d) =>
     (d.agentSessions ?? [])
-      .filter((s) => !s.parentName)
+      .filter(isAgentTarget)
       .map((s) => ({
         deviceId: d.deviceId,
         name: s.name,

@@ -32,6 +32,17 @@ export const resolveHookId = (env: NodeJS.ProcessEnv = process.env): string | un
 /** tmux session options the listener reads before falling back to parsing the name (listener `parseSessionName`). */
 export const SESSION_PROJECT_OPTION = '@zeph_project';
 export const SESSION_LABEL_OPTION = '@zeph_session_label';
+/**
+ * Set by `zeph sh` on the session it opens, to that session's own name. The
+ * one exception to the listener's shell-pane refusal. Only a process on this
+ * machine can set a tmux option, so it says the user opened the shell — but it
+ * is not a boundary: the phone can set it through `!` in a Claude Code session,
+ * or from a shell that is already marked (README § Defense).
+ */
+export const SESSION_SHELL_OPTION = '@zeph_shell';
+
+/** `name` as tmux holds it: tmux turns `.`/`:` into `_`, and `;` would end a tmux command (wrapper `tmuxSessionName`). */
+export const tmuxName = (name: string): string => name.replace(/[.:;]/g, '_');
 
 /** The repo a directory belongs to: `key` names the main checkout, `linked` says the directory is in a linked worktree. */
 export interface Checkout {
@@ -91,7 +102,9 @@ export const checkoutOf = (dir: string, run: (dir: string) => string = revParse)
 export const groupOf = (tail: string, checkout: Checkout | null): { project: string; label: string } | null => {
   if (!checkout) return null;
   const { key, linked } = checkout;
-  const rest = tail.startsWith(`${key}-`) ? tail.slice(key.length + 1) : '';
+  // The tail is a tmux name, the key a directory name.
+  const named = tmuxName(key);
+  const rest = tail.startsWith(`${named}-`) ? tail.slice(named.length + 1) : '';
   if (rest && !/^\d+$/.test(rest)) return { project: key, label: rest };
   return linked ? { project: key, label: tail } : null;
 };

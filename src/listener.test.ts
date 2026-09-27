@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, existsSync, readFileSync, rmSync, utimesSync } 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { groupOf } from './config.js';
+import type { ShellAuditEntry } from './shell-audit.js';
 import { projectHash } from './gate.js';
 import {
     parseSessionName,
@@ -37,6 +38,9 @@ import {
     historyLinesIn,
     displayFolder,
 } from './listener.js';
+
+/** A pane-guard probe answer: the foreground command, unmarked unless a test marks it (`@zeph_shell`). */
+const pane = (command: string | null, shellMarked = false) => (command === null ? null : { command, shellMarked });
 
 describe('checkRateLimit', () => {
     beforeEach(() => {
@@ -92,7 +96,7 @@ describe('checkRateLimit', () => {
 
 describe('handlePush', () => {
     const baseDeps = (override: Parameters<typeof handlePush>[1] = {}) => ({
-        paneCommand: () => 'claude',
+        paneProbe: () => pane('claude'),
         inject: () => true,
         rateLimit: () => true,
         // null cwd keeps the remote-marker write (and its tmux lookup) out
@@ -149,7 +153,7 @@ describe('handlePush', () => {
             agentCmd({ targetDeviceId: 'dev_listener_other' }),
             baseDeps({
                 deviceId: () => 'dev_listener_me',
-                paneCommand: () => 'claude',
+                paneProbe: () => pane('claude'),
                 inject: () => { injected = true; return true; },
             }),
         );
@@ -162,7 +166,7 @@ describe('handlePush', () => {
         const ok = await handlePush(
             agentCmd(),
             baseDeps({
-                paneCommand: () => 'claude',
+                paneProbe: () => pane('claude'),
                 inject: (session, text) => { calledWith = { session, text }; return true; },
             }),
         );
@@ -175,7 +179,7 @@ describe('handlePush', () => {
         const ok = await handlePush(
             agentCmd({ body: 'rm -rf' }),
             baseDeps({
-                paneCommand: () => 'bash',
+                paneProbe: () => pane('bash'),
                 inject: () => { injected = true; return true; },
             }),
         );
@@ -188,7 +192,7 @@ describe('handlePush', () => {
         const ok = await handlePush(
             agentCmd({ agentSessionName: 'ghost' }),
             baseDeps({
-                paneCommand: () => null,
+                paneProbe: () => pane(null),
                 inject: () => { injected = true; return true; },
             }),
         );
@@ -213,7 +217,7 @@ describe('handlePush', () => {
         for (const cmd of ['claude', 'codex', 'gemini', 'node', 'python3']) {
             const ok = await handlePush(
                 agentCmd(),
-                baseDeps({ paneCommand: () => cmd }),
+                baseDeps({ paneProbe: () => pane(cmd) }),
             );
             expect(ok, `expected ${cmd} to be allowed`).toBe(true);
         }
@@ -223,10 +227,177 @@ describe('handlePush', () => {
         for (const shell of ['bash', 'zsh', 'fish', 'sh', 'dash', 'ksh', 'tcsh', 'csh', 'pwsh']) {
             const ok = await handlePush(
                 agentCmd(),
-                baseDeps({ paneCommand: () => shell }),
+                baseDeps({ paneProbe: () => pane(shell) }),
             );
             expect(ok, `expected ${shell} to be refused`).toBe(false);
         }
+    });
+
+    // `zeph sh` marks its session with the `@zeph_shell` tmux option. Only
+    // the desktop can set it, so it is the one exception to the RCE guard.
+    describe('marked shell session', () => {
+        const me = 'dev_listener_me';
+        const shellDeps = (override: Parameters<typeof handlePush>[1] = {}) => baseDeps({
+            deviceId: () => me,
+            paneProbe: () => pane('zsh', true),
+            shellAudit: () => true,
+            ...override,
+        });
+
+        it('types into a marked shell pane addressed to this device', async () => {
+            let calledWith: { session: string; text: string } | null = null;
+            const ok = await handlePush(
+                agentCmd({ agentSessionName: 'zeph-app-sh', body: 'ls', targetDeviceId: me }),
+                shellDeps({ inject: (session, text) => { calledWith = { session, text }; return true; } }),
+            );
+            expect(ok).toBe(true);
+            expect(calledWith).toEqual({ session: 'zeph-app-sh', text: 'ls' });
+        });
+
+        it('sends named keys and inserts into a marked shell pane, auditing each', async () => {
+            const entries: ShellAuditEntry[] = [];
+            const shellAudit = (e: ShellAuditEntry) => { entries.push(e); return true; };
+            const keys = await handlePush(
+                agentCmd({ agentSessionName: 'zeph-app-sh', body: undefined, keys: ['ctrl-c', 'enter'], targetDeviceId: me }),
+                shellDeps({ sendKeys: () => true, shellAudit }),
+            );
+            const insert = await handlePush(
+                agentCmd({ agentSessionName: 'zeph-app-sh', body: undefined, insert: 'git st', targetDeviceId: me }),
+                shellDeps({ insertText: () => true, shellAudit }),
+            );
+            expect([keys, insert]).toEqual([true, true]);
+            expect(entries).toEqual([
+                expect.objectContaining({ kind: 'keys', text: 'C-c Enter' }),
+                expect.objectContaining({ kind: 'insert', text: 'git st' }),
+            ]);
+        });
+
+        // The marker is a session option, so it outlives the shell prompt: an
+        // agent started inside `zeph sh` still needs the push addressed.
+        it('refuses an unaddressed push even when a program, not the shell, is in front', async () => {
+            let injected = false;
+            const ok = await handlePush(
+                agentCmd({ agentSessionName: 'zeph-app-sh', body: 'ls' }),
+                shellDeps({ paneProbe: () => pane('claude', true), inject: () => { injected = true; return true; } }),
+            );
+            expect(ok).toBe(false);
+            expect(injected).toBe(false);
+        });
+
+        // push.new fans out to every listener of the account. Two PCs with
+        // `zeph sh` in the same project share the tmux name, so an
+        // unaddressed command would run in both shells.
+        it('refuses a push that does not name this device', async () => {
+            for (const targetDeviceId of [undefined, '', 'dev_listener_other']) {
+                let injected = false;
+                const ok = await handlePush(
+                    agentCmd({ agentSessionName: 'zeph-app-sh', body: 'ls', targetDeviceId }),
+                    shellDeps({ inject: () => { injected = true; return true; } }),
+                );
+                expect(ok, `targetDeviceId=${JSON.stringify(targetDeviceId)}`).toBe(false);
+                expect(injected).toBe(false);
+            }
+        });
+
+        it('still applies the rate limit and the subagent view-only rule', async () => {
+            const limited = await handlePush(
+                agentCmd({ agentSessionName: 'zeph-app-sh', targetDeviceId: me }),
+                shellDeps({ rateLimit: () => false }),
+            );
+            const subagent = await handlePush(
+                agentCmd({ agentSessionName: 'zeph-app-sh.12', targetDeviceId: me }),
+                shellDeps(),
+            );
+            expect([limited, subagent]).toEqual([false, false]);
+        });
+
+        it('audits each inject once, with the foreground command', async () => {
+            const entries: ShellAuditEntry[] = [];
+            await handlePush(
+                agentCmd({ agentSessionName: 'zeph-app-sh', body: 'ls -la', targetDeviceId: me }),
+                shellDeps({ shellAudit: (e) => { entries.push(e); return true; } }),
+            );
+            await handlePush(
+                agentCmd({ agentSessionName: 'zeph-app-sh', body: 'hunter2', targetDeviceId: me }),
+                shellDeps({ paneProbe: () => pane('sudo', true), shellAudit: (e) => { entries.push(e); return true; } }),
+            );
+            expect(entries).toEqual([
+                expect.objectContaining({ session: 'zeph-app-sh', kind: 'body', foreground: 'zsh', atShell: true, text: 'ls -la' }),
+                expect.objectContaining({ session: 'zeph-app-sh', kind: 'body', foreground: 'sudo', atShell: false, text: 'hunter2' }),
+            ]);
+        });
+
+        it('injects even when the audit write fails', async () => {
+            const ok = await handlePush(
+                agentCmd({ agentSessionName: 'zeph-app-sh', targetDeviceId: me }),
+                shellDeps({ shellAudit: () => false }),
+            );
+            expect(ok).toBe(true);
+        });
+
+        // A shell runs what it reads: attachment paths would each be a command
+        // line, ESC can leave a bracketed paste, and an insert must not run.
+        it('refuses attachments, control bytes, and a newline in an insert', async () => {
+            const cases = [
+                agentCmd({ agentSessionName: 'zeph-app-sh', body: 'cat', files: [{ fileKey: 'fk1', fileName: 'a.txt' }], targetDeviceId: me }),
+                agentCmd({ agentSessionName: 'zeph-app-sh', body: 'echo \x1b[201~ hi', targetDeviceId: me }),
+                agentCmd({ agentSessionName: 'zeph-app-sh', body: 'echo \u009b201~ hi', targetDeviceId: me }),
+                agentCmd({ agentSessionName: 'zeph-app-sh', body: undefined, insert: 'rm -rf x\n', targetDeviceId: me }),
+            ];
+            for (const push of cases) {
+                let typed = false;
+                const ok = await handlePush(push, shellDeps({
+                    downloadAttachments: async () => ['/tmp/a.txt'],
+                    inject: () => { typed = true; return true; },
+                    insertText: () => { typed = true; return true; },
+                }));
+                expect(ok, JSON.stringify(push)).toBe(false);
+                expect(typed).toBe(false);
+            }
+        });
+
+        it('refuses attachments before downloading them', async () => {
+            let downloaded = false;
+            const ok = await handlePush(
+                agentCmd({ agentSessionName: 'zeph-app-sh', body: 'cat', files: [{ fileKey: 'fk1', fileName: 'a.txt' }], targetDeviceId: me }),
+                shellDeps({ downloadAttachments: async () => { downloaded = true; return ['/tmp/a.txt']; } }),
+            );
+            expect(ok).toBe(false);
+            expect(downloaded).toBe(false);
+        });
+
+        it('still takes a multi-line body — each line is a command the user meant', async () => {
+            const ok = await handlePush(
+                agentCmd({ agentSessionName: 'zeph-app-sh', body: 'cd /tmp\nls', targetDeviceId: me }),
+                shellDeps(),
+            );
+            expect(ok).toBe(true);
+        });
+
+        // listener.log is world-readable; what the shell got lives in the 0600 audit log.
+        it('logs only the length of what a shell received', async () => {
+            const lines: string[] = [];
+            const spy = vi.spyOn(console, 'log').mockImplementation((m: string) => { lines.push(m); });
+            try {
+                await handlePush(
+                    agentCmd({ agentSessionName: 'zeph-app-sh', body: 'hunter2', targetDeviceId: me }),
+                    shellDeps(),
+                );
+            } finally {
+                spy.mockRestore();
+            }
+            expect(lines.join('\n')).not.toContain('hunter2');
+            expect(lines.join('\n')).toContain('zeph-app-sh: [7 chars]');
+        });
+
+        it('does not audit an agent session', async () => {
+            let audited = false;
+            await handlePush(
+                agentCmd({ targetDeviceId: me }),
+                shellDeps({ paneProbe: () => pane('claude'), shellAudit: () => { audited = true; return true; } }),
+            );
+            expect(audited).toBe(false);
+        });
     });
 
     it('drops empty body (no spurious Enter)', async () => {
@@ -304,7 +475,7 @@ describe('handlePush — type: file (ADR-0013 receive half)', () => {
             saveFile: async (_push, file) => { saved.push(file.fileName); return `/home/u/Downloads/Zeph/${file.fileName}`; },
             notify: async (n) => { notes.push(n); return true; },
             inject: () => { injected++; return true; },
-            paneCommand: () => 'claude',
+            paneProbe: () => pane('claude'),
             rateLimit: () => true,
             paneCwd: () => null,
         };
@@ -465,7 +636,7 @@ describe('resolveKeys', () => {
 
 describe('handlePush key events', () => {
     const keysDeps = (override: Parameters<typeof handlePush>[1] = {}) => ({
-        paneCommand: () => 'claude',
+        paneProbe: () => pane('claude'),
         sendKeys: () => true,
         rateLimit: () => true,
         ...override,
@@ -532,7 +703,7 @@ describe('handlePush key events', () => {
         let sent = false;
         const ok = await handlePush(
             keyCmd(['enter']),
-            keysDeps({ paneCommand: () => 'bash', sendKeys: () => { sent = true; return true; } }),
+            keysDeps({ paneProbe: () => pane('bash'), sendKeys: () => { sent = true; return true; } }),
         );
         expect(ok).toBe(false);
         expect(sent).toBe(false);
@@ -563,7 +734,7 @@ describe('handlePush key events', () => {
 
 describe('handlePush insert (text without the submitting Enter)', () => {
     const insertDeps = (override: Parameters<typeof handlePush>[1] = {}) => ({
-        paneCommand: () => 'claude',
+        paneProbe: () => pane('claude'),
         insertText: () => true,
         rateLimit: () => true,
         paneCwd: () => null,
@@ -597,7 +768,7 @@ describe('handlePush insert (text without the submitting Enter)', () => {
         let inserted = false;
         const ok = await handlePush(
             insertCmd(),
-            insertDeps({ paneCommand: () => 'bash', insertText: () => { inserted = true; return true; } }),
+            insertDeps({ paneProbe: () => pane('bash'), insertText: () => { inserted = true; return true; } }),
         );
         expect(ok).toBe(false);
         expect(inserted).toBe(false);
@@ -703,6 +874,8 @@ describe('groupOf', () => {
     it('splits a tail that starts with the repo name into project and label', () => {
         expect(groupOf('ko-qmd-20260924-PLAN-1-pi', main)).toEqual({ project: 'ko-qmd', label: '20260924-PLAN-1-pi' });
         expect(groupOf('ko-qmd-wt-x', linked)).toEqual({ project: 'ko-qmd', label: 'wt-x' });
+        // A dotted repo's session name carries `_`, as tmux stores it.
+        expect(groupOf('foo_bar-wt-x', { key: 'foo.bar', linked: true })).toEqual({ project: 'foo.bar', label: 'wt-x' });
     });
 
     // `-2`, `-3` is the wrapper's family counter — the phone shows it as `#2`.
@@ -1285,10 +1458,24 @@ describe('writeRemoteMarker (ADR-0002)', () => {
     it('is written by handlePush after a successful text inject', async () => {
         const ok = await handlePush(
             { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-app', body: 'hello' },
-            { paneCommand: () => 'claude', inject: () => true, rateLimit: () => true, paneCwd: () => '/proj/app' },
+            { paneProbe: () => pane('claude'), inject: () => true, rateLimit: () => true, paneCwd: () => '/proj/app' },
         );
         expect(ok).toBe(true);
         expect(existsSync(markerPath('/proj/app'))).toBe(true);
+    });
+
+    // No prompt hook reads a marker in a shell, and one left behind in that
+    // cwd could flag a later identical CC prompt as sent from the phone.
+    it('is not written for a marked shell session', async () => {
+        const ok = await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-app-sh', body: 'hello', targetDeviceId: 'dev_me' },
+            {
+                paneProbe: () => pane('zsh', true), inject: () => true, rateLimit: () => true,
+                paneCwd: () => '/proj/shell', deviceId: () => 'dev_me', shellAudit: () => true,
+            },
+        );
+        expect(ok).toBe(true);
+        expect(existsSync(markerPath('/proj/shell'))).toBe(false);
     });
 
     it('is on disk before the keys reach the pane — the prompt hook fires on that Enter', async () => {
@@ -1300,7 +1487,7 @@ describe('writeRemoteMarker (ADR-0002)', () => {
         await handlePush(
             { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-app', body: 'hello' },
             {
-                paneCommand: () => 'claude',
+                paneProbe: () => pane('claude'),
                 inject: () => { markerAtInject = existsSync(markerPath('/proj/order')); return true; },
                 rateLimit: () => true,
                 paneCwd: () => '/proj/order',
@@ -1315,7 +1502,7 @@ describe('writeRemoteMarker (ADR-0002)', () => {
         // without a marker here that submit looks locally typed.
         const ok = await handlePush(
             { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-app', insert: 'hello' },
-            { paneCommand: () => 'claude', insertText: () => true, rateLimit: () => true, paneCwd: () => '/proj/inserted' },
+            { paneProbe: () => pane('claude'), insertText: () => true, rateLimit: () => true, paneCwd: () => '/proj/inserted' },
         );
         expect(ok).toBe(true);
         expect(existsSync(markerPath('/proj/inserted'))).toBe(true);
@@ -1324,7 +1511,7 @@ describe('writeRemoteMarker (ADR-0002)', () => {
     it('is NOT written when the inject fails', async () => {
         await handlePush(
             { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-app', body: 'hello' },
-            { paneCommand: () => 'claude', inject: () => false, rateLimit: () => true, paneCwd: () => '/proj/failed' },
+            { paneProbe: () => pane('claude'), inject: () => false, rateLimit: () => true, paneCwd: () => '/proj/failed' },
         );
         expect(existsSync(markerPath('/proj/failed'))).toBe(false);
     });
@@ -1332,7 +1519,7 @@ describe('writeRemoteMarker (ADR-0002)', () => {
     it('is NOT written for key-event injections (no prompt to match)', async () => {
         const ok = await handlePush(
             { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-app', keys: ['Enter'] },
-            { paneCommand: () => 'claude', sendKeys: () => true, rateLimit: () => true, paneCwd: () => '/proj/keys' },
+            { paneProbe: () => pane('claude'), sendKeys: () => true, rateLimit: () => true, paneCwd: () => '/proj/keys' },
         );
         expect(ok).toBe(true);
         expect(existsSync(markerPath('/proj/keys'))).toBe(false);
@@ -1341,7 +1528,7 @@ describe('writeRemoteMarker (ADR-0002)', () => {
     it('skips silently when the pane cwd is unknown', async () => {
         const ok = await handlePush(
             { pushId: '1', type: 'agent.command', agentSessionName: 'zeph-app', body: 'hello' },
-            { paneCommand: () => 'claude', inject: () => true, rateLimit: () => true, paneCwd: () => null },
+            { paneProbe: () => pane('claude'), inject: () => true, rateLimit: () => true, paneCwd: () => null },
         );
         expect(ok).toBe(true);
     });
