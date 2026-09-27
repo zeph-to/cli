@@ -27,7 +27,8 @@ import { constants as fsConstants, copyFileSync, existsSync, linkSync, mkdirSync
 import { homedir, hostname, userInfo } from 'os';
 import { join, basename, dirname, isAbsolute, resolve, sep } from 'path';
 import WebSocket from 'ws';
-import { checkoutOf, groupOf, loadConfig, resolvedEnv, SESSION_LABEL_OPTION, SESSION_PROJECT_OPTION, VERSION, type Checkout } from './config.js';
+import { checkoutOf, groupOf, loadConfig, resolvedEnv, SESSION_LABEL_OPTION, SESSION_PROJECT_OPTION, SESSION_SHELL_OPTION, VERSION, type Checkout } from './config.js';
+import { appendShellAudit, type ShellAuditEntry } from './shell-audit.js';
 import { legacyWsEnvNotice, resolveWsUrlDetailed } from './ws-url.js';
 import {
     clearListenerRuntime,
@@ -193,10 +194,13 @@ export const SESSION_REPORT_INTERVAL_MS = 5_000;
 // watch can take up to 30 s to reach an idle listener.
 export const SESSION_REPORT_HEARTBEAT_MS = 30_000;
 
+/** What a reported session runs: a registered agent, or a `zeph sh` shell. */
+export type SessionKind = AgentKind | 'shell';
+
 interface AgentSession {
     name: string;
     attached: boolean;
-    agentKind: AgentKind;
+    agentKind: SessionKind;
     /** Set when this session is a SUBAGENT — an extra pane of the parent
      *  session `parentName` (`zeph-zeph.48` belongs to `zeph-zeph`). Subagent
      *  sessions are view-only: input, keys, exit, resume and forget are
@@ -434,27 +438,40 @@ export const checkRateLimit = (
     return true;
 };
 
+/** What the inject guard learns from one probe of a session's pinned pane. */
+export interface PaneProbe {
+    /** `pane_current_command` — the foreground program. */
+    command: string;
+    /** The session carries `@zeph_shell` naming itself (`zeph sh`): a shell here may be typed into. */
+    shellMarked: boolean;
+}
+
 /**
  * Read the foreground command on the named session's PINNED pane, verifying
  * the pane still belongs to that session. A pane id is stable across restarts
  * only within one tmux server: after a restart the same `%N` can name a pane
  * in a different session, and typing into that pane would be RCE into someone
- * else's shell. The owning session rides along in the same display-message —
- * one spawn, no second probe — and a mismatch answers null ("no such
- * session"), which refuses the inject until the next sweep re-pins.
+ * else's shell. The owning session and its shell marker ride along in the same
+ * display-message — one spawn, no second probe — and a mismatch answers null
+ * ("no such session"), which refuses the inject until the next sweep re-pins.
+ * An unset option formats as the empty string, so an unmarked pane reads as
+ * `shellMarked: false`, never as an error. The marker must name this very
+ * session: a format reads a user option through pane → window → session →
+ * global inheritance, so a stray `set -g @zeph_shell 1` would otherwise mark
+ * every session on the server.
  */
-export const paneCurrentCommand = (session: string): string | null => {
+export const probePane = (session: string): PaneProbe | null => {
     const target = tmuxTargetFor(session);
     if (target === null) return null; // unresolvable subagent — never spawn
     const result = spawnSync('tmux', tmuxArgs(['display-message', '-p', '-t', target,
-        `#{pane_current_command}${FIELD_SEP}#{session_name}`]), {
+        `#{pane_current_command}${FIELD_SEP}#{session_name}${FIELD_SEP}#{${SESSION_SHELL_OPTION}}`]), {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'ignore'],
     });
     if (result.status !== 0) return null;
     const parts = (result.stdout ?? '').trim().split(FIELD_SEP);
-    if (parts.length !== 2 || parts[1] !== session) return null;
-    return parts[0] || null;
+    if (parts.length !== 3 || parts[1] !== session || !parts[0]) return null;
+    return { command: parts[0], shellMarked: parts[2] === session };
 };
 
 const isShellPane = (command: string | null): boolean => {
@@ -556,6 +573,11 @@ const ALLOWED_KEYS = new Map<string, string>([
     ['ctrl-c', 'C-c'],
     ['ctrl-r', 'C-r'],
     ['ctrl-l', 'C-l'],
+    // One letter, under the same rule: `r` retries after a permission prompt
+    // is allowed. Typed in the composer it arrives with an Enter attached;
+    // this sends the bare key. Letters are otherwise absent — naming `r` does
+    // not open the keyboard to `y`/`n`.
+    ['r', 'r'],
 ]);
 
 /**
@@ -3202,9 +3224,10 @@ export const validateInputMessage = (msg: AgentCommandInput): InputCheck => {
 const deliverInput = (input: PendingInput): void => {
     // The reorder hold can outlive the lease that admitted the message.
     const injected = activeStreams.has(input.sessionName)
+        // Stream input arrives on this listener's own subscription: addressed.
         && (input.tokens
-            ? tryInjectKeys(input.sessionName, input.tokens, {})
-            : tryInject(input.sessionName, input.text ?? '', {}, input.submit));
+            ? tryInjectKeys(input.sessionName, input.tokens, {}, true)
+            : tryInject(input.sessionName, input.text ?? '', {}, { submit: input.submit, addressed: true }));
     // Every refusal reachable from here — dead lease, shell pane, rate limit,
     // a failed send-keys — used to be silent, which contradicts the contract
     // above: the sender would keep waiting on a keystroke that never lands
@@ -3461,7 +3484,7 @@ export const collectSessionsVerbose = (): CollectResult => {
     // per-session display-message) would multiply with split panes; the worker
     // thread keeps the one blocking sweep off the event loop.
     const list = spawnSync('tmux', tmuxArgs(['list-panes', '-a', '-F',
-        `#{session_name}${FIELD_SEP}#{session_attached}${FIELD_SEP}#{session_created}${FIELD_SEP}#{session_activity}${FIELD_SEP}#{window_index}${FIELD_SEP}#{pane_index}${FIELD_SEP}#{pane_id}${FIELD_SEP}#{pane_current_command}${FIELD_SEP}#{pane_start_command}${FIELD_SEP}#{pane_current_path}${FIELD_SEP}#{pane_pid}${FIELD_SEP}#{@zeph_pane_label}${FIELD_SEP}#{@zeph_project}${FIELD_SEP}#{@zeph_session_label}`]), {
+        `#{session_name}${FIELD_SEP}#{session_attached}${FIELD_SEP}#{session_created}${FIELD_SEP}#{session_activity}${FIELD_SEP}#{window_index}${FIELD_SEP}#{pane_index}${FIELD_SEP}#{pane_id}${FIELD_SEP}#{pane_current_command}${FIELD_SEP}#{pane_start_command}${FIELD_SEP}#{pane_current_path}${FIELD_SEP}#{pane_pid}${FIELD_SEP}#{@zeph_pane_label}${FIELD_SEP}#{@zeph_project}${FIELD_SEP}#{@zeph_session_label}${FIELD_SEP}#{${SESSION_SHELL_OPTION}}`]), {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -3489,17 +3512,17 @@ export const collectSessionsVerbose = (): CollectResult => {
 
     const sessions: AgentSession[] = [];
     const rejected: Array<{ name: string; reason: string }> = [];
-    /** 14 fields per row; a mismatch is the mangled-separator failure the
+    /** 15 fields per row; a mismatch is the mangled-separator failure the
      *  sanity log above exists for — skip the row loudly, never misparse it. */
-    const PANE_FIELDS = 14;
+    const PANE_FIELDS = 15;
     interface PaneRow { paneId: string; win: number; idx: number; label: string; info: PaneInfo }
-    interface PaneGroup { attached: boolean; created?: string; activity?: string; project?: string; label?: string; panes: PaneRow[] }
+    interface PaneGroup { attached: boolean; created?: string; activity?: string; project?: string; label?: string; shell: boolean; panes: PaneRow[] }
     const groups = new Map<string, PaneGroup>();
     let malformed = 0;
     for (const line of rawLines) {
         const f = line.split(FIELD_SEP);
         if (f.length !== PANE_FIELDS) { malformed += 1; continue; }
-        const [name, attached, created, activity, win, idx, paneId, current, start, path, pid, label, project, sessionLabel] = f;
+        const [name, attached, created, activity, win, idx, paneId, current, start, path, pid, label, project, sessionLabel, shellMark] = f;
         if (!parseSessionName(name)) {
             // Not noisy enough to log every plain tmux session here —
             // would clutter the verbose output on machines with many
@@ -3522,7 +3545,7 @@ export const collectSessionsVerbose = (): CollectResult => {
                 panePid: numeric(pid) === Number.MAX_SAFE_INTEGER ? null : numeric(pid),
             },
         };
-        const group = groups.get(name) ?? { attached: attached === '1', created, activity, project, label: sessionLabel, panes: [] };
+        const group = groups.get(name) ?? { attached: attached === '1', created, activity, project, label: sessionLabel, shell: shellMark === name, panes: [] };
         group.panes.push(row);
         groups.set(name, group);
     }
@@ -3542,6 +3565,30 @@ export const collectSessionsVerbose = (): CollectResult => {
         // main role — accepted. Focus decides nothing here, which is the point:
         // focusing a subagent pane must not move the phone's view of the main.
         group.panes.sort((a, b) => (a.win - b.win) || (a.idx - b.idx));
+        // A `zeph sh` session is a shell whatever runs in it: its first pane
+        // is the one the phone types into, and agent detection never applies.
+        // Checked before detection so `claude` started inside it does not turn
+        // it into an agent session the registry would offer to resume.
+        const shellRow = group.shell ? group.panes[0] : undefined;
+        if (shellRow) {
+            const parsed = parseSessionName(name, group);
+            if (!parsed) continue; // unreachable — groups only holds parsed names
+            if (shellRow.info.currentPath) paneCwdOf.set(name, shellRow.info.currentPath);
+            targets[name] = shellRow.paneId;
+            sessions.push({
+                name,
+                attached: group.attached,
+                agentKind: 'shell',
+                agentSessionId: null,
+                project: parsed.project,
+                label: parsed.label,
+                createdAt: epochToIso(group.created),
+                lastActivityAt: epochToIso(group.activity),
+                // No `state`: the server arms its completion and `gone` pushes
+                // on reported state, and a shell going idle is not news.
+            });
+            continue;
+        }
         let main: { row: PaneRow; agent: RegisteredRemoteAgent } | null = null;
         for (const row of group.panes) {
             const agent = detectRemoteAgent(row.info);
@@ -3685,7 +3732,9 @@ export const collectSessionsVerbose = (): CollectResult => {
         // Subagents are view-only panes OF a session, not resumable ones:
         // the registry records what a session IS so exit/resume can act on
         // it, and neither is ever offered for a subagent.
-        sessions.filter((s) => !s.parentName).map((s) => ({
+        // A shell is not resumable either: resume starts a registered agent
+        // binary, and there is none behind a `zeph sh` session.
+        sessions.filter((s) => !s.parentName && s.agentKind !== 'shell').map((s) => ({
             name: s.name,
             cwd: paneCwdOf.get(s.name) ?? null,
             agentKind: s.agentKind,
@@ -3703,7 +3752,8 @@ export const collectSessionsVerbose = (): CollectResult => {
  * tmux activity timestamps. Returns [] when tmux is unreachable or no
  * agent sessions exist. Sessions whose pane is at a shell or running
  * something not registered in remote-agents.ts are filtered out — the
- * phone can't usefully address them.
+ * phone can't usefully address them — except a `zeph sh` session, which is
+ * reported as `shell`.
  */
 const collectSessions = (): AgentSession[] => {
     const result = collectSessionsVerbose();
@@ -3858,7 +3908,9 @@ interface PushItem {
 }
 
 interface HandlePushDeps {
-    paneCommand?: (session: string) => string | null;
+    paneProbe?: (session: string) => PaneProbe | null;
+    /** Audit sink for input admitted into a marked shell; defaults to the state-dir log. */
+    shellAudit?: (entry: ShellAuditEntry) => boolean;
     inject?: (session: string, text: string) => boolean;
     /** Paste-only sibling of `inject` — text without the submitting Enter. */
     insertText?: (session: string, text: string) => boolean;
@@ -3891,8 +3943,16 @@ interface HandlePushDeps {
  * Shared inject path: pane guard → rate limit → tmux send-keys. Both
  * the structured `agent.command` push type and the legacy `@<session>`
  * prefix path route through here so the defense layers can't diverge.
+ *
+ * `addressed` says the input names this machine: a REST push whose
+ * `targetDeviceId` is this device, or stream input, which only ever arrives
+ * on this listener's own subscription. A marked shell refuses anything else —
+ * push.new fans out to every listener of the account, and two PCs with
+ * `zeph sh` open in the same project share the tmux name.
+ *
+ * Returns what the probe saw when the input is admitted, null when refused.
  */
-const passesInjectGuards = (session: string, deps: HandlePushDeps, cost = 1): boolean => {
+const passesInjectGuards = (session: string, deps: HandlePushDeps, addressed: boolean, cost = 1): PaneProbe | null => {
     // Subagent panes are view-only: the phone reads them but the agent
     // itself answers at the terminal. This sits above the rate bucket so a
     // flood of refused subagent writes costs nothing and spawns nothing —
@@ -3900,25 +3960,47 @@ const passesInjectGuards = (session: string, deps: HandlePushDeps, cost = 1): bo
     // the refusal must not depend on the pane still being mapped.
     if (isSubagentSessionName(session)) {
         log(`! ${session}: subagent pane is view-only — drop`);
-        return false;
+        return null;
     }
     // Rate bucket first: the pane probe below is a blocking tmux spawnSync,
     // and the sequencer can flush several held messages back-to-back — an
     // empty bucket must refuse before paying that probe N times, not after.
     if (!(deps.rateLimit ?? checkRateLimit)(session, Date.now(), cost)) {
         log(`! ${session}: rate-limited — drop`);
-        return false;
+        return null;
     }
-    const cmd = (deps.paneCommand ?? paneCurrentCommand)(session);
-    if (cmd === null) {
+    const probe = (deps.paneProbe ?? probePane)(session);
+    if (probe === null) {
         log(`! ${session}: no such tmux session — drop`);
-        return false;
+        return null;
     }
-    if (isShellPane(cmd)) {
-        log(`! ${session}: pane is at shell (${cmd}) — refusing (would be RCE)`);
-        return false;
+    if (probe.shellMarked && !addressed) {
+        log(`! ${session}: shell session needs a push addressed to this device — refusing`);
+        return null;
     }
-    return true;
+    if (isShellPane(probe.command) && !probe.shellMarked) {
+        log(`! ${session}: pane is at shell (${probe.command}) — refusing (would be RCE)`);
+        return null;
+    }
+    return probe;
+};
+
+/** Log one input admitted into a marked shell. Best-effort, like the remote marker. */
+const auditShellInput = (
+    input: { session: string; probe: PaneProbe; kind: ShellAuditEntry['kind']; text: string },
+    deps: HandlePushDeps,
+): void => {
+    const { session, probe, kind, text } = input;
+    const entry: ShellAuditEntry = {
+        at: new Date((deps.now ?? Date.now)()),
+        session,
+        target: tmuxTargetFor(session) ?? session,
+        kind,
+        foreground: probe.command,
+        atShell: isShellPane(probe.command),
+        text,
+    };
+    if (!(deps.shellAudit ?? appendShellAudit)(entry)) log(`! ${session}: shell audit write failed`);
 };
 
 /**
@@ -3977,30 +4059,71 @@ const defaultPaneCwd = (session: string): string | null => readPaneInfo(session)
  * after the inject, it lost that race and the phone message read as typed at
  * the keyboard. A failed inject takes the marker back out.
  */
-const tryInject = (session: string, text: string, deps: HandlePushDeps, submit = true): boolean => {
+const tryInject = (
+    session: string,
+    text: string,
+    deps: HandlePushDeps,
+    opts: { submit: boolean; addressed: boolean; files?: boolean },
+): boolean => {
     if (!text) {
         log(`! ${session}: empty text — drop`);
         return false;
     }
-    if (!passesInjectGuards(session, deps, SUBMIT_COST)) return false;
-    const cwd = (deps.paneCwd ?? defaultPaneCwd)(session);
+    const probe = passesInjectGuards(session, deps, opts.addressed, SUBMIT_COST);
+    if (!probe) return false;
+    if (probe.shellMarked) {
+        const refusal = shellTextRefusal(text, opts);
+        if (refusal) {
+            log(`! ${session}: ${refusal} — refusing for a shell session`);
+            return false;
+        }
+    }
+    // No prompt hook reads a marker in a shell, and one left in that cwd could
+    // flag a later identical agent prompt as sent from the phone.
+    const cwd = probe.shellMarked ? null : (deps.paneCwd ?? defaultPaneCwd)(session);
     const marked = cwd !== null && writeRemoteMarker(cwd, text);
-    const ok = submit
+    const ok = opts.submit
         ? (deps.inject ?? injectKeys)(session, text)
         : (deps.insertText ?? pasteText)(session, text);
-    const preview = text.length > 60 ? text.slice(0, 60) + '…' : text;
-    log(`${ok ? (submit ? '→' : '⇢') : '✗'} ${session}: ${preview}`);
-    if (ok) noteStreamInput(session);
-    else if (marked) clearRemoteMarker(cwd);
+    // listener.log is not private: what a shell received — a `sudo` password
+    // included — goes to the 0600 audit log, never here.
+    const preview = probe.shellMarked
+        ? `[${[...text].length} chars]`
+        : text.length > 60 ? text.slice(0, 60) + '…' : text;
+    log(`${ok ? (opts.submit ? '→' : '⇢') : '✗'} ${session}: ${preview}`);
+    if (ok) {
+        noteStreamInput(session);
+        if (probe.shellMarked) auditShellInput({ session, probe, kind: opts.submit ? 'body' : 'insert', text }, deps);
+    } else if (marked) clearRemoteMarker(cwd);
     return ok;
+};
+
+/**
+ * Why text may not go into a marked shell, or null when it may. A shell runs
+ * what it reads, so the rules the agent prompt never needed apply here:
+ * attachment paths would arrive as lines of their own, each a command; ESC and
+ * other control bytes, C1 included, can leave a bracketed paste or drive the
+ * line editor;
+ * and an insert must not carry a newline, which a shell without bracketed
+ * paste (macOS `/bin/bash` 3.2, `dash`) would run.
+ */
+export const shellTextRefusal = (text: string, opts: { submit: boolean; files?: boolean }): string | null => {
+    if (opts.files) return 'attachments';
+    const controls = opts.submit ? /[\x00-\x09\x0b-\x1f\x7f-\x9f]/ : /[\x00-\x1f\x7f-\x9f]/;
+    if (controls.test(text)) return opts.submit ? 'control character' : 'control character or newline in an insert';
+    return null;
 };
 
 /** Key-event sibling of tryInject: same pane/shell/rate guards, but sends
  *  named keys instead of literal text + Enter. */
-const tryInjectKeys = (session: string, tokens: string[], deps: HandlePushDeps): boolean => {
-    if (!passesInjectGuards(session, deps)) return false;
+const tryInjectKeys = (session: string, tokens: string[], deps: HandlePushDeps, addressed: boolean): boolean => {
+    const probe = passesInjectGuards(session, deps, addressed);
+    if (!probe) return false;
     const ok = (deps.sendKeys ?? injectNamedKeys)(session, tokens);
-    if (ok) noteStreamInput(session);
+    if (ok) {
+        noteStreamInput(session);
+        if (probe.shellMarked) auditShellInput({ session, probe, kind: 'keys', text: tokens.join(' ') }, deps);
+    }
     log(`${ok ? '⌨' : '✗'} ${session}: [${tokens.join(' ')}]`);
     return ok;
 };
@@ -4386,6 +4509,9 @@ export const handlePush = async (
     // the other would otherwise inject it into its own same-named session.
     const me = deps.deviceId?.() ?? computeListenerDeviceId();
     if (push.targetDeviceId && push.targetDeviceId !== me) return false;
+    // An agent session still takes an unaddressed push (older senders); a
+    // marked shell does not — passesInjectGuards reads this.
+    const addressed = push.targetDeviceId === me;
 
     // Key event (Esc / arrows / Enter) — no body, no attachments. Lets the
     // phone escape a full-screen modal (e.g. after `/usage`) that swallows
@@ -4396,7 +4522,7 @@ export const handlePush = async (
             log(`! ${push.agentSessionName}: unknown key(s) [${push.keys.join(' ')}] — drop`);
             return false;
         }
-        const injected = tryInjectKeys(push.agentSessionName, tokens, deps);
+        const injected = tryInjectKeys(push.agentSessionName, tokens, deps, addressed);
         if (injected) deps.onKeysInjected?.(push.agentSessionName);
         return injected;
     }
@@ -4410,7 +4536,14 @@ export const handlePush = async (
             log(`! ${push.agentSessionName}: insert and body are mutually exclusive — drop`);
             return false;
         }
-        return tryInject(push.agentSessionName, push.insert, deps, false);
+        return tryInject(push.agentSessionName, push.insert, deps, { submit: false, addressed });
+    }
+
+    // A shell refuses attachments (shellTextRefusal): say so before they land
+    // on disk rather than after.
+    if (push.files?.length && (deps.paneProbe ?? probePane)(push.agentSessionName)?.shellMarked) {
+        log(`! ${push.agentSessionName}: attachments — refusing for a shell session`);
+        return false;
     }
 
     // Download any attachments BEFORE injecting so the agent can read the
@@ -4426,7 +4559,7 @@ export const handlePush = async (
         }
     }
 
-    return tryInject(push.agentSessionName, composeInjection(push.body ?? '', paths), deps);
+    return tryInject(push.agentSessionName, composeInjection(push.body ?? '', paths), deps, { submit: true, addressed, files: !!push.files?.length });
 };
 
 // ─── WS connect loop ─────────────────────────────────────────────────

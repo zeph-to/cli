@@ -4,7 +4,7 @@ import { mkdtempSync, realpathSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { checkoutOf } from './config.js';
-import { detectProjectDir, detectProjectName, handOffExec, sanitizeLabel, sessionSidecarArgs, splitAgentOptions, targetForAgent, tmuxSessionName } from './wrapper.js';
+import { detectProjectDir, detectProjectName, handOffExec, planShellSession, readShellSessionState, sanitizeLabel, shellTargets, sessionSidecarArgs, splitAgentOptions, targetForAgent, tmuxSessionName } from './wrapper.js';
 import type { ProcessHandOff } from './wrapper.js';
 
 // TMUX is in here for two reasons: targetForAgent branches on it, and a
@@ -33,6 +33,13 @@ afterEach(() => {
 describe('tmuxSessionName', () => {
     it('prefixes with zeph-', () => {
         expect(tmuxSessionName('myapp')).toBe('zeph-myapp');
+    });
+
+    // tmux 3.5a creates `zeph-foo.bar` as `zeph-foo_bar`; every `-t =<name>`
+    // after that (sidecar, marker, probe) must use the name tmux holds.
+    it('writes the name the way tmux stores it', () => {
+        expect(tmuxSessionName('foo.bar')).toBe('zeph-foo_bar');
+        expect(tmuxSessionName('a:b;c')).toBe('zeph-a_b_c');
     });
 });
 
@@ -118,7 +125,7 @@ describe('targetForAgent', () => {
         expect(kind).toBe('tmux-detached');
         expect(cmd).toBe('tmux');
         expect(args).toEqual(['new', '-d', '-s', 'zeph-pi-config-impl', '-c', '/work/pi-config', "pi '/skill:02-implement a.md'",
-            ';', 'set-option', '@zeph_project', 'pi-config', ';', 'set-option', '@zeph_session_label', 'impl']);
+            ';', 'set-option', '-t', '=zeph-pi-config-impl:', '@zeph_project', 'pi-config', ';', 'set-option', '-t', '=zeph-pi-config-impl:', '@zeph_session_label', 'impl']);
     });
 
     // `new -d` only creates, so the reuse candidate `findAvailableSession`
@@ -149,6 +156,100 @@ describe('targetForAgent', () => {
         process.env.TMUX = '/private/tmp/tmux-501/default,43544,87';
         process.env.CLAUDE_PROJECT_DIR = '/work/pi-config';
         expect(targetForAgent('pi', [], 'pi', { detach: true, label: 'impl' }).kind).toBe('tmux-detached');
+    });
+});
+
+describe('zeph sh: planShellSession / readShellSessionState', () => {
+    const targets = (opts: { detach?: boolean } = {}) => {
+        process.env.CLAUDE_PROJECT_DIR = '/tmp/app';
+        return shellTargets('/bin/zsh', opts, false);
+    };
+    const marker = [';', 'set-option', '-t', '=zeph-app-sh:', '@zeph_shell', 'zeph-app-sh'];
+
+    // `new -A` from inside tmux nests and exits 1 after the session already
+    // exists, leaving a live shell behind an error. Inside tmux, never attach.
+    it('does not attach from inside tmux, and does for a plain terminal', () => {
+        process.env.CLAUDE_PROJECT_DIR = '/tmp/app';
+        expect(shellTargets('/bin/zsh', {}, true).attach).toBeNull();
+        expect(shellTargets('/bin/zsh', {}, false).attach?.args).toEqual(['attach-session', '-t', '=zeph-app-sh']);
+        expect(shellTargets('/bin/zsh', { detach: true }, false).attach).toBeNull();
+        expect(shellTargets('/bin/zsh', { label: 'ops' }, true).create.session).toBe('zeph-app-ops');
+    });
+
+    it('names the session for the project with the sh label, even from inside tmux', () => {
+        process.env.TMUX = '/tmp/tmux-501/default,1,0';
+        const { create, attach } = targets();
+        expect([create.session, attach?.session]).toEqual(['zeph-app-sh', 'zeph-app-sh']);
+    });
+
+    // `new -d` fails on a taken name, so a session that appeared since the
+    // probe is never attached to and marked. Every option names its session:
+    // an untargeted `set-option` run from inside tmux lands on the caller's.
+    it('creates a missing session detached, marker targeted at it, then attaches', () => {
+        const { create, attach } = targets();
+        const plan = planShellSession(create, attach, 'none');
+        expect(plan).toEqual({ kind: 'create', args: [...create.args, ...marker], attach });
+        expect(create.args.slice(0, 2)).toEqual(['new', '-d']);
+        expect(create.args).not.toContain('-A');
+    });
+
+    it('creates and stops there for --detach', () => {
+        const { create, attach } = targets({ detach: true });
+        expect(planShellSession(create, attach, 'none')).toEqual({ kind: 'create', args: [...create.args, ...marker], attach: null });
+    });
+
+    it('reattaches its own shell session without creating or marking anything', () => {
+        const { create, attach } = targets();
+        expect(planShellSession(create, attach, 'marked')).toEqual({ kind: 'attach', target: attach });
+    });
+
+    // `!zeph sh --detach` from the phone is the bootstrap: running it twice must not fail.
+    it('treats a detached launch of an existing shell session as done', () => {
+        const { create, attach } = targets({ detach: true });
+        expect(planShellSession(create, attach, 'marked')).toEqual({ kind: 'running' });
+    });
+
+    // Attaching would hand the user someone else's session, and marking it
+    // would turn an agent session (or anything else) into a typable shell.
+    it('refuses a session of that name that zeph sh did not open', () => {
+        const { create, attach } = targets();
+        expect(planShellSession(create, attach, 'unmarked')).toEqual({
+            kind: 'refuse',
+            reason: 'zeph-app-sh exists and is not a zeph sh session — pick another --label',
+        });
+    });
+
+    describe('readShellSessionState', () => {
+        const fakeTmux = (answers: { hasSession: number; shellOption?: string }) => {
+            const calls: string[][] = [];
+            const run = (args: string[]) => {
+                calls.push(args);
+                return args[0] === 'has-session'
+                    ? { status: answers.hasSession, stdout: '' }
+                    : { status: 0, stdout: `${answers.shellOption ?? ''}\n` };
+            };
+            return { calls, run };
+        };
+
+        it('is none when tmux has no session of that exact name', () => {
+            const { calls, run } = fakeTmux({ hasSession: 1 });
+            expect(readShellSessionState('zeph-app-sh', run)).toBe('none');
+            expect(calls).toEqual([['has-session', '-t', '=zeph-app-sh']]);
+        });
+
+        // tmux 3.5a: `show-options -t =name` answers nothing — it reads the
+        // target as a pane — and only `=name:` gives the session's own value.
+        it('is marked when the session\'s own option names it, read without inheritance', () => {
+            const { calls, run } = fakeTmux({ hasSession: 0, shellOption: 'zeph-app-sh' });
+            expect(readShellSessionState('zeph-app-sh', run)).toBe('marked');
+            expect(calls[1]).toEqual(['show-options', '-qv', '-t', '=zeph-app-sh:', '@zeph_shell']);
+        });
+
+        it('is unmarked with no option, or a value that is not its own name', () => {
+            for (const shellOption of ['', '1', 'zeph-other-sh']) {
+                expect(readShellSessionState('zeph-app-sh', fakeTmux({ hasSession: 0, shellOption }).run), shellOption).toBe('unmarked');
+            }
+        });
     });
 });
 
@@ -209,21 +310,21 @@ describe('checkoutOf / sessionSidecarArgs', () => {
 
     it('a worktree session named for its repo groups under it with the rest as the label', () => {
         expect(sessionSidecarArgs('zeph-ko-qmd-wt-feat-x', wt)).toEqual(
-            [';', 'set-option', '@zeph_project', 'ko-qmd', ';', 'set-option', '@zeph_session_label', 'wt-feat-x']);
+            [';', 'set-option', '-t', '=zeph-ko-qmd-wt-feat-x:', '@zeph_project', 'ko-qmd', ';', 'set-option', '-t', '=zeph-ko-qmd-wt-feat-x:', '@zeph_session_label', 'wt-feat-x']);
     });
 
     it('a worktree session with a name of its own groups under the repo with that name as the label', () => {
         expect(sessionSidecarArgs('zeph-feature-y', loose)).toEqual(
-            [';', 'set-option', '@zeph_project', 'ko-qmd', ';', 'set-option', '@zeph_session_label', 'feature-y']);
+            [';', 'set-option', '-t', '=zeph-feature-y:', '@zeph_project', 'ko-qmd', ';', 'set-option', '-t', '=zeph-feature-y:', '@zeph_session_label', 'feature-y']);
     });
 
     it('a labelled session groups under its project', () => {
         expect(sessionSidecarArgs('zeph-ko-qmd-wt-feat-x-plan-pi', wt, 'plan-pi')).toEqual(
-            [';', 'set-option', '@zeph_project', 'ko-qmd', ';', 'set-option', '@zeph_session_label', 'plan-pi']);
+            [';', 'set-option', '-t', '=zeph-ko-qmd-wt-feat-x-plan-pi:', '@zeph_project', 'ko-qmd', ';', 'set-option', '-t', '=zeph-ko-qmd-wt-feat-x-plan-pi:', '@zeph_session_label', 'plan-pi']);
         expect(sessionSidecarArgs('zeph-ko-qmd-plan-pi', main, 'plan-pi')).toEqual(
-            [';', 'set-option', '@zeph_project', 'ko-qmd', ';', 'set-option', '@zeph_session_label', 'plan-pi']);
+            [';', 'set-option', '-t', '=zeph-ko-qmd-plan-pi:', '@zeph_project', 'ko-qmd', ';', 'set-option', '-t', '=zeph-ko-qmd-plan-pi:', '@zeph_session_label', 'plan-pi']);
         expect(sessionSidecarArgs('zeph-loose-plan-pi', join(tmp, 'loose'), 'plan-pi')).toEqual(
-            [';', 'set-option', '@zeph_project', 'loose', ';', 'set-option', '@zeph_session_label', 'plan-pi']);
+            [';', 'set-option', '-t', '=zeph-loose-plan-pi:', '@zeph_project', 'loose', ';', 'set-option', '-t', '=zeph-loose-plan-pi:', '@zeph_session_label', 'plan-pi']);
     });
 
     // The name already says it all; no options keeps these sessions reported exactly as before.
@@ -259,6 +360,8 @@ describe('splitAgentOptions', () => {
 describe('sanitizeLabel', () => {
     it('turns what tmux forbids in a session name into dashes', () => {
         expect(sanitizeLabel(' PLAN-11.32:44 ')).toBe('PLAN-11-32-44');
+        // tmux reads an argv element ending in `;` as a command separator.
+        expect(sanitizeLabel('x;')).toBe('x-');
     });
 });
 

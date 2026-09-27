@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'fs';
+import { mkdtempSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
@@ -6,8 +6,9 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 // tmux is faked wholesale (as in listener-stream-lease.test.ts): what is under
 // test is the ephemeral input path's guards and ordering, not tmux itself.
 // `zeph-shell` reports a shell as its pane command — the RCE guard's subject.
+// `zeph-marked` is a shell too, but carries `@zeph_shell` (`zeph sh`).
 const FIELD_SEP = '␟';
-const SESSIONS = ['zeph-a', 'zeph-shell', 'zeph-rate', 'zeph-cost'];
+const SESSIONS = ['zeph-a', 'zeph-shell', 'zeph-rate', 'zeph-cost', 'zeph-marked'];
 
 /** Every tmux call the code made, in order — the injection evidence. */
 let tmuxCalls: string[][] = [];
@@ -22,18 +23,21 @@ const fakeTmux = (args: readonly string[]) => {
     // One pane per session, pinned id `%<index>` — what the sweep records in
     // its targets map, so display/capture/send calls arrive with pane ids.
     if (a[0] === 'list-panes') {
-        const rows = SESSIONS.map((n, i) => [n, '0', '1700000000', '1700000000', '0', '0', `%${i}`, 'node', 'claude', '/tmp/proj', '1234', '', '', ''].join(FIELD_SEP));
+        const rows = SESSIONS.map((n, i) => [n, '0', '1700000000', '1700000000', '0', '0', `%${i}`, 'node', 'claude', '/tmp/proj', '1234', '', '', '', ''].join(FIELD_SEP));
         return { status: 0, stdout: rows.join('\n') + '\n', stderr: '' };
     }
     if (a[0] === 'list-sessions') return { status: 0, stdout: '', stderr: '' };
     if (a[0] === 'display-message') {
         const target = a[a.indexOf('-t') + 1];
         const session = SESSIONS[Number(target.slice(1))] ?? target;
-        const paneCommand = session === 'zeph-shell' ? 'zsh' : 'node';
+        const paneCommand = session === 'zeph-shell' || session === 'zeph-marked' ? 'zsh' : 'node';
+        // `zeph-shell` sees a marker naming another session — what a stray
+        // `set -g @zeph_shell …` inherits into every session. Not its own name: unmarked.
+        const shellMark = session === 'zeph-marked' ? 'zeph-marked' : session === 'zeph-shell' ? 'zeph-marked' : '';
         // Three callers, three formats: the inject guard asks for the current
         // command AND the owning session (a stale pane id must not receive an
         // inject), the bare-command probe, and the four-field pane record.
-        if (a[4]?.includes('#{session_name}')) return { status: 0, stdout: [paneCommand, session].join(FIELD_SEP), stderr: '' };
+        if (a[4]?.includes('#{session_name}')) return { status: 0, stdout: [paneCommand, session, shellMark].join(FIELD_SEP), stderr: '' };
         if (a[4] === '#{pane_current_command}') return { status: 0, stdout: paneCommand, stderr: '' };
         return { status: 0, stdout: [paneCommand, 'claude', '/tmp/proj', '1234', ''].join(FIELD_SEP), stderr: '' };
     }
@@ -464,6 +468,18 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         // A silent drop here contradicts the handler's own contract: the
         // sender learns nothing and never falls back to a REST push.
         expect(rejections()).toHaveLength(1);
+    });
+
+    // Stream input only ever arrives on this listener's own subscription, so
+    // it counts as addressed to this device.
+    it('types into a shell pane marked by `zeph sh`', () => {
+        openStream('zeph-marked');
+        handleCommandInput(input({ sessionName: 'zeph-marked', body: 'id', keys: undefined }), send);
+        expect(injections().length).toBeGreaterThan(0);
+        expect(rejections()).toEqual([]);
+        // The stream path audits too, into the redirected state dir.
+        const audit = readFileSync(join(TMP, 'state', 'zeph', 'shell-audit.log'), 'utf-8');
+        expect(audit).toMatch(/\t"zeph-marked"\t"%4"\tbody\t"zsh"\t"id"\n$/);
     });
 
     it('spends the same rate-limit budget as the REST push path', () => {

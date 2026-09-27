@@ -13,7 +13,7 @@ import { execFileSync, spawn, spawnSync } from 'child_process';
 import { basename } from 'path';
 import { resolveCommand } from './agents.js';
 import { isNewer } from './check-update.js';
-import { checkoutOf, groupOf, PROJECT_DIR_ENV_VARS, resolvedEnv, SESSION_LABEL_OPTION, SESSION_PROJECT_OPTION, VERSION } from './config.js';
+import { checkoutOf, groupOf, PROJECT_DIR_ENV_VARS, resolvedEnv, SESSION_LABEL_OPTION, SESSION_PROJECT_OPTION, SESSION_SHELL_OPTION, tmuxName, VERSION } from './config.js';
 import {
     LISTENER_LOG_FILE,
     runningListenerPid,
@@ -56,6 +56,11 @@ export const detectProjectName = (): string => safeBasename(detectProjectDir());
  * each opened a card of its own. Nothing when the name already says it all, so
  * a plain family session is reported exactly as before. The rule is config
  * `groupOf`, which the listener also applies to sessions started without these.
+ *
+ * Each option names its session (`-t =<session>:`). An untargeted `set-option`
+ * applies to the client's current session, and a launch from inside tmux (a
+ * `--detach` from an agent's pane) would relabel the caller instead of the new
+ * session (measured on tmux 3.5a).
  */
 export const sessionSidecarArgs = (session: string, projectDir: string, label?: string): string[] => {
     const checkout = checkoutOf(projectDir);
@@ -63,11 +68,27 @@ export const sessionSidecarArgs = (session: string, projectDir: string, label?: 
         ? { project: checkout?.key ?? safeBasename(projectDir), label }
         : groupOf(session.slice('zeph-'.length), checkout);
     if (!group) return [];
-    return [';', 'set-option', SESSION_PROJECT_OPTION, group.project, ';', 'set-option', SESSION_LABEL_OPTION, group.label];
+    return [
+        ';', 'set-option', '-t', sessionOptionTarget(session), SESSION_PROJECT_OPTION, group.project,
+        ';', 'set-option', '-t', sessionOptionTarget(session), SESSION_LABEL_OPTION, group.label,
+    ];
 };
 
-/** `zeph-<project>` — the canonical tmux session base name. */
-export const tmuxSessionName = (project: string): string => `zeph-${project}`;
+/**
+ * The option target for one session by exact name. `=` stops a prefix match;
+ * the trailing `:` makes `show-options`/`set-option`, which read `-t` as a
+ * pane, take it as a session (tmux 3.5a: `-t =name` alone answers nothing).
+ */
+const sessionOptionTarget = (session: string): string => `=${session}:`;
+
+/**
+ * `zeph-<project>` — the canonical tmux session base name. tmux itself turns
+ * `.` and `:` into `_` when it creates a session (3.5a: `zeph-foo.bar` becomes
+ * `zeph-foo_bar`), so the name is written that way up front: every later
+ * `-t =<name>` must match what tmux actually holds. `;` goes too — an argv
+ * element ending in one is a tmux command separator.
+ */
+export const tmuxSessionName = (project: string): string => `zeph-${tmuxName(project)}`;
 
 /**
  * Every live tmux session as `name → attached`, in one spawn.
@@ -206,8 +227,11 @@ export interface AgentLaunchOptions {
     label?: string;
 }
 
-/** tmux forbids `.` and `:` in session names; whitespace would split the target. */
-export const sanitizeLabel = (label: string): string => label.trim().replace(/[.:\s]+/g, '-');
+/**
+ * tmux forbids `.` and `:` in session names; whitespace would split the target;
+ * and an argv element ending in `;` is a tmux command separator.
+ */
+export const sanitizeLabel = (label: string): string => label.trim().replace(/[.:;\s]+/g, '-');
 
 /**
  * A label the user typed, or the reason it cannot be one. Empty (`--label ''`)
@@ -423,6 +447,15 @@ export const handleAgentSession = async (
         }
     }
 
+    return launchTarget({ kind, cmd, args, session }, agent.binary);
+};
+
+/**
+ * Run a spawn target: a detached session is created and named, anything else
+ * hands the terminal over (execve where it can, a waited child where not) and
+ * forwards the exit code. `what` names the program in the detached message.
+ */
+const launchTarget = async ({ kind, cmd, args, session }: SpawnTarget, what: string): Promise<number> => {
     if (kind === 'tmux-detached' && session) {
         const r = spawnSync(cmd, args, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
         if (r.error || r.status !== 0) {
@@ -431,7 +464,7 @@ export const handleAgentSession = async (
             return r.status ?? 1;
         }
         // The name is the contract: the caller attaches, kills, or injects by it.
-        console.log(`zeph: ${agent.binary} started in tmux session ${session} (detached) — attach: tmux attach -t ${session}`);
+        console.log(`zeph: ${what} started in tmux session ${session} (detached) — attach: tmux attach -t ${session}`);
         return 0;
     }
 
@@ -491,4 +524,119 @@ export const handleAgentSession = async (
             }
         });
     });
+};
+
+// ── zeph sh — a shell the phone may type into ────────────────────────
+
+/** What tmux holds under a `zeph sh` session name. */
+export type ShellSessionState = 'none' | 'marked' | 'unmarked';
+
+/** A tmux call, injectable for tests. */
+type RunTmux = (args: string[]) => { status: number | null; stdout: string; stderr?: string };
+
+const runTmux: RunTmux = (args) => {
+    const r = spawnSync('tmux', args, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+    return { status: r.error ? null : r.status, stdout: r.stdout ?? '', stderr: r.error?.message ?? r.stderr ?? '' };
+};
+
+/**
+ * How `zeph sh` proceeds, given what tmux holds under the name. `create` is
+ * the detached target, `attach` the attaching one (null for `--detach`).
+ *
+ * A missing session is created with `new -d` and `@zeph_shell` set to its own
+ * name in the same tmux call, so no sweep ever sees it unmarked, and `new -d`
+ * fails on a taken name: a session that appeared since the probe is never
+ * attached to and marked. The listener accepts the marker only when it names
+ * the session, so a stray `set -g @zeph_shell …` cannot mark anything. A
+ * session this command opened before is reattached (or, detached, left as it
+ * is — running `!zeph sh --detach` twice from the phone must not fail). Any
+ * other session under that name is refused: the marker would turn it into a
+ * typable shell.
+ */
+export const planShellSession = (
+    create: SpawnTarget,
+    attach: SpawnTarget | null,
+    state: ShellSessionState,
+):
+    | { kind: 'create'; args: string[]; attach: SpawnTarget | null }
+    | { kind: 'attach'; target: SpawnTarget }
+    | { kind: 'running' }
+    | { kind: 'refuse'; reason: string } => {
+    const session = create.session ?? '';
+    if (state === 'unmarked') {
+        return { kind: 'refuse', reason: `${session} exists and is not a zeph sh session — pick another --label` };
+    }
+    if (state === 'marked') return attach ? { kind: 'attach', target: attach } : { kind: 'running' };
+    return {
+        kind: 'create',
+        args: [...create.args, ';', 'set-option', '-t', sessionOptionTarget(session), SESSION_SHELL_OPTION, session],
+        attach,
+    };
+};
+
+/**
+ * Read the marker off the session itself. `show-options` without `-A` shows
+ * only what is set on that session, never an inherited global value. A failed
+ * `has-session` reads as "none", which is safe: creation is `new -d`, and it
+ * fails on a name that does exist.
+ */
+export const readShellSessionState = (session: string, run: RunTmux = runTmux): ShellSessionState => {
+    if (run(['has-session', '-t', `=${session}`]).status !== 0) return 'none';
+    const r = run(['show-options', '-qv', '-t', sessionOptionTarget(session), SESSION_SHELL_OPTION]);
+    return r.stdout.trim() === session ? 'marked' : 'unmarked';
+};
+
+/**
+ * The two targets `zeph sh` works with. Inside tmux there is no attaching —
+ * `new -A` would nest and exit 1 after the session already exists — so the
+ * run is a detached one, as `--detach` is.
+ */
+export const shellTargets = (
+    shell: string,
+    opts: AgentLaunchOptions,
+    inTmux: boolean = !!process.env.TMUX,
+): { create: SpawnTarget; attach: SpawnTarget | null } => {
+    const create = targetForAgent(shell, ['-l'], 'shell', { label: opts.label ?? 'sh', detach: true });
+    const session = create.session ?? '';
+    // `attach-session`, never `new -A`: a session that died since the probe
+    // must not come back as a fresh, unmarked one.
+    const attach: SpawnTarget = { kind: 'tmux-new', cmd: 'tmux', args: ['attach-session', '-t', `=${session}`], session };
+    return { create, attach: opts.detach || inTmux ? null : attach };
+};
+
+/**
+ * `zeph sh [--label x] [--detach]` — open (or reattach) `zeph-<project>-sh`
+ * running the login shell, marked so the phone may type into it. The label
+ * always pins a tmux session, so this never runs in the current pane.
+ */
+export const handleShellSession = async (opts: AgentLaunchOptions): Promise<number> => {
+    await ensureListenerRunning();
+    const shell = process.env.SHELL || '/bin/sh';
+    const { create, attach } = shellTargets(shell, opts);
+    const session = create.session ?? '';
+    const switchHint = (): void => {
+        if (process.env.TMUX) console.log(`zeph: from this tmux: tmux switch-client -t ${session}`);
+    };
+    const plan = planShellSession(create, attach, readShellSessionState(session));
+    if (plan.kind === 'refuse') {
+        console.error(`zeph: ${plan.reason}`);
+        return 1;
+    }
+    if (plan.kind === 'running') {
+        console.log(`zeph: shell session ${session} is already running — attach: tmux attach -t ${session}`);
+        switchHint();
+        return 0;
+    }
+    if (plan.kind === 'attach') return launchTarget(plan.target, basename(shell));
+    if (!plan.attach) {
+        const code = await launchTarget({ ...create, args: plan.args }, basename(shell));
+        if (code === 0) switchHint();
+        return code;
+    }
+    const made = runTmux(plan.args);
+    if (made.status !== 0) {
+        console.error(`zeph: could not start ${session} — ${(made.stderr ?? '').trim() || `exit ${made.status}`}`);
+        return made.status ?? 1;
+    }
+    return launchTarget(plan.attach, basename(shell));
 };

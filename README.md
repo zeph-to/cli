@@ -312,6 +312,25 @@ block here.
    older CLI) is grouped by the listener from its pane's checkout instead,
    so upgrading the listener is enough — no session restart.
 
+   **A shell the phone may type into — `zeph sh`.** Every other shell
+   pane is refused (see [Defense](#defense)); `zeph sh` opens the one
+   exception, `zeph-<project>-sh` running your login shell, for the jobs an
+   agent's permission prompt blocks — a restart, a `kill`, a `sudo`. It is a
+   real terminal: `cd` and `export` stick, `sudo`/`ssh` prompts work, and a
+   long command does not tie up an agent. `--label <x>` names it
+   `zeph-<project>-<x>`; `--detach` creates it without attaching. Away from
+   the desk, open one from the phone through any running Claude Code
+   session by sending `!zeph sh --detach` (Claude Code's `!` bash mode —
+   see Defense item 7). Inside tmux it never attaches; it prints a
+   `tmux switch-client -t <session>` line instead. Running it again for a
+   session it opened reattaches, and a session of that name it did not open
+   is refused.
+
+   ```bash
+   zeph sh              # → tmux session "zeph-<project>-sh"
+   zeph sh --detach     # create it, print its name, exit
+   ```
+
    `zeph cursor` runs **`cursor-agent`**, Cursor's terminal agent — a
    separate install from the Cursor IDE (the bare `cursor` on your PATH
    is the editor launcher, which exits immediately and can't be driven).
@@ -548,21 +567,65 @@ curl -X POST "$ZEPH_BASE_URL/pushes/send" \
 The listener is a remote-code-execution surface by design (it types
 into a shell-adjacent pane). The defense is layered:
 
-1. **Pane guard** — before injecting, the listener checks
-   `tmux display-message -p '#{pane_current_command}'`. If the pane is
-   at an interactive shell (`bash`/`zsh`/`fish`/`sh`/`dash`/`ksh`/
-   `tcsh`/`csh`/`pwsh`), the inject is refused. CC/Codex/Gemini exited
-   ≠ phone gets free shell access.
-2. **Literal injection** — `tmux send-keys -l` takes the payload as
-   data; tmux escape sequences inside a message can't drive other tmux
+1. **Pane guard** — before injecting, the listener checks the pinned
+   pane's `#{pane_current_command}`. If the pane is at an interactive shell
+   (`bash`/`zsh`/`fish`/`sh`/`dash`/`ksh`/`tcsh`/`csh`/`pwsh`), the inject
+   is refused. CC/Codex/Gemini exited ≠ phone gets free shell access. The
+   one exception is a `zeph sh` session: its `@zeph_shell` session option
+   names the session itself. Only a process on this machine can set a tmux
+   option, and a value inherited from `set -g` names no session. The marker
+   says you opened that shell; it is not a boundary — see what it does not
+   stop, below.
+2. **Addressed shells only** — a marked shell takes a REST
+   `agent.command` only when its `targetDeviceId` is this machine. An
+   agent session still takes an unaddressed one, which `push.new` fans out
+   to every listener of the account; for a shell, two PCs with `zeph sh`
+   open in the same project would both run it. Stream input already
+   arrives on one listener's own subscription.
+3. **Nothing a shell would misread** — into a marked shell the listener
+   refuses attachments (their paths would arrive as lines, each a command),
+   control bytes such as ESC (which can leave a bracketed paste), and a
+   newline in an insert (a shell without bracketed paste, such as macOS
+   `/bin/bash` 3.2, would run it). A multi-line body is allowed: each line
+   is a command you meant.
+4. **Audit** — every input admitted into a shell session is one line in
+   `$XDG_STATE_HOME/zeph/shell-audit.log` (default
+   `~/.local/state/zeph/shell-audit.log`, mode 0600; past 1 MiB it moves to
+   `shell-audit.log.1`, replacing the one before): time, session, pane,
+   kind, foreground program, and the text only when the shell itself was in
+   front. Input to anything else — a `sudo` or `ssh` password prompt — is
+   recorded as `[N chars → "sudo"]`. `listener.log`, which is not private,
+   shows only the length. The foreground is judged when the input lands, so
+   a secret read by the shell itself (`read -s`) is logged in full, and a
+   command typed inside `sudo -s` or `ssh` is logged by length only.
+5. **Literal injection** — text is delivered as a paste of data, not typed
+   key names; tmux escape sequences inside a message can't drive other tmux
    commands.
-3. **Session-name allowlist** — only `[A-Za-z0-9._-]+` is accepted as
+6. **Session-name allowlist** — only `[A-Za-z0-9._-]+` is accepted as
    a session target, so shell metacharacters never reach the tmux argv.
-4. **Per-session rate limit** — 30 injections/minute/session token
-   bucket caps a runaway/compromised sender.
-5. **Agent permission gate stays on** — your CC/Codex/Gemini permission
-   prompt is still in front of every destructive tool call. The phone
-   can *talk* but can't approve `rm -rf` for you.
+   Agents skip a shell: `zeph send` and `zeph_agent_send` (from
+   `@zeph-to/mcp-server` 3.3.0) drop `agentKind: "shell"` sessions from
+   their candidates. The check runs on the sending machine only, so an
+   older `zeph` on any machine of your account can still type into your
+   shell — update every machine that runs agents before you open one.
+7. **Per-session rate limit** — a token bucket caps a runaway or
+   compromised sender, shell sessions included.
+8. **Agent permission gate — with one hole.** Your CC/Codex/Gemini
+   permission prompt still stands in front of every tool call the agent
+   makes. But Claude Code's `!` prefix runs a shell command directly, as
+   typed input, with no permission prompt, and text the phone injects is
+   typed input: `!<command>` sent to a Claude Code session runs on this
+   machine. This is accepted, and it is how `!zeph sh --detach` opens a
+   shell from the phone.
+
+What the marker does not stop: anything running as your user on this
+machine can set `@zeph_shell` on a session, or run `zeph sh` itself — and
+so can the phone, while a Claude Code session (`!tmux set-option …`) or a
+marked shell is open to it. It keeps the phone from choosing panes only
+when neither is.
+And no layer authenticates the sender: whoever holds your API key, or
+controls the backend, can type into every marked shell and, through `!`,
+every Claude Code session.
 
 The transport (WS) is authenticated by API key + `push:read` scope.
 Whether your backend also reads what crosses it depends on encryption
@@ -580,7 +643,9 @@ being on:
 
 Two gaps either way. A message sent while no live stream is open falls
 back to REST, which is plaintext to the server — that includes every
-`@<session>` command from the agent chat. And the sealed channel buys
+`@<session>` command from the agent chat, and every command typed into a
+`zeph sh` shell. With encryption off, a shell's screen crosses the relay in
+plaintext too, so keep secrets off both. And the sealed channel buys
 confidentiality against a *passive* relay only: each side learns the
 other's key from the wire, so a backend that mints its own keypair can
 pose as the listener.
@@ -652,6 +717,7 @@ zeph notify --title "Hello" --json
 | `forget <session>` | Drop an ended session from this machine's record, so it leaves the app's past list (and the resume whitelist — the same thing deleting the row on the phone does). Refuses a session that is still running: kill it first. `--ended` forgets every remembered session tmux no longer has, which is what a machine that launches agents under a fresh name per task eventually needs |
 | `test` | Verify connection and API key |
 | `cc` · `codex` · `gemini` | Run the agent in a `zeph-<project>` tmux session — reattaches a detached session of that project (newest suffix first) when there is one, else auto-suffixes `-2`, `-3`, …. Auto-spawns the background listener on first invocation so the phone picker just works. Trailing args pass through to the agent (`zeph cc --resume "..."`). On node 22.15+ the wrapper hands its process to tmux rather than waiting on it, so a running session shows no `zeph cc` of its own in `ps` — older runtimes and Windows keep the waiting wrapper `--detach` / `--label <x>` (front of the args) create without attaching / pin the name — see "Run agents through the wrapper" above. |
+| `sh` | Open (or reattach) `zeph-<project>-sh`, a login shell the phone may type into — the one shell pane the listener does not refuse. `--label <x>` / `--detach` as for the agents; inside tmux it never attaches and prints a `switch-client` hint. Refuses a session of that name it did not open. Input must be addressed to this machine, is audited, and agents (`send`, `zeph_agent_send`) skip it — see [Defense](#defense) |
 | `mcp` | Run the MCP server on stdio, in this process. What agent MCP configs launch — `zeph install` registers it and you never type it. Replaces the old `npx -y @zeph-to/mcp-server` registration, which left an `npm exec` launcher resident alongside the server for the life of the session. `@zeph-to/mcp-server` ships as a dependency now, so it updates with the CLI rather than being re-fetched by `npx` on every launch — `zeph check-update` reports the version you actually have |
 | `listener` | (Usually unnecessary — `zeph cc` autospawns it.) Resident daemon: subscribes via WebSocket, reports tmux session inventory every 5 s, injects `agent.command` pushes into the matching session. Run in the foreground for SDK development; otherwise let `zeph cc` manage it |
 

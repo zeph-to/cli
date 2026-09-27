@@ -1,6 +1,6 @@
 import { hostname } from 'node:os';
 import { agentSessionContext } from './agent-session.js';
-import { resolveAgentTarget, type AgentTargetDevice } from './agent-target.js';
+import { isAgentTarget, resolveAgentTarget, type AgentTargetDevice } from './agent-target.js';
 
 export interface SendDeps {
     listDevices: () => Promise<AgentTargetDevice[]>;
@@ -42,14 +42,14 @@ export const parseSendArgs = (argv: string[], stdin?: string): { target: string;
  * The header the receiver reads first. It matches the MCP tool's
  * (mcp-server/src/tools/agent-send.ts `senderHeader`); the web app is to parse
  * the same shape to caption the bubble. The reply key is offered only for a
- * session the listener reports, and never for a subagent: `resolveAgentTarget`
- * takes neither, so the reply would not resolve.
+ * session the listener reports, and never for a subagent or a `zeph sh` shell:
+ * `resolveAgentTarget` takes none of them, so the reply would not resolve.
  */
 const senderHeader = (devices: AgentTargetDevice[], deps: SendDeps): { header: string; ownKey?: string } => {
     const ctx = deps.context();
     const own = ctx ? devices.find((d) => d.deviceId === ctx.agentDeviceId) : undefined;
     const host = own?.nickname ?? deps.hostname();
-    const listed = !!ctx && !!own?.agentSessions?.some((s) => s.name === ctx.agentSessionName && !s.parentName);
+    const listed = !!ctx && !!own?.agentSessions?.some((s) => s.name === ctx.agentSessionName && isAgentTarget(s));
     if (!ctx || !listed) return { header: `[from ${ctx?.agentSessionName ?? 'cli'}@${host}]` };
     const ownKey = `${ctx.agentDeviceId}:${ctx.agentSessionName}`;
     const label = own?.agentSessionAliases?.[ctx.agentSessionName] ?? ctx.agentSessionName;

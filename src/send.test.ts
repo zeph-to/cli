@@ -111,6 +111,23 @@ describe('zeph send', () => {
 
         expect(d.sendAgentCommand.mock.calls[0][0].body).toBe('[from pi-brain.2@takPC] hi');
     });
+
+    // An agent started inside a `zeph sh` session: the shell is never a target,
+    // so a reply key pointing at it would not resolve.
+    it('offers no reply key from a shell session', async () => {
+        const withShell = [
+            { ...devices[0], agentSessions: [...(devices[0].agentSessions ?? []), { name: 'zeph-api-sh', agentKind: 'shell' }] },
+            devices[1],
+        ];
+        const d = deps({
+            listDevices: async () => withShell,
+            context: () => ({ agentDeviceId: 'dev_mac', agentSessionName: 'zeph-api-sh' }),
+        });
+
+        await runSend({ target: 'zeph-api', message: 'hi' }, d);
+
+        expect(d.sendAgentCommand.mock.calls[0][0].body).toBe('[from zeph-api-sh@takPC] hi');
+    });
 });
 
 describe('parseSendArgs', () => {

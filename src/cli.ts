@@ -11,7 +11,7 @@ import { handleCheckUpdate } from './check-update.js';
 import { handleAsk } from './ask.js';
 import { parseCliArgv } from './args.js';
 import { liveSendDeps, parseSendArgs, runSend, sendReadsStdin } from './send.js';
-import { handleAgentSession, splitAgentOptions } from './wrapper.js';
+import { handleAgentSession, handleShellSession, splitAgentOptions } from './wrapper.js';
 import { handleMcp } from './mcp.js';
 import {
   computeListenerDeviceId, handleListener, isSubagentSessionName, liveSessionNames, sessionLiveness,
@@ -97,6 +97,16 @@ ${usageAgentLines()}
                                  agent's pane or a script (no TTY needed)
                   --label <x>    name it 'zeph-<project>-<x>' instead of the
                                  -2/-3 family. Both must come first.
+  sh              Open (or reattach) 'zeph-<project>-sh', a login shell the
+                  phone may type into. Every other shell stays refused.
+                  Input must be addressed to this machine; each one is
+                  logged to ~/.local/state/zeph/shell-audit.log (0600).
+                  Agents ('zeph send', zeph_agent_send) skip it — keep
+                  'zeph' up to date on every machine that runs agents.
+                  --label <x>    'zeph-<project>-<x>' instead of '-sh'
+                  --detach       create it without attaching, print its
+                                 name, exit — '!zeph sh --detach' in a CC
+                                 session opens one from the phone
   mcp             Run the MCP server on stdio. This is what agent MCP
                   configs launch — 'zeph install' registers it, you
                   never type it
@@ -648,6 +658,14 @@ const main = async (): Promise<number> => {
       return handleForget(args);
     case 'test':
       return handleTest(args);
+    case 'sh': {
+      const { opts, rest, error } = splitAgentOptions(collectPassthrough(process.argv, command));
+      if (error || rest.length) {
+        console.error(`zeph: ${error ?? "'zeph sh' takes only --label <x> and --detach"}`);
+        return 2;
+      }
+      return handleShellSession(opts);
+    }
     case 'mcp':
       return handleMcp();
     case 'listener':

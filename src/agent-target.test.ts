@@ -11,6 +11,7 @@ const devices: AgentTargetDevice[] = [
             { name: 'zeph-proj', project: 'proj' },
             { name: 'zeph-brain', project: 'brain' },
             { name: 'zeph-proj.3', project: 'proj', parentName: 'zeph-proj' },
+            { name: 'zeph-proj-sh', project: 'proj', label: 'sh', agentKind: 'shell' },
         ],
         agentSessionAliases: { 'zeph-proj': 'deploy' },
     },
@@ -80,6 +81,15 @@ describe('resolveAgentTarget', () => {
         expect(offlineError('dev_linux:zeph-brain').code).toBe('TARGET_OFFLINE');
         expect(offlineError('brain · Pi').message).toContain('louis-lemon');
         expect(resolveAgentTarget(away, 'deploy').key).toBe('dev_mac:zeph-proj');
+    });
+
+    // A `zeph sh` session is a real shell: an agent typing into it would run
+    // commands on that machine, on another PC just as well as its own.
+    it('never resolves to a shell session, by key or by name', () => {
+        expect(errorOf('dev_mac:zeph-proj-sh').code).toBe('UNKNOWN_TARGET');
+        expect(errorOf('zeph-proj-sh').code).toBe('UNKNOWN_TARGET');
+        expect(errorOf('sh').code).toBe('UNKNOWN_TARGET');
+        expect(errorOf('zeph-proj-sh').message).not.toContain('zeph-proj-sh (');
     });
 
     // Subagents are view-only: they take no input.
