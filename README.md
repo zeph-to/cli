@@ -312,6 +312,21 @@ block here.
    older CLI) is grouped by the listener from its pane's checkout instead,
    so upgrading the listener is enough — no session restart.
 
+   **Inside [herdr](https://herdr.dev).** herdr finds agents by a pane's
+   foreground process, which for a wrapped session is the tmux client, so
+   the agent would not show in its sidebar. Every `zeph` attach records the
+   herdr pane it runs in as session options (`@zeph_herdr_pane`,
+   `@zeph_herdr_socket`, `@zeph_herdr_bin`), and clears them when attached
+   from outside herdr; a bare `tmux attach` changes neither, so the agent
+   keeps reporting to the last herdr pane `zeph` saw. Reporters read them on every report and send the
+   agent's `working` / `idle` / `blocked` state to that pane: Claude Code
+   through the Zeph plugin's `zeph-herdr.sh` hook (plugin 0.20.0+) as
+   `zeph cc`, pi through the Zeph pi extension as `zeph pi`. herdr's own pi
+   extension reads the pane from its env, which tmux does not pass, so it
+   stays silent in a wrapped session. Headless runs (`claude -p`, `pi -p`,
+   RPC) started from a shell in a wrapped pane inherit its `TMUX_PANE` and
+   never report.
+
    **A shell the phone may type into — `zeph sh`.** Every other shell
    pane is refused (see [Defense](#defense)); `zeph sh` opens the one
    exception, `zeph-<project>-sh` running your login shell, for the jobs an
