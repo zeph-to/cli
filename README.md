@@ -312,6 +312,15 @@ block here.
    older CLI) is grouped by the listener from its pane's checkout instead,
    so upgrading the listener is enough — no session restart.
 
+   **Inside [herdr](https://herdr.dev).** herdr finds agents by a pane's
+   foreground process, which for a wrapped session is the tmux client, so
+   the agent would not show in its sidebar. Every attach records the herdr
+   pane it runs in as session options (`@zeph_herdr_pane`,
+   `@zeph_herdr_socket`, `@zeph_herdr_bin`), and clears them when attached
+   from outside herdr; the Zeph plugin's `zeph-herdr.sh` hook reads them
+   and reports Claude Code's `working` / `idle` / `blocked` state to that
+   pane as `zeph cc`. Needs the plugin from 0.20.0.
+
    **A shell the phone may type into — `zeph sh`.** Every other shell
    pane is refused (see [Defense](#defense)); `zeph sh` opens the one
    exception, `zeph-<project>-sh` running your login shell, for the jobs an

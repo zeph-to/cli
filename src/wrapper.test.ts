@@ -4,7 +4,7 @@ import { mkdtempSync, realpathSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { checkoutOf } from './config.js';
-import { detectProjectDir, detectProjectName, handOffExec, planShellSession, readShellSessionState, sanitizeLabel, shellTargets, sessionSidecarArgs, splitAgentOptions, targetForAgent, tmuxSessionName } from './wrapper.js';
+import { detectProjectDir, detectProjectName, handOffExec, herdrSessionArgs, planShellSession, readShellSessionState, sanitizeLabel, shellTargets, sessionSidecarArgs, splitAgentOptions, targetForAgent, tmuxSessionName } from './wrapper.js';
 import type { ProcessHandOff } from './wrapper.js';
 
 // TMUX is in here for two reasons: targetForAgent branches on it, and a
@@ -250,6 +250,46 @@ describe('zeph sh: planShellSession / readShellSessionState', () => {
                 expect(readShellSessionState('zeph-app-sh', fakeTmux({ hasSession: 0, shellOption }).run), shellOption).toBe('unmarked');
             }
         });
+    });
+});
+
+describe('herdrSessionArgs', () => {
+    const herdr = {
+        HERDR_ENV: '1',
+        HERDR_PANE_ID: 'wF:p1',
+        HERDR_SOCKET_PATH: '/Users/u/.config/herdr/herdr.sock',
+        HERDR_BIN_PATH: '/Users/u/.local/bin/herdr',
+    };
+
+    it('points the session at the herdr pane it is attached from', () => {
+        expect(herdrSessionArgs('zeph-app', herdr)).toEqual([
+            ';', 'set-option', '-t', '=zeph-app:', '@zeph_herdr_pane', 'wF:p1',
+            ';', 'set-option', '-t', '=zeph-app:', '@zeph_herdr_socket', '/Users/u/.config/herdr/herdr.sock',
+            ';', 'set-option', '-t', '=zeph-app:', '@zeph_herdr_bin', '/Users/u/.local/bin/herdr',
+        ]);
+    });
+
+    // A reattach from a plain terminal must not leave a running agent reporting
+    // to a herdr pane that now holds something else.
+    it('clears every option outside herdr', () => {
+        const unset = [
+            ';', 'set-option', '-u', '-t', '=zeph-app:', '@zeph_herdr_pane',
+            ';', 'set-option', '-u', '-t', '=zeph-app:', '@zeph_herdr_socket',
+            ';', 'set-option', '-u', '-t', '=zeph-app:', '@zeph_herdr_bin',
+        ];
+        expect(herdrSessionArgs('zeph-app', {})).toEqual(unset);
+        expect(herdrSessionArgs('zeph-app', { ...herdr, HERDR_ENV: '0' })).toEqual(unset);
+        expect(herdrSessionArgs('zeph-app', { ...herdr, HERDR_PANE_ID: '' })).toEqual(unset);
+    });
+
+    it('clears an option herdr did not set', () => {
+        const { HERDR_BIN_PATH: _, ...noBin } = herdr;
+        expect(herdrSessionArgs('zeph-app', noBin).slice(-6)).toEqual([';', 'set-option', '-u', '-t', '=zeph-app:', '@zeph_herdr_bin']);
+    });
+
+    it('rides on the attaching launch', () => {
+        const { args } = targetForAgent('claude', []);
+        expect(args).toContain('@zeph_herdr_pane');
     });
 });
 

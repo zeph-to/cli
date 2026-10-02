@@ -13,7 +13,7 @@ import { execFileSync, spawn, spawnSync } from 'child_process';
 import { basename } from 'path';
 import { resolveCommand } from './agents.js';
 import { isNewer } from './check-update.js';
-import { checkoutOf, groupOf, PROJECT_DIR_ENV_VARS, resolvedEnv, SESSION_LABEL_OPTION, SESSION_PROJECT_OPTION, SESSION_SHELL_OPTION, tmuxName, VERSION } from './config.js';
+import { checkoutOf, groupOf, HERDR_SESSION_OPTIONS, PROJECT_DIR_ENV_VARS, resolvedEnv, SESSION_LABEL_OPTION, SESSION_PROJECT_OPTION, SESSION_SHELL_OPTION, tmuxName, VERSION } from './config.js';
 import {
     LISTENER_LOG_FILE,
     runningListenerPid,
@@ -72,6 +72,19 @@ export const sessionSidecarArgs = (session: string, projectDir: string, label?: 
         ';', 'set-option', '-t', sessionOptionTarget(session), SESSION_PROJECT_OPTION, group.project,
         ';', 'set-option', '-t', sessionOptionTarget(session), SESSION_LABEL_OPTION, group.label,
     ];
+};
+
+/**
+ * tmux commands, chained after `new -A`, that point config
+ * `HERDR_SESSION_OPTIONS` at the herdr pane this attach runs in, or clear them
+ * outside herdr.
+ */
+export const herdrSessionArgs = (session: string, env: NodeJS.ProcessEnv = process.env): string[] => {
+    const inHerdr = env.HERDR_ENV === '1' && !!env.HERDR_PANE_ID && !!env.HERDR_SOCKET_PATH;
+    return Object.entries(HERDR_SESSION_OPTIONS).flatMap(([name, option]) => {
+        const value = inHerdr ? env[name] : undefined;
+        return [';', 'set-option', ...(value ? [] : ['-u']), '-t', sessionOptionTarget(session), option, ...(value ? [value] : [])];
+    });
 };
 
 /**
@@ -320,7 +333,7 @@ export const targetForAgent = (
         return { kind: 'tmux-detached', cmd: 'tmux', args: ['new', '-d', '-s', session, '-c', projectDir, shellCmd, ...sidecar], session };
     }
     // `tmux new -A`: attach if the named session exists, else create it.
-    return { kind: 'tmux-new', cmd: 'tmux', args: ['new', '-A', '-s', session, shellCmd, ...sidecar], session };
+    return { kind: 'tmux-new', cmd: 'tmux', args: ['new', '-A', '-s', session, shellCmd, ...sidecar, ...herdrSessionArgs(session)], session };
 };
 
 // ── Background listener auto-start ────────────────────────────────────

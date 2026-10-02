@@ -33,6 +33,19 @@ export const resolveHookId = (env: NodeJS.ProcessEnv = process.env): string | un
 export const SESSION_PROJECT_OPTION = '@zeph_project';
 export const SESSION_LABEL_OPTION = '@zeph_session_label';
 /**
+ * The herdr pane a session is attached from, as `<herdr env var> → <session
+ * option>`. herdr finds agents by a pane's foreground process, which for a
+ * `zeph cc` pane is the tmux client, so the plugin's `zeph-herdr.sh` hook
+ * reports the agent's state itself, to the pane these options name. They are
+ * session options rather than the agent's own env because a reattach from
+ * another herdr pane (or from outside herdr) must retarget a running agent.
+ */
+export const HERDR_SESSION_OPTIONS = {
+  HERDR_PANE_ID: '@zeph_herdr_pane',
+  HERDR_SOCKET_PATH: '@zeph_herdr_socket',
+  HERDR_BIN_PATH: '@zeph_herdr_bin',
+} as const;
+/**
  * Set by `zeph sh` on the session it opens, to that session's own name. The
  * one exception to the listener's shell-pane refusal. Only a process on this
  * machine can set a tmux option, so it says the user opened the shell — but it
