@@ -468,18 +468,23 @@ const SUBAGENT_SESSION = (() => {
 // own pi extension reads HERDR_* from the env, which tmux does not pass, so it
 // stays silent here. Same protocol as the Claude Code plugin's zeph-herdr.sh.
 const TMUX_PANE = process.env.TMUX_PANE || "";
+// Set by session_start for the TUI only: a \`pi -p\` or RPC run from a shell in
+// a wrapped pane inherits TMUX_PANE, and must not report (or release) that
+// pane's agent. herdr's own pi extension gates on the same \`ctx.mode\`.
+let herdrTui = false;
 let herdrLast = "";
 let herdrSeq = 0;
-const herdr = (state: "idle" | "working" | "blocked" | "release"): void => {
+// Resolves once herdr is spawned, so session_shutdown can hold pi's exit until
+// the release is on its way.
+const herdr = (state: "idle" | "working" | "blocked" | "release"): Promise<void> => new Promise((resolve) => {
   // A subagent's pane shares the parent's session, and with it the herdr pane.
-  if (!TMUX_PANE || SUBAGENT_NAME) return;
+  if (!TMUX_PANE || SUBAGENT_NAME || !herdrTui) return resolve();
   // herdr drops a report whose seq is not above the last it accepted, so take
   // it now, in event order, not when tmux answers.
   const seq = herdrSeq = Math.max(Date.now() * 1000, herdrSeq + 1);
   execFile("tmux", ["display-message", "-p", "-t", TMUX_PANE, "#{@zeph_herdr_pane}\\t#{@zeph_herdr_socket}\\t#{@zeph_herdr_bin}"], { timeout: 2000 }, (err, out) => {
     const [pane, socket, bin] = String(out).trim().split("\\t");
-    if (err || !pane || !socket) return;
-    if (herdrLast === pane + " " + state) return;
+    if (err || !pane || !socket || herdrLast === pane + " " + state) return resolve();
     herdrLast = pane + " " + state;
     const who = ["--source", "zeph-pi", "--agent", "zeph pi"];
     const args = state === "release"
@@ -488,8 +493,9 @@ const herdr = (state: "idle" | "working" | "blocked" | "release"): void => {
     const child = spawn(bin || "herdr", args, { env: { ...process.env, HERDR_SOCKET_PATH: socket }, stdio: "ignore", detached: true });
     child.on("error", () => {});
     child.unref();
+    resolve();
   });
-};
+});
 
 export default function (pi: ExtensionAPI) {
   // Turn facts for the push gate. One agent per process, so plain counters
@@ -507,11 +513,15 @@ export default function (pi: ExtensionAPI) {
   let marker = "none";
   let stop: { reason: string; error?: string } | undefined;
 
-  pi.on("session_start", () => herdr("idle"));
+  // A /reload replaces this extension mid-turn without another agent_start.
+  pi.on("session_start", (_event, ctx) => {
+    herdrTui = ctx?.mode === "tui";
+    void herdr(ctx?.isIdle?.() === false ? "working" : "idle");
+  });
   pi.on("session_shutdown", () => herdr("release"));
   pi.on("agent_start", () => {
     agentRunning = true;
-    herdr("working");
+    void herdr("working");
   });
   pi.on("message_end", (event) => {
     const message = event.message;
@@ -543,7 +553,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("ui_prompt_start", (event, ctx) => {
     clearTimeout(promptTimer);
     if (!agentRunning) return;
-    herdr("blocked");
+    void herdr("blocked");
     const command = running?.toolName === "bash" ? running.args?.command : undefined;
     const body = event.title
       ?? (typeof command === "string" ? "$ " + command : undefined)
@@ -557,13 +567,13 @@ export default function (pi: ExtensionAPI) {
   pi.on("ui_prompt_end", () => {
     clearTimeout(promptTimer);
     promptTimer = undefined;
-    if (agentRunning) herdr("working");
+    if (agentRunning) void herdr("working");
   });
   // Stop-equivalent: agent_settled fires once per user turn, after retries/compaction.
   // Fire-and-forget: never block pi's turn-end on the notify network call.
   pi.on("agent_settled", (_event, ctx) => {
     agentRunning = false;
-    herdr("idle");
+    void herdr("idle");
     clearTimeout(promptTimer);
     promptTimer = undefined;
     // A subagent never pushes — not its completion, not its error. The parent

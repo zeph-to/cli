@@ -292,7 +292,7 @@ type Handler = (event: unknown, ctx: unknown) => unknown;
  * run so the host terminal can't leak in — this suite itself runs inside tmux,
  * and a bare load once picked up the session's real TMUX_PANE.
  */
-const loadExtension = (env: Record<string, string | undefined> = {}, herdrOptions = '') => {
+const loadExtension = (env: Record<string, string | undefined> = {}, herdrOptions = '', ctxExtra: Record<string, unknown> = { mode: 'tui' }, deferTmux = false) => {
     const js = transformSync(templates.PI_EXTENSION, { loader: 'ts', format: 'cjs' }).code;
     const spawned: { cmd: string; command: string; argv: string[]; env: Record<string, string | undefined> }[] = [];
     const mod = { exports: {} as Record<string, unknown> };
@@ -312,8 +312,9 @@ const loadExtension = (env: Record<string, string | undefined> = {}, herdrOption
             },
             execFileSync: (_bin: string, argv: string[]) => (argv.includes('#S') ? 'zeph-a\n' : ''),
             // The herdr options read: answers synchronously so a test can assert
-            // right after the event that triggered it.
-            execFile: (_cmd: string, _argv: string[], _opts: unknown, cb: (err: Error | null, out: string) => void) => cb(null, herdrOptions + '\n'),
+            // right after the event that triggered it, or a tick later like tmux.
+            execFile: (_cmd: string, _argv: string[], _opts: unknown, cb: (err: Error | null, out: string) => void) =>
+                deferTmux ? setTimeout(() => cb(null, herdrOptions + '\n'), 5) : cb(null, herdrOptions + '\n'),
         }));
     } finally {
         for (const k of Object.keys(saved)) {
@@ -325,7 +326,7 @@ const loadExtension = (env: Record<string, string | undefined> = {}, herdrOption
     (mod.exports.default as (pi: unknown) => void)({
         on: (name: string, handler: Handler) => (handlers[name] = handler),
     });
-    const ctx = { cwd: '/work/dou-app' };
+    const ctx = { cwd: '/work/dou-app', ...ctxExtra };
     const emit = (name: string, event: Record<string, unknown> = {}) => handlers[name]({ type: name, ...event }, ctx);
     const assistant = (text: string, stopReason = 'stop', errorMessage?: string) =>
         emit('message_end', { message: { role: 'assistant', content: [{ type: 'text', text }], stopReason, errorMessage } }) as
@@ -376,23 +377,44 @@ describe('templates.ts: the pi extension reports pi to herdr', () => {
 
     it('does not resend an unchanged state', () => {
         const pi = loadExtension({ TMUX_PANE: '%7' }, inHerdr);
+        pi.emit('session_start');
         pi.emit('agent_settled');
         pi.emit('agent_settled');
         expect(pi.herdrCalls()).toHaveLength(1);
     });
 
-    it('ignores a dialog the user opened between turns', () => {
-        const pi = loadExtension({ TMUX_PANE: '%7' }, inHerdr);
-        pi.emit('ui_prompt_start', { kind: 'select' });
-        pi.emit('ui_prompt_end');
-        expect(pi.herdrCalls()).toEqual([]);
+    // A /reload replaces the extension mid-turn without another agent_start.
+    it('starts as working when pi is mid-turn', () => {
+        const pi = loadExtension({ TMUX_PANE: '%7' }, inHerdr, { mode: 'tui', isIdle: () => false });
+        pi.emit('session_start');
+        expect(pi.herdrCalls().map((c) => c.argv)).toEqual(['pane report-agent wF:p1 --source zeph-pi --agent zeph pi --state working']);
     });
 
-    it('stays silent outside herdr, outside tmux, and in a subagent', () => {
+    // pi awaits session_shutdown; resolving before herdr is spawned would let pi
+    // exit with the release still waiting on tmux.
+    it('holds shutdown until the release is spawned', async () => {
+        const pi = loadExtension({ TMUX_PANE: '%7' }, inHerdr, { mode: 'tui' }, true);
+        pi.emit('session_start');
+        await pi.emit('session_shutdown');
+        expect(pi.herdrCalls().at(-1)?.argv).toBe('pane release-agent wF:p1 --source zeph-pi --agent zeph pi');
+    });
+
+    it('ignores a dialog the user opened between turns', () => {
+        const pi = loadExtension({ TMUX_PANE: '%7' }, inHerdr);
+        pi.emit('session_start');
+        const before = pi.herdrCalls().length;
+        pi.emit('ui_prompt_start', { kind: 'select' });
+        pi.emit('ui_prompt_end');
+        expect(pi.herdrCalls()).toHaveLength(before);
+    });
+
+    it('stays silent outside herdr, outside tmux, in a subagent, and headless', () => {
         for (const pi of [
             loadExtension({ TMUX_PANE: '%7' }, '\t\t'),
             loadExtension({}, inHerdr),
             loadExtension({ TMUX_PANE: '%7', PI_SUBAGENT_NAME: 'scout' }, inHerdr),
+            // \`pi -p\` or RPC from a shell in a wrapped pane inherits TMUX_PANE.
+            loadExtension({ TMUX_PANE: '%7' }, inHerdr, { mode: 'print' }),
         ]) {
             pi.emit('session_start');
             pi.emit('agent_start');
