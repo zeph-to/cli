@@ -292,7 +292,7 @@ type Handler = (event: unknown, ctx: unknown) => unknown;
  * run so the host terminal can't leak in — this suite itself runs inside tmux,
  * and a bare load once picked up the session's real TMUX_PANE.
  */
-const loadExtension = (env: Record<string, string | undefined> = {}) => {
+const loadExtension = (env: Record<string, string | undefined> = {}, herdrOptions = '') => {
     const js = transformSync(templates.PI_EXTENSION, { loader: 'ts', format: 'cjs' }).code;
     const spawned: { cmd: string; command: string; argv: string[]; env: Record<string, string | undefined> }[] = [];
     const mod = { exports: {} as Record<string, unknown> };
@@ -311,6 +311,9 @@ const loadExtension = (env: Record<string, string | undefined> = {}) => {
                 return { on: () => {}, unref: () => {}, stdout: { on: () => {} }, stdin: { end: () => {} } };
             },
             execFileSync: (_bin: string, argv: string[]) => (argv.includes('#S') ? 'zeph-a\n' : ''),
+            // The herdr options read: answers synchronously so a test can assert
+            // right after the event that triggered it.
+            execFile: (_cmd: string, _argv: string[], _opts: unknown, cb: (err: Error | null, out: string) => void) => cb(null, herdrOptions + '\n'),
         }));
     } finally {
         for (const k of Object.keys(saved)) {
@@ -335,8 +338,68 @@ const loadExtension = (env: Record<string, string | undefined> = {}) => {
         pushes: () => spawned.filter((s) => s.command.includes(' notify')),
         /** tmux invocations as full argv — the pane-label set-option. */
         tmuxCalls: () => spawned.filter((s) => s.cmd === 'tmux').map((s) => [s.cmd, ...s.argv]),
+        /** herdr reports as `<argv without --seq>`, plus the socket it was pointed at. */
+        herdrCalls: () => spawned.filter((s) => s.cmd.endsWith('herdr')).map((s) => ({
+            argv: s.argv.filter((a, i, all) => a !== '--seq' && all[i - 1] !== '--seq').join(' '),
+            seq: Number(s.argv[s.argv.indexOf('--seq') + 1]),
+            socket: s.env.HERDR_SOCKET_PATH,
+        })),
     };
 };
+
+describe('templates.ts: the pi extension reports pi to herdr', () => {
+    const inHerdr = 'wF:p1\t/sock\t/bin/herdr';
+
+    it('reports the turn lifecycle to the herdr pane the session records', () => {
+        const pi = loadExtension({ TMUX_PANE: '%7' }, inHerdr);
+        pi.emit('session_start');
+        pi.emit('agent_start');
+        pi.emit('ui_prompt_start', { kind: 'confirm' });
+        pi.emit('ui_prompt_end');
+        pi.emit('agent_settled');
+        pi.emit('session_shutdown');
+        const calls = pi.herdrCalls();
+        const who = '--source zeph-pi --agent zeph pi';
+        expect(calls.map((c) => c.argv)).toEqual([
+            `pane report-agent wF:p1 ${who} --state idle`,
+            `pane report-agent wF:p1 ${who} --state working`,
+            `pane report-agent wF:p1 ${who} --state blocked`,
+            `pane report-agent wF:p1 ${who} --state working`,
+            `pane report-agent wF:p1 ${who} --state idle`,
+            `pane release-agent wF:p1 ${who}`,
+        ]);
+        expect(calls.every((c) => c.socket === '/sock')).toBe(true);
+        const seqs = calls.map((c) => c.seq);
+        expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+        expect(new Set(seqs).size).toBe(seqs.length);
+    });
+
+    it('does not resend an unchanged state', () => {
+        const pi = loadExtension({ TMUX_PANE: '%7' }, inHerdr);
+        pi.emit('agent_settled');
+        pi.emit('agent_settled');
+        expect(pi.herdrCalls()).toHaveLength(1);
+    });
+
+    it('ignores a dialog the user opened between turns', () => {
+        const pi = loadExtension({ TMUX_PANE: '%7' }, inHerdr);
+        pi.emit('ui_prompt_start', { kind: 'select' });
+        pi.emit('ui_prompt_end');
+        expect(pi.herdrCalls()).toEqual([]);
+    });
+
+    it('stays silent outside herdr, outside tmux, and in a subagent', () => {
+        for (const pi of [
+            loadExtension({ TMUX_PANE: '%7' }, '\t\t'),
+            loadExtension({}, inHerdr),
+            loadExtension({ TMUX_PANE: '%7', PI_SUBAGENT_NAME: 'scout' }, inHerdr),
+        ]) {
+            pi.emit('session_start');
+            pi.emit('agent_start');
+            expect(pi.herdrCalls()).toEqual([]);
+        }
+    });
+});
 
 describe('templates.ts: the pi extension pushes when pi waits on the user', () => {
 

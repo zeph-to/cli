@@ -317,9 +317,12 @@ block here.
    the agent would not show in its sidebar. Every attach records the herdr
    pane it runs in as session options (`@zeph_herdr_pane`,
    `@zeph_herdr_socket`, `@zeph_herdr_bin`), and clears them when attached
-   from outside herdr; the Zeph plugin's `zeph-herdr.sh` hook reads them
-   and reports Claude Code's `working` / `idle` / `blocked` state to that
-   pane as `zeph cc`. Needs the plugin from 0.20.0.
+   from outside herdr. Reporters read them on every report and send the
+   agent's `working` / `idle` / `blocked` state to that pane: Claude Code
+   through the Zeph plugin's `zeph-herdr.sh` hook (plugin 0.20.0+) as
+   `zeph cc`, pi through the Zeph pi extension as `zeph pi`. herdr's own pi
+   extension reads the pane from its env, which tmux does not pass, so it
+   stays silent in a wrapped session.
 
    **A shell the phone may type into — `zeph sh`.** Every other shell
    pane is refused (see [Defense](#defense)); `zeph sh` opens the one
