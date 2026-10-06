@@ -419,16 +419,31 @@ describe('handOffExec', () => {
     // A stand-in for process.execve, which the real signature types as never-
     // returning — a stub cannot honour that, so the cast is the whole fake.
     const execve = ((): never => { throw new Error('execve stub'); }) as ProcessHandOff;
-    const tmuxNew = { kind: 'tmux-new' as const, stdinTTY: true, stdoutTTY: true };
+    const env = { TERM: 'xterm-256color', PATH: '/usr/bin' };
+    const tmuxNew = { env, kind: 'tmux-new' as const, stdinTTY: true, stdoutTTY: true };
+    // The same stand-in, recording what it was called with before it throws.
+    const recording = () => {
+        const calls: unknown[][] = [];
+        const spy = ((...a: unknown[]): never => { calls.push(a); throw new Error('execve stub'); }) as ProcessHandOff;
+        return { calls, spy };
+    };
 
     // The wrapper otherwise sits resident for the whole session doing nothing
     // but waiting on tmux. Handing the process over deletes it outright.
     it('never hands off a detached launch — the wrapper returns after tmux answers', () => {
-        expect(handOffExec({ execve, kind: 'tmux-detached', stdinTTY: true, stdoutTTY: true })).toBeNull();
+        expect(handOffExec({ execve, env, kind: 'tmux-detached', stdinTTY: true, stdoutTTY: true })).toBeNull();
     });
 
     it('returns the exec when execve exists and both streams are a terminal', () => {
-        expect(handOffExec({ execve, ...tmuxNew })).toBe(execve);
+        expect(handOffExec({ execve, ...tmuxNew })).not.toBeNull();
+    });
+
+    // node 22.15.1 execs with an empty environment when the env argument is
+    // omitted, and tmux without TERM cannot open the terminal.
+    it('passes the environment to execve explicitly', () => {
+        const { calls, spy } = recording();
+        expect(() => handOffExec({ execve: spy, ...tmuxNew })?.('/usr/bin/tmux', ['tmux', 'new'])).toThrow('execve stub');
+        expect(calls).toEqual([['/usr/bin/tmux', ['tmux', 'new'], env]]);
     });
 
     // node <22.15 and Windows have no execve — those keep the spawn+wait path.
@@ -440,7 +455,7 @@ describe('handOffExec', () => {
     // runs no cleanup, and only a TTY is written synchronously on POSIX.
     it('refuses when stdout is not a terminal, whichever target it is', () => {
         expect(handOffExec({ execve, ...tmuxNew, stdoutTTY: false })).toBeNull();
-        expect(handOffExec({ execve, kind: 'direct', stdinTTY: true, stdoutTTY: false })).toBeNull();
+        expect(handOffExec({ execve, env, kind: 'direct', stdinTTY: true, stdoutTTY: false })).toBeNull();
     });
 
     // `tmux new` needs a terminal to attach to — that failure is the one the
@@ -452,7 +467,10 @@ describe('handOffExec', () => {
     // Running the agent in the pane we are already in attaches nothing, so
     // stdin being a pipe is not this decision's business.
     it('hands off a direct target even without a stdin terminal', () => {
-        expect(handOffExec({ execve, kind: 'direct', stdinTTY: undefined, stdoutTTY: true })).toBe(execve);
+        const { calls, spy } = recording();
+        const handOff = handOffExec({ execve: spy, env, kind: 'direct', stdinTTY: undefined, stdoutTTY: true });
+        expect(() => handOff?.('/usr/bin/claude', ['claude'])).toThrow('execve stub');
+        expect(calls).toEqual([['/usr/bin/claude', ['claude'], env]]);
     });
 
     // process.stdin.isTTY is `undefined`, not false, when stdin is a pipe.

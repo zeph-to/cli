@@ -407,6 +407,9 @@ export const ensureListenerRunning = async (): Promise<void> => {
 /** `process.execve` with the optionality resolved — see handOffExec. */
 export type ProcessHandOff = NonNullable<typeof process.execve>;
 
+/** The hand-off handOffExec returns: execve with the environment already bound. */
+type HandOff = (file: string, argv: string[]) => never;
+
 /**
  * The exec that replaces this process with the child, or null when the wrapper
  * has to stay and wait instead. Returning the function rather than a boolean
@@ -419,13 +422,19 @@ export type ProcessHandOff = NonNullable<typeof process.execve>;
  * is `>=18`, so the spawn path below is not a transitional fallback — it stays.
  *
  * `isTTY` is `undefined` rather than `false` on a pipe, hence every `=== true`.
+ *
+ * The environment is bound here rather than left to execve's default: node
+ * 22.15.1 execs with an empty environment when the argument is omitted
+ * (measured — 22.23.2 and 24.x inherit process.env), and a tmux started without
+ * TERM dies with "open terminal failed: terminal does not support clear".
  */
 export const handOffExec = (deps: {
     execve: ProcessHandOff | undefined;
+    env: NodeJS.ProcessEnv;
     kind: SpawnTarget['kind'];
     stdinTTY: boolean | undefined;
     stdoutTTY: boolean | undefined;
-}): ProcessHandOff | null => {
+}): HandOff | null => {
     // A detached launch returns after tmux answers — nothing to hand the terminal to.
     if (deps.kind === 'tmux-detached') return null;
     if (!deps.execve) return null;
@@ -435,7 +444,8 @@ export const handOffExec = (deps: {
     // `tmux new` additionally needs a terminal of its own to attach to. That is
     // the failure the spawn path below exists to explain, so send it there.
     if (deps.kind === 'tmux-new' && deps.stdinTTY !== true) return null;
-    return deps.execve;
+    const { execve, env } = deps;
+    return (file, argv) => execve(file, argv, env);
 };
 
 export const handleAgentSession = async (
@@ -487,6 +497,7 @@ const launchTarget = async ({ kind, cmd, args, session }: SpawnTarget, what: str
     // exit code that execve gives us for free by being the same process.
     const handOff = handOffExec({
         execve: process.execve,
+        env: process.env,
         kind,
         stdinTTY: process.stdin.isTTY,
         stdoutTTY: process.stdout.isTTY,
@@ -502,7 +513,6 @@ const launchTarget = async ({ kind, cmd, args, session }: SpawnTarget, what: str
         // Nothing buffered survives: execve runs no cleanup handler and fires
         // no exit event. Safe here only because stdout is a TTY, which node
         // writes synchronously on POSIX — every `zeph:` line above is already out.
-        // The env argument is left off: it defaults to process.env.
         handOff(file, [cmd, ...args]);
     }
 
