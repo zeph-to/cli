@@ -102,8 +102,8 @@ const highNotifyCmd =
 // assigns it a word the marker regex captured, or "none".
 const PUSH_SIGNAL_FLAG = ' --marker ${marker}';
 
-/** Grace before the pi extension turns an unanswered prompt into a push. Exported for the tests. */
-export const PI_PROMPT_GRACE_MS = 10_000;
+/** Grace before a drop-in artifact (pi extension, opencode plugin) turns an unanswered prompt into a push. Exported for the tests. */
+export const PROMPT_GRACE_MS = 10_000;
 
 // ── Shared behavioral core ───────────────────────────────────────
 //
@@ -419,7 +419,7 @@ const READ_ONLY = new Set(["read", "grep", "find", "ls"]);
 // How long a blocking prompt may stay open before it becomes a push. An answer
 // inside the window means the user is at the terminal, and a guard extension
 // can raise several prompts a turn — pushing each one at once would be noise.
-const PROMPT_GRACE_MS = ${PI_PROMPT_GRACE_MS};
+const PROMPT_GRACE_MS = ${PROMPT_GRACE_MS};
 
 // Push Signal markers — the pattern the Claude Code Stop hook reads
 // (plugin/hooks/zeph-stop.sh MARKER_RE). pi's markdown renders an HTML comment
@@ -637,6 +637,19 @@ const READ_ONLY = new Set(["read", "grep", "glob", "list"]);
 type TurnFacts = { tools: number; nonReadonly: number };
 const zeroFacts = (): TurnFacts => ({ tools: 0, nonReadonly: 0 });
 
+// How long a permission request may stay open before it becomes a push. An
+// answer inside the window means the user is at the terminal.
+const PROMPT_GRACE_MS = ${PROMPT_GRACE_MS};
+const projectOf = (cwd: string): string => cwd.split("/").pop() || cwd;
+
+// \`permission.asked\` / \`permission.replied\` are v2 bus events: the server
+// emits them (names read from the opencode 1.18.35 binary on 2026-10-08), but
+// the \`Event\` union that \`Plugin\` is typed against predates them. Shapes
+// from @opencode-ai/sdk v2 types.gen.d.ts.
+type PermissionEvent =
+  | { type: "permission.asked"; properties: { id: string; permission: string; patterns: string[] } }
+  | { type: "permission.replied"; properties: { requestID: string } };
+
 // Typed against the real plugin contract, the way the pi extension is: the
 // hook names and payload shapes this file asserts by hand are then checked by
 // the compiler, so an upstream rename fails loudly instead of silently
@@ -664,6 +677,36 @@ export const ZephPlugin: Plugin = async ({ client, directory }) => {
     }
   };
 
+  // Waiting-on-you: a permission request blocks the turn, so session.idle never
+  // fires and the Stop-equivalent below stays silent. One timer per request —
+  // parallel tool calls can each raise their own.
+  const asking = new Map<string, ReturnType<typeof setTimeout>>();
+  const settle = (requestID: string): void => {
+    clearTimeout(asking.get(requestID));
+    asking.delete(requestID);
+  };
+  const onPermission = (event: PermissionEvent): void => {
+    if (event.type === "permission.replied") return settle(event.properties.requestID);
+    const { id, permission, patterns } = event.properties;
+    settle(id);
+    const body = permission + (patterns.length ? ": " + patterns.join(", ") : "");
+    const timer = setTimeout(() => {
+      asking.delete(id);
+      // Title and body reach the shell as env vars, never as command text —
+      // a pattern is whatever the model asked to run.
+      const env = {
+        ...process.env,
+        ZEPH_PUSH_TITLE: "opencode asks: " + projectOf(directory),
+        ZEPH_PUSH_BODY: body.length > 200 ? body.slice(0, 199) + "…" : body,
+      };
+      const child = spawn("sh", ["-c", ${JSON.stringify(highNotifyCmd)}], { cwd: directory, env, stdio: "ignore", detached: true });
+      child.on("error", () => {});
+      child.unref();
+    }, PROMPT_GRACE_MS);
+    timer.unref?.();
+    asking.set(id, timer);
+  };
+
   return {
     // Turn start. Create-if-absent, never reset: this fires per *message*, and
     // a second message queued while the agent is still working would otherwise
@@ -682,6 +725,10 @@ export const ZephPlugin: Plugin = async ({ client, directory }) => {
     // through the generic \`event\` hook — there is no per-event key for it, so
     // filter by type.
     event: async ({ event }) => {
+      const type: string = event.type;
+      if (type === "permission.asked" || type === "permission.replied") {
+        return onPermission(event as unknown as PermissionEvent);
+      }
       // A deleted session never idles again, so nothing would ever consume its
       // entry. Drop it here or it outlives the turn for the life of the
       // process. An *aborted* turn needs no such handling: the entry survives
@@ -725,6 +772,15 @@ export const ZephPlugin: Plugin = async ({ client, directory }) => {
       child.unref();
     },
   };
+};
+
+// The opencode v2 server loader rejects a module with no default definition
+// ("Plugin must export a default definition with an id and an effect or setup
+// function", seen on 1.18.35) — a named export alone never loads.
+export default {
+  id: "zeph",
+  server: ZephPlugin,
+  setup() {},
 };
 `;
 

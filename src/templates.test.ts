@@ -160,12 +160,14 @@ describe('templates.ts: the OpenCode plugin bills tool calls to the right sessio
     const loadPlugin = async (parents: Record<string, string | undefined>, unreachable = false) => {
         const js = transformSync(templates.OPENCODE_PLUGIN, { loader: 'ts', format: 'cjs' }).code;
         const commands: string[] = [];
+        const envs: Record<string, string>[] = [];
         const mod = { exports: {} as Record<string, unknown> };
         // `node:child_process` is the artifact's only value import — the type
         // import is erased, so nothing else needs a stub.
         new Function('exports', 'module', 'require', js)(mod.exports, mod, () => ({
-            spawn: (_sh: string, argv: string[]) => {
+            spawn: (_sh: string, argv: string[], options: { env?: Record<string, string> }) => {
                 commands.push(argv[1]);
+                envs.push(options.env ?? {});
                 return { on: () => {}, unref: () => {} };
             },
         }));
@@ -184,6 +186,11 @@ describe('templates.ts: the OpenCode plugin bills tool calls to the right sessio
 
         return {
             commands,
+            envs,
+            asked: (id: string, permission: string, patterns: string[]) =>
+                hooks.event({ event: { type: 'permission.asked', properties: { id, permission, patterns } } } as never),
+            replied: (requestID: string) =>
+                hooks.event({ event: { type: 'permission.replied', properties: { requestID } } } as never),
             message: (sessionID: string) => hooks['chat.message']({ sessionID } as never),
             tool: (sessionID: string, tool: string) =>
                 hooks['tool.execute.after']({ tool, sessionID } as never),
@@ -264,6 +271,54 @@ describe('templates.ts: the OpenCode plugin bills tool calls to the right sessio
         expect(p.commands).toHaveLength(1);
         expect(p.commands[0]).toContain(`--${TOOL_COUNT_FLAG} 1`);
         expect(p.commands[0]).toContain(`--${NONREADONLY_COUNT_FLAG} 0`);
+    });
+
+    describe('permission requests', () => {
+        beforeEach(() => vi.useFakeTimers());
+        afterEach(() => vi.useRealTimers());
+
+        it('pushes an unanswered request at high priority once the grace passes', async () => {
+            const p = await loadPlugin({});
+            await p.asked('per_1', 'external_directory', ['/tmp/*']);
+            vi.advanceTimersByTime(templates.PROMPT_GRACE_MS - 1);
+            expect(p.commands).toEqual([]);
+
+            vi.advanceTimersByTime(1);
+            expect(p.commands).toHaveLength(1);
+            expect(p.commands[0]).toContain('--priority high');
+            // The pattern reaches the shell as an env var, not as command text.
+            expect(p.commands[0]).not.toContain('/tmp');
+            expect(p.envs[0].ZEPH_PUSH_TITLE).toBe('opencode asks: repo');
+            expect(p.envs[0].ZEPH_PUSH_BODY).toBe('external_directory: /tmp/*');
+        });
+
+        it('stays silent when the request is answered inside the grace', async () => {
+            const p = await loadPlugin({});
+            await p.asked('per_1', 'bash', ['rm -rf dist']);
+            vi.advanceTimersByTime(templates.PROMPT_GRACE_MS - 1);
+            await p.replied('per_1');
+            vi.advanceTimersByTime(templates.PROMPT_GRACE_MS);
+            expect(p.commands).toEqual([]);
+        });
+
+        it('times parallel requests separately', async () => {
+            const p = await loadPlugin({});
+            await p.asked('per_1', 'bash', ['git push']);
+            await p.asked('per_2', 'edit', ['src/a.ts']);
+            await p.replied('per_1');
+            vi.advanceTimersByTime(templates.PROMPT_GRACE_MS);
+            expect(p.envs.map((env) => env.ZEPH_PUSH_BODY)).toEqual(['edit: src/a.ts']);
+        });
+    });
+
+    it('exports the default definition the v2 server loader requires', () => {
+        const js = transformSync(templates.OPENCODE_PLUGIN, { loader: 'ts', format: 'cjs' }).code;
+        const mod = { exports: {} as Record<string, unknown> };
+        new Function('exports', 'module', 'require', js)(mod.exports, mod, () => ({}));
+        const definition = mod.exports.default as { id: string; server: unknown; setup: unknown };
+        expect(definition.id).toBe('zeph');
+        expect(definition.server).toBe(mod.exports.ZephPlugin);
+        expect(typeof definition.setup).toBe('function');
     });
 
     it('still pushes when the parent lookup fails', async () => {
@@ -433,7 +488,7 @@ describe('templates.ts: the pi extension pushes when pi waits on the user', () =
         pi.emit('agent_start');
         pi.emit('tool_execution_start', { toolName: 'bash', args: { command: 'git status | head' } });
         pi.emit('ui_prompt_start', { kind: 'custom' });
-        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS - 1);
+        vi.advanceTimersByTime(templates.PROMPT_GRACE_MS - 1);
         expect(pi.pushes()).toEqual([]);
 
         vi.advanceTimersByTime(1);
@@ -450,9 +505,9 @@ describe('templates.ts: the pi extension pushes when pi waits on the user', () =
         const pi = loadExtension();
         pi.emit('agent_start');
         pi.emit('ui_prompt_start', { kind: 'confirm', title: 'Delete branch?' });
-        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS - 1);
+        vi.advanceTimersByTime(templates.PROMPT_GRACE_MS - 1);
         pi.emit('ui_prompt_end', { kind: 'confirm', title: 'Delete branch?' });
-        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
+        vi.advanceTimersByTime(templates.PROMPT_GRACE_MS);
         expect(pi.pushes()).toEqual([]);
     });
 
@@ -461,11 +516,11 @@ describe('templates.ts: the pi extension pushes when pi waits on the user', () =
         pi.emit('agent_start');
         pi.emit('tool_execution_start', { toolName: 'bash', args: { command: 'rm -rf dist' } });
         pi.emit('ui_prompt_start', { kind: 'select', title: 'Pick a target' });
-        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
+        vi.advanceTimersByTime(templates.PROMPT_GRACE_MS);
         pi.emit('ui_prompt_end', { kind: 'select' });
         pi.emit('tool_execution_end', { toolName: 'bash' });
         pi.emit('ui_prompt_start', { kind: 'custom' });
-        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
+        vi.advanceTimersByTime(templates.PROMPT_GRACE_MS);
 
         expect(pi.pushes().map((s) => s.env.ZEPH_PUSH_BODY)).toEqual(['Pick a target', 'Waiting for your input']);
     });
@@ -475,13 +530,13 @@ describe('templates.ts: the pi extension pushes when pi waits on the user', () =
         // user is at the terminal by definition.
         const pi = loadExtension();
         pi.emit('ui_prompt_start', { kind: 'custom' });
-        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS * 2);
+        vi.advanceTimersByTime(templates.PROMPT_GRACE_MS * 2);
 
         pi.emit('agent_start');
         pi.emit('agent_settled');
         const settlePushes = pi.pushes().length;
         pi.emit('ui_prompt_start', { kind: 'select', title: 'pi-cbm settings' });
-        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS * 2);
+        vi.advanceTimersByTime(templates.PROMPT_GRACE_MS * 2);
         expect(pi.pushes()).toHaveLength(settlePushes);
     });
 
@@ -550,7 +605,7 @@ describe('templates.ts: the pi extension runs subagent panes view-only-by-push',
         pi.emit('agent_start');
         pi.emit('tool_execution_start', { toolName: 'bash', args: { command: 'git push' } });
         pi.emit('ui_prompt_start', { kind: 'custom' });
-        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
+        vi.advanceTimersByTime(templates.PROMPT_GRACE_MS);
 
         const pushes = pi.pushes();
         expect(pushes).toHaveLength(1);
@@ -577,7 +632,7 @@ describe('templates.ts: the pi extension runs subagent panes view-only-by-push',
         pi.emit('agent_start');
         pi.emit('tool_execution_start', { toolName: 'bash', args: { command: 'git push' } });
         pi.emit('ui_prompt_start', { kind: 'custom' });
-        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
+        vi.advanceTimersByTime(templates.PROMPT_GRACE_MS);
         const pushes = pi.pushes();
         expect(pushes[0].env.ZEPH_PUSH_TITLE).toBe('pi asks: dou-app · review-01');
         expect(pushes[0].env.ZEPH_AGENT_SESSION_NAME).toBeUndefined();
