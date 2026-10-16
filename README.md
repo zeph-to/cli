@@ -6,6 +6,12 @@
 [![license](https://img.shields.io/npm/l/@zeph-to/cli.svg)](./LICENSE)
 [![docs](https://img.shields.io/badge/docs-docs.zeph.to-1f6feb)](https://docs.zeph.to)
 
+> **Agent features end on 2026-11-01 (00:00 UTC).** From that date, agent sessions, the terminal, and agent setup stop working, and the `zeph` agent commands and hooks exit without doing anything. Pushes, files, clipboard, and channels keep working. To remove the hooks and the background service from this machine, run:
+>
+> ```bash
+> zeph uninstall
+> ```
+
 **Your agent works, hits a decision, and asks your phone. You tap a button (or type a reply), and the answer lands back in the live session — so the agent keeps going.**
 
 `@zeph-to/cli` is the terminal side of that round trip: a zero-dependency push SDK, a `zeph` CLI that wires up 8 AI agents in one command, and a resident listener that lets your phone **drive any agent session it can start** by typing straight into named tmux sessions.
