@@ -81,6 +81,7 @@ import { createTurnWatchers, type TurnWatchControl } from './turn-watch.js';
 import { diskTurnRing } from './turn-ring.js';
 import { createInputSequencer, type InputSequencer, type SequencedInput } from './input-sequencer.js';
 import { startKeepAwake } from './keep-awake.js';
+import { isSunset } from './sunset.js';
 import { Readable } from 'node:stream';
 import type { ReadableStream } from 'node:stream/web';
 import { createLanPublisher } from './lan-endpoint.js';
@@ -5383,6 +5384,15 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     };
     process.on('SIGINT', () => stop('SIGINT'));
     process.on('SIGTERM', () => stop('SIGTERM'));
+
+    // A daemon started before the sunset date must not outlive it: the server
+    // refuses the socket from then on, and reconnecting forever would also keep
+    // the Mac awake. Exit 0 so the login service (KeepAlive SuccessfulExit:false)
+    // does not relaunch it.
+    const sunsetTimer = setInterval(() => {
+        if (isSunset(new Date())) stop('sunset');
+    }, 60 * 1000);
+    sunsetTimer.unref();
 
     inventoryOffload = startInventoryOffload(collectSessionsVerbose, log);
     let attempt = 0;

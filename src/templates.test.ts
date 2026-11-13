@@ -286,6 +286,7 @@ describe('templates.ts: the OpenCode plugin bills tool calls to the right sessio
             vi.advanceTimersByTime(1);
             expect(p.commands).toHaveLength(1);
             expect(p.commands[0]).toContain('--priority high');
+            expect(p.commands[0]).toContain('--hook');
             // The pattern reaches the shell as an env var, not as command text.
             expect(p.commands[0]).not.toContain('/tmp');
             expect(p.envs[0].ZEPH_PUSH_TITLE).toBe('opencode asks: repo');
@@ -576,6 +577,8 @@ describe('templates.ts: the pi extension pushes when pi waits on the user', () =
         expect(pushes).toHaveLength(1);
         expect(pushes[0].command).not.toContain('--auto');
         expect(pushes[0].command).toContain('--priority high');
+        // Marks it as a hook push, so it goes quiet with the agent features (sunset.ts).
+        expect(pushes[0].command).toContain('--hook');
         expect(pushes[0].env.ZEPH_PUSH_TITLE).toBe('pi stopped: dou-app');
         expect(pushes[0].env.ZEPH_PUSH_BODY).toBe('429 rate limit');
     });

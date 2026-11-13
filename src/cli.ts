@@ -26,6 +26,7 @@ import {
 import { awayForGate } from './presence.js';
 import { findAgentBySubcommand, REMOTE_AGENTS } from './remote-agents.js';
 import { isRemoteHookAgent, runRemoteHook } from './remote-hook.js';
+import { sunsetGate } from './sunset.js';
 
 const detectBranchAndProject = (): { branch?: string; project: string } => {
   const dir = detectProjectDir();
@@ -608,6 +609,11 @@ const main = async (): Promise<number> => {
     printUsage();
     return 0;
   }
+
+  // Agent features end on a fixed date (sunset.ts): notice before it, no
+  // request after it. Everything below this line is past the gate.
+  const early = sunsetGate(command, args);
+  if (early !== null) return early;
 
   // Remote-control subcommands (`zeph cc` / `zeph codex` / …) come from the
   // registry — one table row per agent, no hardcoded cases. Pass the typed

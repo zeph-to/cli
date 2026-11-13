@@ -93,9 +93,10 @@ const remoteHookCmd = (agent: 'gemini' | 'codex' | 'pi'): string =>
 // through the quiet dial, and plain `notify` (no --auto) means only a mute
 // stops it. Title and body arrive as env vars, never spliced into the string:
 // the body can carry the model's own bash command or a provider error.
+// `--hook` marks it as a hook push for the sunset gate (sunset.ts).
 const highNotifyCmd =
   '$(command -v zeph || echo "npx -y @zeph-to/cli") notify'
-  + ' --title "$ZEPH_PUSH_TITLE" --body "$ZEPH_PUSH_BODY" --priority high 2>/dev/null || true';
+  + ' --title "$ZEPH_PUSH_TITLE" --body "$ZEPH_PUSH_BODY" --priority high --hook 2>/dev/null || true';
 
 // The pi turn's Push Signal marker, as a JS template placeholder (single quotes:
 // `${marker}` must reach the artifact unexpanded). The artifact only ever
